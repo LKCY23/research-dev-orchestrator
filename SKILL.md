@@ -17,6 +17,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.
 - `SUMMARY.md` and `diagnostics/` are derived monitor artifacts, not sources of truth.
+- `EVENTS.ndjson` and `JOURNAL.md` are required long-term memory artifacts. Use them to preserve cross-session history without adding a heavier decision database.
 
 ## Standard Workflow
 
@@ -32,6 +33,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 10. Only mark `approved` after diff review, evidence review, mergeability verification, and required integration smoke tests pass.
 11. Merge only approved tasks, then record post-merge smoke results when required by `ACCEPTANCE.md`.
 12. Update `RESULT_LEDGER.md` for experiment outcomes and claim support.
+13. At the end of every working session, run `scripts/close_session.py` to update `SUMMARY.md`, append `JOURNAL.md`, and append a `session_closed` event.
 
 ## References
 
@@ -49,6 +51,8 @@ Read references only when they are needed:
 - `references/status-schema.md`: use before writing or reviewing `STATUS.json`.
 - `references/review-rubric.md`: use before Codex review and merge decisions.
 - `references/summary-template.md`: use when updating or auditing `SUMMARY.md`.
+- `references/events-schema.md`: use when appending or auditing `EVENTS.ndjson`.
+- `references/journal-template.md`: use when closing a session or auditing `JOURNAL.md`.
 
 ## Scripts
 
@@ -63,6 +67,7 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-diagnostics
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-id> --summary "<session summary>" --changed "<change>" --next-action "<next>"
 ```
 
 `init_run.py` scaffolds only. It must not make substantive research, design, or architecture decisions.
@@ -72,6 +77,22 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run
 `dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, create a lock, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must not synthesize `review` or `blocked` for the worker.
 
 `collect_status.py` is read-only by default. It must not modify `STATUS.json`, delete locks, change FSM state, or repair violations. `--write-summary` may update only `SUMMARY.md`; `--write-diagnostics` may write only diagnostics files.
+
+`close_session.py` is the standard session closeout command. It updates derived `SUMMARY.md`, appends a human-readable `JOURNAL.md` entry, and appends a `session_closed` event to `EVENTS.ndjson`.
+
+## Long-Term Memory
+
+Use these files to recover context after days or weeks:
+
+- `SUMMARY.md`: current dashboard; derived and regenerable.
+- `EVENTS.ndjson`: append-only machine-readable timeline; required.
+- `JOURNAL.md`: append-only human-readable session memory; required.
+- `RESULT_LEDGER.md`: experiment results and claim support.
+- `ADR/*`: durable architecture/design decisions only.
+- `reviews/*`: Codex review records.
+- `tasks/*/attempts/*`: worker execution records.
+
+Do not force a separate `DECISIONS.md` in the first version. Put non-architecture session decisions and tradeoffs in `JOURNAL.md`; add ADRs only when a decision should be durable architecture/design record.
 
 ## Review Gate
 

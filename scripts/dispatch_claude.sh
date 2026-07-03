@@ -24,6 +24,34 @@ LOCK_PATH="${TASK_DIR}/LOCK"
 DIAGNOSTICS_DIR="${RUN_DIR}/diagnostics"
 STATUS_UPDATED=0
 
+append_event() {
+  local event_name="$1"
+  python3 - "$RUN_DIR" "$RUN_ID" "$TASK_ID" "$ATTEMPT_ID" "$event_name" "$CLAUDE_AGENT_NAME" "$STATUS_PATH" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+run_dir, run_id, task_id, attempt_id, event_name, agent_name, status_path = sys.argv[1:8]
+payload = {
+    "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "actor": "dispatch" if event_name == "task_dispatched" else "claude-code",
+    "event": event_name,
+    "run_id": run_id,
+    "task_id": task_id,
+    "attempt_id": attempt_id,
+}
+if event_name == "task_dispatched":
+    payload["worker"] = agent_name
+if event_name == "worker_blocked":
+    status = json.load(open(status_path, encoding="utf-8"))
+    payload["blocker_type"] = status.get("blocker_type", "")
+    payload["blocking_reason"] = status.get("blocking_reason", "")
+with Path(run_dir, "EVENTS.ndjson").open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+PY
+}
+
 write_dispatch_failure() {
   local code="$?"
   if [[ "${code}" -eq 0 ]]; then
@@ -231,6 +259,7 @@ with open(status_path, "w", encoding="utf-8") as handle:
     handle.write("\n")
 PY
 STATUS_UPDATED=1
+append_event "task_dispatched"
 
 if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
   echo "dry run: prompt written to ${ATTEMPT_DIR}/prompt.md" | tee "${ATTEMPT_DIR}/result.md"
@@ -278,3 +307,14 @@ if not (valid_state and valid_attempt and evidence_or_handoff):
     print(f"state={state!r} current_attempt_id={status.get('current_attempt_id')!r}", file=sys.stderr)
     raise SystemExit(4)
 PY
+
+FINAL_STATE="$(python3 - "$STATUS_PATH" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8")).get("state", ""))
+PY
+)"
+if [[ "${FINAL_STATE}" == "review" ]]; then
+  append_event "worker_review_ready"
+elif [[ "${FINAL_STATE}" == "blocked" ]]; then
+  append_event "worker_blocked"
+fi

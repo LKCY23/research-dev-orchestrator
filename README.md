@@ -12,14 +12,15 @@ The skill runtime entrypoint is [`SKILL.md`](SKILL.md). The detailed design base
 - Dispatches CLI coding agents through a filesystem protocol and Git worktree isolation.
 - Enforces a finite state machine through `references/state-machine.json`.
 - Provides human, machine, and diagnostic monitoring through `SUMMARY.md`, `collect_status.py --json`, and `diagnostics/`.
+- Preserves long-running context with required append-only memory files: `EVENTS.ndjson` and `JOURNAL.md`.
 
 ## Repository Layout
 
 ```text
 SKILL.md                 # Codex skill entrypoint
 DESIGN_SPEC.md           # Full design baseline and protocol rationale
-references/              # Templates, FSM, schema, review rubric
-scripts/                 # init_run, create_task, dispatch, collect_status
+references/              # Templates, FSM, schema, review rubric, memory docs
+scripts/                 # init_run, create_task, dispatch, collect_status, close_session
 agents/openai.yaml       # UI metadata
 ```
 
@@ -27,7 +28,7 @@ agents/openai.yaml       # UI metadata
 
 ```bash
 python /path/to/skill-creator/scripts/quick_validate.py /path/to/research-dev-orchestrator
-python -m py_compile scripts/init_run.py scripts/create_task.py scripts/collect_status.py
+python -m py_compile scripts/init_run.py scripts/create_task.py scripts/collect_status.py scripts/close_session.py
 bash -n scripts/dispatch_claude.sh
 ```
 
@@ -35,6 +36,12 @@ When using the skill from another target repository, keep the current working di
 
 ```bash
 export RESEARCH_DEV_ORCHESTRATOR_HOME=/path/to/research-dev-orchestrator
+```
+
+At the end of a working session, use:
+
+```bash
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-id> --summary "<what happened>"
 ```
 
 ## Notes

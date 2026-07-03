@@ -31,6 +31,8 @@ Template:
 
 ## Recent Decisions
 
+## Recent Events
+
 ## Experiment Results
 
 ## Next Actions

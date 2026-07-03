@@ -76,6 +76,8 @@ Codex review
   runs/
     <run-id>/
       SUMMARY.md
+      EVENTS.ndjson
+      JOURNAL.md
       RUN.json
       REQUIREMENTS.md
       DESIGN_METHOD_SELECTION.md
@@ -614,6 +616,8 @@ Can be deleted and regenerated
 
 ```text
 RUN.json
+EVENTS.ndjson
+JOURNAL.md
 tasks/*/STATUS.json
 references/state-machine.json
 tasks/*/EVIDENCE.md
@@ -657,7 +661,63 @@ Interactive monitor:
   collect_status.py default output
 ```
 
-## 15. Diagnostics
+## 15. Long-Term Memory
+
+长期迭代需要两个 required memory artifacts：
+
+```text
+EVENTS.ndjson
+JOURNAL.md
+```
+
+它们的分工：
+
+```text
+SUMMARY.md       = 当前状态 dashboard，可重建
+EVENTS.ndjson    = 机器可读完整关键时间线，append-only
+JOURNAL.md       = 人类可读 session 记忆，append-only
+RESULT_LEDGER.md = 实验结果和 claim support
+ADR/*            = 架构/设计级长期决策
+reviews/*        = Codex review 记录
+tasks/*/attempts = worker 执行记录
+```
+
+第一版不强制 `DECISIONS.md`。非架构但重要的取舍先写入 `JOURNAL.md`；只有长期有效的架构/设计决策才写入 `ADR/*`。如果后续 `JOURNAL.md` 中决策过多，再引入 `DECISIONS.md` 作为第二阶段索引。
+
+`EVENTS.ndjson` 只记录能重建历史的关键事件，不记录每个小编辑。核心事件类型：
+
+```text
+run_created
+requirements_updated
+design_method_selected
+adr_added
+task_created
+task_dispatched
+worker_blocked
+worker_review_ready
+codex_reviewed
+changes_requested
+task_approved
+task_merged
+task_failed
+experiment_recorded
+scope_changed
+session_closed
+```
+
+每个工作 session 结束前，Codex 必须执行：
+
+```text
+1. run close_session.py or collect_status.py --write-summary
+2. append JOURNAL.md
+3. append important events to EVENTS.ndjson
+4. update RESULT_LEDGER.md if experiments ran
+5. add ADR only for durable architecture/design decisions
+```
+
+`close_session.py` 是推荐入口，因为它会同时更新 `SUMMARY.md`、追加 `JOURNAL.md`、追加 `session_closed` event。
+
+## 16. Diagnostics
 
 协议错误和状态异常可以写入：
 
@@ -687,7 +747,7 @@ STATUS.json.evidence 与 EVIDENCE.md/logs 冲突
 LOCK attempt_id 与 STATUS.json.current_attempt_id 不一致
 ```
 
-## 16. scripts 设计
+## 17. scripts 设计
 
 第一版 scripts：
 
@@ -697,6 +757,7 @@ scripts/
   create_task.py
   dispatch_claude.sh
   collect_status.py
+  close_session.py
 ```
 
 ### init_run.py
@@ -708,8 +769,10 @@ scripts/
 2. 生成 RUN.json。
 3. 创建空模板文件和目录。
 4. 创建 SUMMARY.md 初始骨架。
-5. 创建 diagnostics/。
-6. 记录 target_branch、base_commit、protocol_version。
+5. 创建 EVENTS.ndjson 和 JOURNAL.md。
+6. 创建 diagnostics/。
+7. 记录 target_branch、base_commit、protocol_version。
+8. 追加 run_created event。
 ```
 
 限制：
@@ -730,6 +793,7 @@ Only scaffold headings/templates.
 3. 创建 TASK.md / CONTEXT.md / ACCEPTANCE.md / HANDOFF.md / EVIDENCE.md。
 4. 创建 logs/ 和 attempts/。
 5. 校验 task_id、allowed_paths、forbidden_paths。
+6. 追加 task_created event。
 ```
 
 限制：
@@ -755,6 +819,7 @@ Only creates pending task.
 7. 调用配置化 Claude Code CLI。
 8. 保存 transcript.log / result.md。
 9. 检查 worker 是否写出合法交付状态。
+10. 追加 task_dispatched / worker_review_ready / worker_blocked events。
 ```
 
 限制：
@@ -814,6 +879,7 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-diagnostics
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-id> --summary "<summary>"
 ```
 
 限制：
@@ -829,6 +895,18 @@ Never change FSM state.
 Never repair protocol violations automatically.
 ```
 
+### close_session.py
+
+职责：
+
+```text
+1. 调用 collect_status 生成当前 run report。
+2. 更新派生 SUMMARY.md。
+3. 追加 JOURNAL.md session entry。
+4. 追加 EVENTS.ndjson session_closed event。
+5. 不修改 STATUS.json、不删除 LOCK、不改变 FSM。
+```
+
 第一版不做：
 
 ```text
@@ -837,7 +915,7 @@ review_task.py
 
 原因：review 依赖工程判断、研究目标、实验语义、diff 质量和 integration context，先由 Codex 按 `review-rubric.md` 手动 review 更稳。
 
-## 17. Skill 文件结构
+## 18. Skill 文件结构
 
 ```text
 research-dev-orchestrator/
@@ -855,14 +933,17 @@ research-dev-orchestrator/
     state-machine.json
     status-schema.md
     summary-template.md
+    events-schema.md
+    journal-template.md
   scripts/
     init_run.py
     create_task.py
     dispatch_claude.sh
     collect_status.py
+    close_session.py
 ```
 
-## 18. SKILL.md 的职责
+## 19. SKILL.md 的职责
 
 `SKILL.md` 保持轻量，只写：
 
@@ -877,11 +958,12 @@ research-dev-orchestrator/
 8. scripts 的调用顺序和限制。
 9. review 前必须检查 diff、evidence、mergeability、integration smoke test。
 10. SUMMARY.md 是派生 monitor，不是真源。
+11. 每个 session 结束必须维护 EVENTS.ndjson 和 JOURNAL.md。
 ```
 
 详细模板、schema、rubric、FSM 解释放进 `references`。
 
-## 19. 推荐 references 内容
+## 20. 推荐 references 内容
 
 ```text
 requirements-template.md:
@@ -919,9 +1001,15 @@ status-schema.md:
 
 summary-template.md:
   SUMMARY.md 结构和 derived artifact 约束。
+
+events-schema.md:
+  EVENTS.ndjson 的 append-only 事件格式和核心事件类型。
+
+journal-template.md:
+  JOURNAL.md 的 session closeout 模板和写入边界。
 ```
 
-## 20. 最终审计结论
+## 21. 最终审计结论
 
 这版可以作为实现基线。
 
@@ -937,7 +1025,8 @@ summary-template.md:
 7. 可复现：EXPERIMENT_PLAN + REPRODUCIBILITY + RESULT_LEDGER。
 8. 可 resume：SUMMARY.md + collect_status.py。
 9. 可诊断：diagnostics/ 保存 protocol violations。
-10. 可扩展：`resume`、Codex plugin、更多 worker 都只是可选增强。
+10. 可长期记忆：EVENTS.ndjson + JOURNAL.md 支撑跨周恢复和审计。
+11. 可扩展：`resume`、Codex plugin、更多 worker 都只是可选增强。
 ```
 
-下一步可以生成真正的 `research-dev-orchestrator` skill：先实现最小脚本闭环 `init_run.py`、`create_task.py`、`collect_status.py`，再把 `dispatch_claude.sh` 做成配置化 wrapper。
+下一步可以继续迭代 `research-dev-orchestrator` skill，同时保持长期记忆层简单：required 只有 `EVENTS.ndjson` 和 `JOURNAL.md`，`DECISIONS.md` 暂不强制。

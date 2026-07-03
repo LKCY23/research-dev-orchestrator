@@ -41,6 +41,12 @@ def render_list(values: list[str]) -> str:
     return "\n".join(f"  - {value}" for value in values)
 
 
+def append_event(run_dir: Path, event: dict) -> None:
+    events_path = run_dir / "EVENTS.ndjson"
+    with events_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a task packet in an orchestration run.")
     parser.add_argument("--run-id", required=True)
@@ -123,6 +129,19 @@ non_goals:
     (task_dir / "EVIDENCE.md").write_text(
         f"{EVIDENCE_TEMPLATE_MARKER}\n# Evidence\n\nRemove the template marker before submitting this task.\n\n## Commands Run\n\n## Tests Passed\n\n## Metrics / Outputs\n\n## Logs\n\n## Known Limitations\n",
         encoding="utf-8",
+    )
+    append_event(
+        run_dir,
+        {
+            "at": now,
+            "actor": "codex",
+            "event": "task_created",
+            "run_id": args.run_id,
+            "task_id": args.task_id,
+            "goal": args.goal,
+            "allowed_paths": args.allowed_paths,
+            "forbidden_paths": args.forbidden_paths,
+        },
     )
 
     print(task_dir)

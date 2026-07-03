@@ -40,6 +40,12 @@ def write_if_missing(path: Path, content: str) -> None:
         path.write_text(content, encoding="utf-8")
 
 
+def append_event(run_dir: Path, event: dict) -> None:
+    events_path = run_dir / "EVENTS.ndjson"
+    with events_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create an orchestration run scaffold.")
     parser.add_argument("--project-slug", required=True)
@@ -93,6 +99,19 @@ def main() -> int:
         ],
     }
     (run_dir / "RUN.json").write_text(json.dumps(run_json, indent=2) + "\n", encoding="utf-8")
+    write_if_missing(run_dir / "EVENTS.ndjson", "")
+    append_event(
+        run_dir,
+        {
+            "at": created_at,
+            "actor": "codex",
+            "event": "run_created",
+            "run_id": run_id,
+            "project_slug": project_slug,
+            "target_branch": target_branch,
+            "base_commit": base_commit,
+        },
+    )
 
     write_if_missing(
         run_dir / "SUMMARY.md",
@@ -119,6 +138,8 @@ Initialized. This file is derived and may be regenerated.
 
 ## Recent Decisions
 
+## Recent Events
+
 ## Experiment Results
 
 ## Next Actions
@@ -133,6 +154,7 @@ Initialized. This file is derived and may be regenerated.
         "REPRODUCIBILITY.md": "# Reproducibility\n\n## Environment\n\n## Dependencies\n\n## Hardware Notes\n\n## Random Seeds\n\n## Data Versions\n\n## Commands\n\n## Expected Outputs\n\n## Log Locations\n\n## Known Sources Of Nondeterminism\n\n## Reproduction Checklist\n",
         "RESULT_LEDGER.md": "# Result Ledger\n\n| Time | Task | Attempt | Command | Metric | Result | Supports Claim | Logs | Notes |\n|---|---|---|---|---|---|---|---|---|\n",
         "TASKS.md": "# Tasks\n\n| Task | Goal | State | Dependencies | Notes |\n|---|---|---|---|---|\n",
+        "JOURNAL.md": "# Journal\n\nAppend one concise entry at the end of every working session.\n",
     }
     for filename, content in scaffolds.items():
         write_if_missing(run_dir / filename, content)

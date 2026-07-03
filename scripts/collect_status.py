@@ -56,6 +56,21 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_recent_events(run_dir: Path, limit: int = 10) -> list[dict[str, Any]]:
+    events_path = run_dir / "EVENTS.ndjson"
+    if not events_path.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            events.append({"event": "invalid_event_line", "raw": line})
+    return events[-limit:]
+
+
 def skill_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -176,6 +191,11 @@ def collect(run_id: str, stale_lock_hours: float) -> dict[str, Any]:
     invalid_status_files: list[str] = []
     now_ts = datetime.now(timezone.utc).timestamp()
 
+    if not (run_dir / "EVENTS.ndjson").exists():
+        violations.append("run: missing required EVENTS.ndjson")
+    if not (run_dir / "JOURNAL.md").exists():
+        violations.append("run: missing required JOURNAL.md")
+
     for task_dir in sorted((run_dir / "tasks").glob("*")):
         if not task_dir.is_dir():
             continue
@@ -230,6 +250,7 @@ def collect(run_id: str, stale_lock_hours: float) -> dict[str, Any]:
         "invalid_status_files": invalid_status_files,
         "stale_locks": stale_locks,
         "protocol_violations": violations,
+        "recent_events": load_recent_events(run_dir),
     }
 
 
@@ -265,6 +286,12 @@ def render_human(report: dict[str, Any]) -> str:
         lines.append("Stale locks:")
         for lock in report["stale_locks"]:
             lines.append(f"  - {lock}")
+
+    if report["recent_events"]:
+        lines.append("")
+        lines.append("Recent events:")
+        for event in report["recent_events"][-5:]:
+            lines.append(f"  - {event.get('at', '')} {event.get('event', '')} {event.get('task_id', '')}")
 
     return "\n".join(lines) + "\n"
 
@@ -314,6 +341,10 @@ def render_summary(report: dict[str, Any]) -> str:
             *(f"- {warning}" for warning in warnings),
             "",
             "## Recent Decisions",
+            "",
+            "## Recent Events",
+            "",
+            *(f"- {event.get('at', '')} `{event.get('event', '')}` {event.get('task_id', '')}" for event in report["recent_events"][-10:]),
             "",
             "## Experiment Results",
             "",
