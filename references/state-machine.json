@@ -1,0 +1,39 @@
+{
+  "states": [
+    "pending",
+    "running",
+    "blocked",
+    "review",
+    "changes_requested",
+    "approved",
+    "merged",
+    "failed"
+  ],
+  "terminal_states": ["merged", "failed"],
+  "transitions": {
+    "pending": {
+      "running": ["dispatch"]
+    },
+    "running": {
+      "review": ["claude-code"],
+      "blocked": ["claude-code"]
+    },
+    "blocked": {
+      "running": ["dispatch"],
+      "failed": ["codex"]
+    },
+    "review": {
+      "approved": ["codex"],
+      "changes_requested": ["codex"],
+      "failed": ["codex"]
+    },
+    "changes_requested": {
+      "running": ["dispatch"]
+    },
+    "approved": {
+      "merged": ["codex"]
+    },
+    "merged": {},
+    "failed": {}
+  }
+}

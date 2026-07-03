@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Dev Orchestrator"
+  short_description: "Coordinate research experiments and agent coding"
+  default_prompt: "Use $research-dev-orchestrator to turn this research or experiment goal into requirements, design, task packets, worker execution, and evidence-based review."
