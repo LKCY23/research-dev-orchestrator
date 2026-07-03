@@ -57,7 +57,6 @@ def main() -> int:
     parser.add_argument("--dependencies", nargs="*", default=[])
     parser.add_argument("--branch", default="")
     parser.add_argument("--worktree", default="")
-    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     validate_task_id(args.task_id)
@@ -67,7 +66,7 @@ def main() -> int:
         raise SystemExit(f"Run not found: {run_dir}")
 
     task_dir = run_dir / "tasks" / args.task_id
-    if task_dir.exists() and not args.force:
+    if task_dir.exists():
         raise SystemExit(f"Task already exists: {task_dir}")
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "logs").mkdir(exist_ok=True)

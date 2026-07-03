@@ -35,7 +35,7 @@ from pathlib import Path
 run_dir, run_id, task_id, attempt_id, event_name, agent_name, status_path = sys.argv[1:8]
 payload = {
     "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    "actor": "dispatch" if event_name == "task_dispatched" else "claude-code",
+    "actor": "dispatch" if event_name in {"task_dispatched", "worker_exit_without_valid_status"} else "claude-code",
     "event": event_name,
     "run_id": run_id,
     "task_id": task_id,
@@ -167,8 +167,12 @@ payload = {
     "agent": "claude-code",
     "agent_name": agent_name,
     "session_id": session_id,
+    "state": "created",
+    "handoff_valid": None,
+    "handoff_state": None,
     "started_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "ended_at": None,
+    "exit_code": None,
     "runtime": {
         "model": os.environ.get("CLAUDE_MODEL"),
         "cli": command.split()[0] if command.split() else command,
@@ -206,6 +210,7 @@ PY
   echo "## Protocol Reminders"
   echo
   echo "- You may only transition STATUS.json from running to review or blocked."
+  echo "- Append the matching state_history entry: running -> review|blocked with actor claude-code."
   echo "- Do not write approved, merged, failed, or changes_requested."
   echo "- Remove RDO_TEMPLATE markers from EVIDENCE.md or HANDOFF.md before ending."
   echo "- Write substantive EVIDENCE.md and HANDOFF.md before ending."
@@ -259,11 +264,23 @@ with open(status_path, "w", encoding="utf-8") as handle:
     handle.write("\n")
 PY
 STATUS_UPDATED=1
+python3 - "$ATTEMPT_DIR/ATTEMPT.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+attempt = json.load(open(path, encoding="utf-8"))
+attempt["state"] = "running"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(attempt, handle, indent=2)
+    handle.write("\n")
+PY
 append_event "task_dispatched"
 
 if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
   echo "dry run: prompt written to ${ATTEMPT_DIR}/prompt.md" | tee "${ATTEMPT_DIR}/result.md"
   touch "${ATTEMPT_DIR}/transcript.log"
+  EXIT_CODE=0
 else
   set +e
   (cd "${WORKTREE_PATH}" && ${CLAUDE_CODE_CMD} < "${ATTEMPT_DIR}/prompt.md") \
@@ -277,10 +294,12 @@ else
   } > "${ATTEMPT_DIR}/result.md"
 fi
 
-python3 - "$STATUS_PATH" "$ATTEMPT_ID" "$TASK_DIR" <<'PY'
+set +e
+python3 - "$STATUS_PATH" "$ATTEMPT_ID" "$TASK_DIR" "$ATTEMPT_DIR/ATTEMPT.json" "$EXIT_CODE" <<'PY'
 import json
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
 
 TEMPLATE_MARKERS = {
     "EVIDENCE.md": "<!-- RDO_TEMPLATE: EVIDENCE -->",
@@ -296,17 +315,57 @@ def substantive(path: Path) -> bool:
     marker = TEMPLATE_MARKERS.get(path.name)
     return not (marker and marker in text)
 
-status_path, attempt_id, task_dir = sys.argv[1:4]
+status_path, attempt_id, task_dir, attempt_path, exit_code = sys.argv[1:6]
 status = json.load(open(status_path, encoding="utf-8"))
 state = status.get("state")
 valid_state = state in {"review", "blocked"}
 valid_attempt = status.get("current_attempt_id") == attempt_id
-evidence_or_handoff = substantive(Path(task_dir, "EVIDENCE.md")) or substantive(Path(task_dir, "HANDOFF.md"))
-if not (valid_state and valid_attempt and evidence_or_handoff):
+history = status.get("state_history") if isinstance(status.get("state_history"), list) else []
+last_transition = history[-1] if history else {}
+valid_history = (
+    isinstance(last_transition, dict)
+    and last_transition.get("from") == "running"
+    and last_transition.get("to") == state
+    and last_transition.get("actor") == "claude-code"
+)
+handoff_ok = substantive(Path(task_dir, "HANDOFF.md"))
+evidence_ok = substantive(Path(task_dir, "EVIDENCE.md"))
+if state == "review":
+    artifacts_ok = handoff_ok and evidence_ok
+elif state == "blocked":
+    artifacts_ok = handoff_ok and bool(status.get("blocker_type")) and bool(status.get("blocking_reason"))
+else:
+    artifacts_ok = False
+
+attempt = json.load(open(attempt_path, encoding="utf-8"))
+attempt["ended_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+attempt["exit_code"] = int(exit_code)
+
+if not (valid_state and valid_attempt and valid_history and artifacts_ok):
+    attempt["state"] = "invalid_handoff"
+    attempt["handoff_valid"] = False
+    attempt["handoff_state"] = None
+    with open(attempt_path, "w", encoding="utf-8") as handle:
+        json.dump(attempt, handle, indent=2)
+        handle.write("\n")
     print("worker_exit_without_valid_status", file=sys.stderr)
     print(f"state={state!r} current_attempt_id={status.get('current_attempt_id')!r}", file=sys.stderr)
+    print(f"valid_history={valid_history!r}", file=sys.stderr)
     raise SystemExit(4)
+
+attempt["state"] = "completed"
+attempt["handoff_valid"] = True
+attempt["handoff_state"] = state
+with open(attempt_path, "w", encoding="utf-8") as handle:
+    json.dump(attempt, handle, indent=2)
+    handle.write("\n")
 PY
+VALIDATION_CODE=$?
+set -e
+if [[ "${VALIDATION_CODE}" -ne 0 ]]; then
+  append_event "worker_exit_without_valid_status"
+  exit "${VALIDATION_CODE}"
+fi
 
 FINAL_STATE="$(python3 - "$STATUS_PATH" <<'PY'
 import json, sys

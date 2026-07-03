@@ -11,8 +11,11 @@ The skill runtime entrypoint is [`SKILL.md`](SKILL.md). The detailed design base
 - Decomposes work into task packets with explicit allowed paths, acceptance criteria, evidence, and handoff files.
 - Dispatches CLI coding agents through a filesystem protocol and Git worktree isolation.
 - Enforces a finite state machine through `references/state-machine.json`.
+- Keeps worker/process lifecycle in `ATTEMPT.json` instead of expanding the task FSM.
 - Provides human, machine, and diagnostic monitoring through `SUMMARY.md`, `collect_status.py --json`, and `diagnostics/`.
 - Preserves long-running context with required append-only memory files: `EVENTS.ndjson` and `JOURNAL.md`.
+- Prevents destructive overwrites of audit-bearing artifacts; use a new run, new attempt, or revision task.
+- Uses `collect_status.py` as an invariant checker across `STATUS.json`, `ATTEMPT.json`, `LOCK`, `EVENTS.ndjson`, `EVIDENCE.md`, and `HANDOFF.md`.
 
 ## Repository Layout
 

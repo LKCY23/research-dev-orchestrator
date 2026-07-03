@@ -2,6 +2,8 @@
 
 `state-machine.json` is the authoritative machine-readable FSM. This file explains the protocol for humans.
 
+Task state models task progress only. Worker/process lifecycle belongs in `ATTEMPT.json`; see `attempt-lifecycle.md`.
+
 ## States
 
 - `pending`: task packet exists and no worker has started.
@@ -22,6 +24,12 @@
 - `collect_status.py` is read-only and must never mutate state.
 
 Claude Code must not write `approved`, `merged`, `failed`, or `changes_requested`. If a worker believes failure is irrecoverable, it must write `blocked` with `blocker_type: "irrecoverable"` and a concrete `blocking_reason`.
+
+## Attempt Invariants
+
+Do not add worker/process failure states to the task FSM. A worker that exits without valid handoff should set `ATTEMPT.state = invalid_handoff`; `collect_status.py` reports this as a protocol violation while the task remains available for Codex triage.
+
+`running`, `review`, and `blocked` have cross-file invariants defined in `attempt-lifecycle.md`.
 
 ## Changes Requested
 

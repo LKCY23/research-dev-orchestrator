@@ -53,7 +53,6 @@ def main() -> int:
     parser.add_argument("--target-branch", default="")
     parser.add_argument("--run-id", default="")
     parser.add_argument("--coordinator-session-id", default="")
-    parser.add_argument("--force", action="store_true", help="Allow using an existing run directory.")
     args = parser.parse_args()
 
     root = repo_root(Path.cwd())
@@ -67,7 +66,7 @@ def main() -> int:
     base_commit = run_git(["rev-parse", "HEAD"], root, "")
 
     run_dir = root / ".agent-collab" / "runs" / run_id
-    if run_dir.exists() and not args.force:
+    if run_dir.exists():
         raise SystemExit(f"Run already exists: {run_dir}")
 
     for directory in [

@@ -504,10 +504,14 @@ tasks/T001-name/
   "agent": "claude-code",
   "agent_name": "claude-worker-1",
   "session_id": "s8d21",
+  "state": "completed",
+  "handoff_valid": true,
+  "handoff_state": "review",
   "started_at": "2026-07-03T12:10:00Z",
-  "ended_at": null,
+  "ended_at": "2026-07-03T12:20:00Z",
+  "exit_code": 0,
   "runtime": {
-    "model": "glm-5.2",
+    "model": null,
     "cli": "claude",
     "command": "claude ...",
     "cwd": "/path/to/worktree"
@@ -516,6 +520,46 @@ tasks/T001-name/
 ```
 
 `runtime.model` 可选，不作为协议主键。
+
+Attempt state 是 worker execution lifecycle，不是 task progress：
+
+```text
+created
+  ATTEMPT.json exists, worker not yet launched. This should be brief.
+
+running
+  Worker process is active.
+
+completed
+  Worker exited and made a valid protocol handoff to review or blocked.
+
+invalid_handoff
+  Worker exited but did not produce legal STATUS/EVIDENCE/HANDOFF.
+```
+
+Task state invariants:
+
+```text
+STATUS.state = running requires:
+  current_attempt_id exists
+  ATTEMPT.state in [created, running]
+  LOCK exists and matches current_attempt_id
+
+STATUS.state = review requires:
+  ATTEMPT.state = completed
+  ATTEMPT.handoff_valid = true
+  ATTEMPT.handoff_state = review
+  STATUS.state_history ends with running -> review by actor claude-code
+  EVIDENCE.md and HANDOFF.md have substantive content
+
+STATUS.state = blocked requires:
+  ATTEMPT.state = completed
+  ATTEMPT.handoff_valid = true
+  ATTEMPT.handoff_state = blocked
+  STATUS.state_history ends with running -> blocked by actor claude-code
+  HANDOFF.md has substantive content
+  blocker_type valid and blocking_reason non-empty
+```
 
 `changes_requested` 后的修复入口：
 
@@ -695,6 +739,7 @@ task_created
 task_dispatched
 worker_blocked
 worker_review_ready
+worker_exit_without_valid_status
 codex_reviewed
 changes_requested
 task_approved
@@ -717,7 +762,57 @@ session_closed
 
 `close_session.py` 是推荐入口，因为它会同时更新 `SUMMARY.md`、追加 `JOURNAL.md`、追加 `session_closed` event。
 
-## 16. Diagnostics
+## 16. Attempt Lifecycle And Audit Integrity
+
+Task FSM 只表达任务目标进展。Worker/process 状态必须放在 `ATTEMPT.json`。`collect_status.py` 是 invariant checker，负责跨 `STATUS.json`、`ATTEMPT.json`、`LOCK`、`EVENTS.ndjson`、`EVIDENCE.md`、`HANDOFF.md` 检测协议一致性，但不自动修复。
+
+四条实现原则：
+
+```text
+1. Task FSM stays about task progress only.
+2. ATTEMPT.json owns worker execution lifecycle.
+3. collect_status.py validates invariants across STATUS, ATTEMPT, LOCK, EVENTS, EVIDENCE, HANDOFF.
+4. No destructive overwrite; use new run, new attempt, or revision task.
+```
+
+No destructive overwrite principle:
+
+```text
+No command may destructively overwrite or reinitialize audit-bearing artifacts.
+Updates must be append-only where applicable, or legal state/protocol transitions where mutable.
+```
+
+Audit-bearing artifacts:
+
+```text
+STATUS.json
+TASK.md
+CONTEXT.md
+ACCEPTANCE.md
+EVIDENCE.md
+HANDOFF.md
+attempts/*
+EVENTS.ndjson
+JOURNAL.md
+reviews/*
+```
+
+第一版不提供覆盖语义：
+
+```text
+init_run.py existing run -> fail
+create_task.py existing task -> fail
+```
+
+需要变化时：
+
+```text
+new overall collaboration -> new run
+same task retry -> new attempt
+scope / acceptance / design change -> revision task, e.g. T001R1-*
+```
+
+## 17. Diagnostics
 
 协议错误和状态异常可以写入：
 
@@ -747,7 +842,7 @@ STATUS.json.evidence 与 EVIDENCE.md/logs 冲突
 LOCK attempt_id 与 STATUS.json.current_attempt_id 不一致
 ```
 
-## 17. scripts 设计
+## 18. scripts 设计
 
 第一版 scripts：
 
@@ -773,6 +868,7 @@ scripts/
 6. 创建 diagnostics/。
 7. 记录 target_branch、base_commit、protocol_version。
 8. 追加 run_created event。
+9. 已有 run 直接拒绝；不提供 --force 覆盖语义。
 ```
 
 限制：
@@ -794,6 +890,7 @@ Only scaffold headings/templates.
 4. 创建 logs/ 和 attempts/。
 5. 校验 task_id、allowed_paths、forbidden_paths。
 6. 追加 task_created event。
+7. 已有 task 直接拒绝；不覆盖 audit-bearing artifacts。
 ```
 
 限制：
@@ -819,7 +916,8 @@ Only creates pending task.
 7. 调用配置化 Claude Code CLI。
 8. 保存 transcript.log / result.md。
 9. 检查 worker 是否写出合法交付状态。
-10. 追加 task_dispatched / worker_review_ready / worker_blocked events。
+10. 维护 ATTEMPT.json state / ended_at / exit_code / handoff_valid / handoff_state。
+11. 追加 task_dispatched / worker_review_ready / worker_blocked / worker_exit_without_valid_status events。
 ```
 
 限制：
@@ -868,8 +966,10 @@ CLAUDE_CODE_CMD="${CLAUDE_CODE_CMD:-claude}"
 6. 汇总 blocker_type。
 7. 报告 LOCK 状态和可能陈旧锁。
 8. 报告缺失 evidence/log/current_attempt。
-9. 可生成 SUMMARY.md。
-10. 可写 diagnostics 文件。
+9. 校验 ATTEMPT.json lifecycle 和 running/review/blocked invariants。
+10. 严格校验 EVENTS.ndjson required fields 和 run_id。
+11. 可生成 SUMMARY.md。
+12. 可写 diagnostics 文件。
 ```
 
 模式：
@@ -915,7 +1015,7 @@ review_task.py
 
 原因：review 依赖工程判断、研究目标、实验语义、diff 质量和 integration context，先由 Codex 按 `review-rubric.md` 手动 review 更稳。
 
-## 18. Skill 文件结构
+## 19. Skill 文件结构
 
 ```text
 research-dev-orchestrator/
@@ -932,6 +1032,7 @@ research-dev-orchestrator/
     state-machine.md
     state-machine.json
     status-schema.md
+    attempt-lifecycle.md
     summary-template.md
     events-schema.md
     journal-template.md
@@ -943,7 +1044,7 @@ research-dev-orchestrator/
     close_session.py
 ```
 
-## 19. SKILL.md 的职责
+## 20. SKILL.md 的职责
 
 `SKILL.md` 保持轻量，只写：
 
@@ -959,11 +1060,12 @@ research-dev-orchestrator/
 9. review 前必须检查 diff、evidence、mergeability、integration smoke test。
 10. SUMMARY.md 是派生 monitor，不是真源。
 11. 每个 session 结束必须维护 EVENTS.ndjson 和 JOURNAL.md。
+12. Task FSM / Attempt lifecycle / audit integrity 必须分层处理。
 ```
 
 详细模板、schema、rubric、FSM 解释放进 `references`。
 
-## 20. 推荐 references 内容
+## 21. 推荐 references 内容
 
 ```text
 requirements-template.md:
@@ -999,6 +1101,9 @@ state-machine.json:
 status-schema.md:
   STATUS.json 字段解释、必填条件、blocker_type、evidence 摘要语义。
 
+attempt-lifecycle.md:
+  ATTEMPT.json schema、attempt states、handoff_valid、handoff_state、running/review/blocked invariants。
+
 summary-template.md:
   SUMMARY.md 结构和 derived artifact 约束。
 
@@ -1009,7 +1114,7 @@ journal-template.md:
   JOURNAL.md 的 session closeout 模板和写入边界。
 ```
 
-## 21. 最终审计结论
+## 22. 最终审计结论
 
 这版可以作为实现基线。
 
@@ -1026,7 +1131,9 @@ journal-template.md:
 8. 可 resume：SUMMARY.md + collect_status.py。
 9. 可诊断：diagnostics/ 保存 protocol violations。
 10. 可长期记忆：EVENTS.ndjson + JOURNAL.md 支撑跨周恢复和审计。
-11. 可扩展：`resume`、Codex plugin、更多 worker 都只是可选增强。
+11. 可区分 task progress 与 worker execution：Task FSM + ATTEMPT lifecycle 分层。
+12. 可避免破坏性覆盖：new run / new attempt / revision task。
+13. 可扩展：`resume`、Codex plugin、更多 worker 都只是可选增强。
 ```
 
 下一步可以继续迭代 `research-dev-orchestrator` skill，同时保持长期记忆层简单：required 只有 `EVENTS.ndjson` 和 `JOURNAL.md`，`DECISIONS.md` 暂不强制。

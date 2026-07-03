@@ -28,6 +28,7 @@ task_created
 task_dispatched
 worker_blocked
 worker_review_ready
+worker_exit_without_valid_status
 codex_reviewed
 changes_requested
 task_approved
@@ -39,3 +40,11 @@ session_closed
 ```
 
 Do not record every small edit. Record events needed to reconstruct the history of requirements, design, dispatch, review, merge, experiments, blockers, and session closeout.
+
+## Validation
+
+Malformed JSON, missing required fields, and wrong `run_id` are protocol violations.
+
+Unknown event types are warnings, not fatal errors. This allows future extension without breaking older runs.
+
+Task events should include `task_id`; attempt events should include `attempt_id`.

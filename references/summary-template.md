@@ -29,6 +29,8 @@ Template:
 
 ## Protocol Warnings
 
+## Protocol Non-Fatal Warnings
+
 ## Recent Decisions
 
 ## Recent Events

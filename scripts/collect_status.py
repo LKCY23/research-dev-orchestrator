@@ -30,6 +30,40 @@ REQUIRED_STATUS_FIELDS = {
 }
 
 BLOCKER_TYPES = {"needs_codex", "needs_user", "environment", "budget", "irrecoverable"}
+ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
+HANDOFF_STATES = {"review", "blocked", None}
+CORE_EVENTS = {
+    "run_created",
+    "requirements_updated",
+    "design_method_selected",
+    "adr_added",
+    "task_created",
+    "task_dispatched",
+    "worker_blocked",
+    "worker_review_ready",
+    "worker_exit_without_valid_status",
+    "codex_reviewed",
+    "changes_requested",
+    "task_approved",
+    "task_merged",
+    "task_failed",
+    "experiment_recorded",
+    "scope_changed",
+    "session_closed",
+}
+TASK_EVENTS = {
+    "task_created",
+    "task_dispatched",
+    "worker_blocked",
+    "worker_review_ready",
+    "worker_exit_without_valid_status",
+    "codex_reviewed",
+    "changes_requested",
+    "task_approved",
+    "task_merged",
+    "task_failed",
+}
+ATTEMPT_EVENTS = {"task_dispatched", "worker_blocked", "worker_review_ready", "worker_exit_without_valid_status"}
 TEMPLATE_MARKERS = {
     "EVIDENCE.md": "<!-- RDO_TEMPLATE: EVIDENCE -->",
     "HANDOFF.md": "<!-- RDO_TEMPLATE: HANDOFF -->",
@@ -56,19 +90,49 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def load_recent_events(run_dir: Path, limit: int = 10) -> list[dict[str, Any]]:
+def parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     events_path = run_dir / "EVENTS.ndjson"
     if not events_path.exists():
-        return []
+        return [], ["run: missing required EVENTS.ndjson"], []
     events: list[dict[str, Any]] = []
-    for line in events_path.read_text(encoding="utf-8").splitlines():
+    violations: list[str] = []
+    warnings: list[str] = []
+    for line_no, line in enumerate(events_path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
         try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            events.append({"event": "invalid_event_line", "raw": line})
-    return events[-limit:]
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            violations.append(f"EVENTS.ndjson line {line_no}: malformed JSON: {exc}")
+            continue
+        if not isinstance(event, dict):
+            violations.append(f"EVENTS.ndjson line {line_no}: event must be a JSON object")
+            continue
+        missing = [field for field in ("at", "actor", "event", "run_id") if not event.get(field)]
+        if missing:
+            violations.append(f"EVENTS.ndjson line {line_no}: missing required fields: {', '.join(missing)}")
+        if event.get("run_id") and event.get("run_id") != run_id:
+            violations.append(f"EVENTS.ndjson line {line_no}: run_id {event.get('run_id')!r} does not match {run_id!r}")
+        event_name = event.get("event")
+        if event_name and event_name not in CORE_EVENTS:
+            warnings.append(f"EVENTS.ndjson line {line_no}: unknown event type {event_name!r}")
+        if event_name in TASK_EVENTS and not event.get("task_id"):
+            violations.append(f"EVENTS.ndjson line {line_no}: event {event_name!r} requires task_id")
+        if event_name in ATTEMPT_EVENTS and not event.get("attempt_id"):
+            violations.append(f"EVENTS.ndjson line {line_no}: event {event_name!r} requires attempt_id")
+        if event.get("at") and parse_iso(event.get("at")) is None:
+            violations.append(f"EVENTS.ndjson line {line_no}: invalid at timestamp {event.get('at')!r}")
+        events.append(event)
+    return events, violations, warnings
 
 
 def skill_root() -> Path:
@@ -91,8 +155,99 @@ def has_substantive_content(path: Path) -> bool:
     return True
 
 
-def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any]) -> list[str]:
+def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minutes: float) -> tuple[list[str], list[str], dict[str, Any] | None]:
     violations: list[str] = []
+    warnings: list[str] = []
+    state = status.get("state")
+    attempt_id = status.get("current_attempt_id")
+    if not attempt_id:
+        return violations, warnings, None
+
+    attempt_path = task_dir / "attempts" / str(attempt_id) / "ATTEMPT.json"
+    if not attempt_path.exists():
+        violations.append(f"{task_dir.name}: ATTEMPT.json missing for current_attempt_id {attempt_id}")
+        return violations, warnings, None
+    try:
+        attempt = load_json(attempt_path)
+    except json.JSONDecodeError as exc:
+        violations.append(f"{task_dir.name}: invalid ATTEMPT.json for {attempt_id}: {exc}")
+        return violations, warnings, None
+
+    required = {
+        "attempt_id",
+        "task_id",
+        "agent",
+        "agent_name",
+        "session_id",
+        "state",
+        "handoff_valid",
+        "handoff_state",
+        "started_at",
+        "ended_at",
+        "exit_code",
+        "runtime",
+    }
+    missing = sorted(required - set(attempt))
+    if missing:
+        violations.append(f"{task_dir.name}: ATTEMPT.json missing fields: {', '.join(missing)}")
+    if attempt.get("attempt_id") != attempt_id:
+        violations.append(f"{task_dir.name}: ATTEMPT.json attempt_id does not match current_attempt_id")
+    if attempt.get("task_id") != status.get("task_id"):
+        violations.append(f"{task_dir.name}: ATTEMPT.json task_id does not match STATUS task_id")
+    if attempt.get("state") not in ATTEMPT_STATES:
+        violations.append(f"{task_dir.name}: invalid ATTEMPT.state {attempt.get('state')!r}")
+    if attempt.get("handoff_state") not in HANDOFF_STATES:
+        violations.append(f"{task_dir.name}: invalid ATTEMPT.handoff_state {attempt.get('handoff_state')!r}")
+    if attempt.get("started_at") and parse_iso(attempt.get("started_at")) is None:
+        violations.append(f"{task_dir.name}: invalid ATTEMPT.started_at {attempt.get('started_at')!r}")
+    if attempt.get("ended_at") and parse_iso(attempt.get("ended_at")) is None:
+        violations.append(f"{task_dir.name}: invalid ATTEMPT.ended_at {attempt.get('ended_at')!r}")
+
+    attempt_state = attempt.get("state")
+    if attempt_state in {"completed", "invalid_handoff"}:
+        if not attempt.get("ended_at"):
+            violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires ended_at")
+        if attempt.get("exit_code") is None:
+            violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires exit_code")
+    if attempt_state == "completed":
+        if attempt.get("handoff_valid") is not True:
+            violations.append(f"{task_dir.name}: completed ATTEMPT requires handoff_valid=true")
+        if attempt.get("handoff_state") not in {"review", "blocked"}:
+            violations.append(f"{task_dir.name}: completed ATTEMPT requires handoff_state review or blocked")
+    if attempt_state == "invalid_handoff":
+        if attempt.get("handoff_valid") is not False:
+            violations.append(f"{task_dir.name}: invalid_handoff ATTEMPT requires handoff_valid=false")
+
+    if attempt_state == "created":
+        started = parse_iso(attempt.get("started_at"))
+        if started:
+            age_minutes = (datetime.now(timezone.utc) - started).total_seconds() / 60
+            if age_minutes > stale_created_minutes:
+                warnings.append(f"{task_dir.name}: ATTEMPT.state created for {age_minutes:.1f} minutes")
+
+    lock = task_dir / "LOCK"
+    if state == "running":
+        if attempt_state not in {"created", "running"}:
+            violations.append(f"{task_dir.name}: STATUS running requires ATTEMPT.state created or running, got {attempt_state!r}")
+        if not lock.exists():
+            violations.append(f"{task_dir.name}: STATUS running requires LOCK")
+    if state == "review":
+        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "review":
+            violations.append(f"{task_dir.name}: STATUS review requires completed attempt with handoff_state=review")
+        if not has_substantive_content(task_dir / "HANDOFF.md"):
+            violations.append(f"{task_dir.name}: review task has missing or template-only HANDOFF.md")
+    if state == "blocked":
+        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "blocked":
+            violations.append(f"{task_dir.name}: STATUS blocked requires completed attempt with handoff_state=blocked")
+        if not has_substantive_content(task_dir / "HANDOFF.md"):
+            violations.append(f"{task_dir.name}: blocked task has missing or template-only HANDOFF.md")
+
+    return violations, warnings, attempt
+
+
+def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any], stale_created_minutes: float) -> tuple[list[str], list[str]]:
+    violations: list[str] = []
+    warnings: list[str] = []
     missing = sorted(REQUIRED_STATUS_FIELDS - set(status))
     if missing:
         violations.append(f"{task_dir.name}: missing STATUS fields: {', '.join(missing)}")
@@ -168,6 +323,9 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any])
         violations.append(f"{task_dir.name}: {state} task is missing current_attempt_id")
     if attempt_id and not (task_dir / "attempts" / str(attempt_id)).exists():
         violations.append(f"{task_dir.name}: current_attempt_id directory missing: {attempt_id}")
+    attempt_violations, attempt_warnings, _ = validate_attempt(task_dir, status, stale_created_minutes)
+    violations.extend(attempt_violations)
+    warnings.extend(attempt_warnings)
 
     lock = task_dir / "LOCK"
     if lock.exists() and attempt_id:
@@ -175,10 +333,10 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any])
         if f"attempt_id: {attempt_id}" not in text:
             violations.append(f"{task_dir.name}: LOCK attempt_id does not match STATUS current_attempt_id")
 
-    return violations
+    return violations, warnings
 
 
-def collect(run_id: str, stale_lock_hours: float) -> dict[str, Any]:
+def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float = 10.0) -> dict[str, Any]:
     root = repo_root(Path.cwd())
     run_dir = root / ".agent-collab" / "runs" / run_id
     if not run_dir.exists():
@@ -187,12 +345,14 @@ def collect(run_id: str, stale_lock_hours: float) -> dict[str, Any]:
     fsm = load_fsm()
     tasks: list[dict[str, Any]] = []
     violations: list[str] = []
+    warnings: list[str] = []
     stale_locks: list[str] = []
     invalid_status_files: list[str] = []
     now_ts = datetime.now(timezone.utc).timestamp()
 
-    if not (run_dir / "EVENTS.ndjson").exists():
-        violations.append("run: missing required EVENTS.ndjson")
+    events, event_violations, event_warnings = load_events(run_dir, run_id)
+    violations.extend(event_violations)
+    warnings.extend(event_warnings)
     if not (run_dir / "JOURNAL.md").exists():
         violations.append("run: missing required JOURNAL.md")
 
@@ -211,7 +371,9 @@ def collect(run_id: str, stale_lock_hours: float) -> dict[str, Any]:
             violations.append(f"{task_dir.name}: invalid STATUS.json: {exc}")
             continue
 
-        violations.extend(validate_status(task_dir, status, fsm))
+        status_violations, status_warnings = validate_status(task_dir, status, fsm, stale_created_minutes)
+        violations.extend(status_violations)
+        warnings.extend(status_warnings)
 
         lock = task_dir / "LOCK"
         lock_info = None
@@ -250,7 +412,8 @@ def collect(run_id: str, stale_lock_hours: float) -> dict[str, Any]:
         "invalid_status_files": invalid_status_files,
         "stale_locks": stale_locks,
         "protocol_violations": violations,
-        "recent_events": load_recent_events(run_dir),
+        "protocol_warnings": warnings,
+        "recent_events": events[-10:],
     }
 
 
@@ -280,6 +443,11 @@ def render_human(report: dict[str, Any]) -> str:
         lines.append("Protocol violations:")
         for violation in report["protocol_violations"]:
             lines.append(f"  - {violation}")
+    if report["protocol_warnings"]:
+        lines.append("")
+        lines.append("Protocol warnings:")
+        for warning in report["protocol_warnings"]:
+            lines.append(f"  - {warning}")
 
     if report["stale_locks"]:
         lines.append("")
@@ -310,6 +478,7 @@ def render_summary(report: dict[str, Any]) -> str:
         blockers.append(f"| {task['task_id']} | {task.get('blocker_type') or ''} | {task.get('blocking_reason') or ''} |")
 
     warnings = report["protocol_violations"] or ["None"]
+    protocol_warnings = report["protocol_warnings"] or ["None"]
     return "\n".join(
         [
             "# Run Summary",
@@ -339,6 +508,10 @@ def render_summary(report: dict[str, Any]) -> str:
             "## Protocol Warnings",
             "",
             *(f"- {warning}" for warning in warnings),
+            "",
+            "## Protocol Non-Fatal Warnings",
+            "",
+            *(f"- {warning}" for warning in protocol_warnings),
             "",
             "## Recent Decisions",
             "",
@@ -374,9 +547,10 @@ def main() -> int:
     parser.add_argument("--write-summary", action="store_true", help="Write derived SUMMARY.md.")
     parser.add_argument("--write-diagnostics", action="store_true", help="Write derived diagnostics files.")
     parser.add_argument("--stale-lock-hours", type=float, default=6.0)
+    parser.add_argument("--stale-created-minutes", type=float, default=10.0)
     args = parser.parse_args()
 
-    report = collect(args.run_id, args.stale_lock_hours)
+    report = collect(args.run_id, args.stale_lock_hours, args.stale_created_minutes)
 
     if args.write_summary:
         Path(report["run_dir"], "SUMMARY.md").write_text(render_summary(report), encoding="utf-8")

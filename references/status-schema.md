@@ -69,3 +69,13 @@ attempts/*/result.md
 If the summary conflicts with evidence files, report a protocol violation and do not auto-repair it.
 
 Template-only `EVIDENCE.md` or `HANDOFF.md` files with `RDO_TEMPLATE` markers are not valid evidence or handoff content.
+
+## Attempt Invariants
+
+`current_attempt_id` points to the current `attempts/<attempt-id>/ATTEMPT.json`.
+
+`STATUS.state = running` requires a matching lock and an attempt whose state is `created` or `running`.
+
+`STATUS.state = review` requires a completed attempt with `handoff_valid = true`, `handoff_state = review`, and substantive `EVIDENCE.md` and `HANDOFF.md`.
+
+`STATUS.state = blocked` requires a completed attempt with `handoff_valid = true`, `handoff_state = blocked`, substantive `HANDOFF.md`, valid `blocker_type`, and non-empty `blocking_reason`.

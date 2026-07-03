@@ -18,6 +18,8 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.
 - `SUMMARY.md` and `diagnostics/` are derived monitor artifacts, not sources of truth.
 - `EVENTS.ndjson` and `JOURNAL.md` are required long-term memory artifacts. Use them to preserve cross-session history without adding a heavier decision database.
+- Task FSM stays about task progress only. `ATTEMPT.json` owns worker execution lifecycle. `collect_status.py` validates invariants across status, attempt, lock, events, evidence, and handoff files.
+- Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
 
 ## Standard Workflow
 
@@ -49,6 +51,7 @@ Read references only when they are needed:
 - `references/state-machine.md`: use for human-readable FSM semantics.
 - `references/state-machine.json`: use as the authoritative machine-readable FSM.
 - `references/status-schema.md`: use before writing or reviewing `STATUS.json`.
+- `references/attempt-lifecycle.md`: use before dispatching workers or auditing running/review/blocked invariants.
 - `references/review-rubric.md`: use before Codex review and merge decisions.
 - `references/summary-template.md`: use when updating or auditing `SUMMARY.md`.
 - `references/events-schema.md`: use when appending or auditing `EVENTS.ndjson`.
@@ -72,9 +75,9 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-
 
 `init_run.py` scaffolds only. It must not make substantive research, design, or architecture decisions.
 
-`create_task.py` creates `pending` tasks only. It must not dispatch, create locks, or merge.
+`create_task.py` creates `pending` tasks only. It must not overwrite existing tasks, dispatch, create locks, or merge.
 
-`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, create a lock, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must not synthesize `review` or `blocked` for the worker.
+`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, create a lock, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and must not synthesize `review` or `blocked` for the worker.
 
 `collect_status.py` is read-only by default. It must not modify `STATUS.json`, delete locks, change FSM state, or repair violations. `--write-summary` may update only `SUMMARY.md`; `--write-diagnostics` may write only diagnostics files.
 
