@@ -52,23 +52,24 @@ Read references only when they are needed:
 
 ## Scripts
 
-Run scripts from a repository root unless a script explicitly says otherwise.
+Run scripts from the target repository root, but call the scripts by absolute path from this skill directory. If needed, set `RESEARCH_DEV_ORCHESTRATOR_HOME` to the directory containing this `SKILL.md`.
 
 ```bash
-python scripts/init_run.py --project-slug <slug> --objective "<objective>" --target-branch <branch>
-python scripts/create_task.py --run-id <run-id> --task-id T001-name --goal "<goal>" --allowed-paths path1 path2
-scripts/dispatch_claude.sh <run-id> <task-id>
-python scripts/collect_status.py --run-id <run-id>
-python scripts/collect_status.py --run-id <run-id> --json
-python scripts/collect_status.py --run-id <run-id> --write-summary
-python scripts/collect_status.py --run-id <run-id> --write-diagnostics
+export RESEARCH_DEV_ORCHESTRATOR_HOME=/absolute/path/to/research-dev-orchestrator
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/init_run.py" --project-slug <slug> --objective "<objective>" --target-branch <branch>
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" --run-id <run-id> --task-id T001-name --goal "<goal>" --allowed-paths path1 path2
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> <task-id>
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-diagnostics
 ```
 
 `init_run.py` scaffolds only. It must not make substantive research, design, or architecture decisions.
 
 `create_task.py` creates `pending` tasks only. It must not dispatch, create locks, or merge.
 
-`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, create a lock, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It must not synthesize `review` or `blocked` for the worker.
+`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, create a lock, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must not synthesize `review` or `blocked` for the worker.
 
 `collect_status.py` is read-only by default. It must not modify `STATUS.json`, delete locks, change FSM state, or repair violations. `--write-summary` may update only `SUMMARY.md`; `--write-diagnostics` may write only diagnostics files.
 

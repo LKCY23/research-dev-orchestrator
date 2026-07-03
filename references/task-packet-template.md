@@ -58,7 +58,7 @@ Post-merge smoke test, if required
 
 ## EVIDENCE.md
 
-Workers must write:
+Workers must remove `<!-- RDO_TEMPLATE: EVIDENCE -->` and write:
 
 ```text
 Commands Run
@@ -70,7 +70,7 @@ Known Limitations
 
 ## HANDOFF.md
 
-Workers must write enough for Codex review or unblock:
+Workers must remove `<!-- RDO_TEMPLATE: HANDOFF -->` and write enough for Codex review or unblock:
 
 ```text
 What changed

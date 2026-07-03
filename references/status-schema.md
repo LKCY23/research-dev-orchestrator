@@ -67,3 +67,5 @@ attempts/*/result.md
 ```
 
 If the summary conflicts with evidence files, report a protocol violation and do not auto-repair it.
+
+Template-only `EVIDENCE.md` or `HANDOFF.md` files with `RDO_TEMPLATE` markers are not valid evidence or handoff content.

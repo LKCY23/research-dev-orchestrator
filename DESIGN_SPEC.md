@@ -459,7 +459,7 @@ Smoke test
 Failure handoff condition
 ```
 
-`EVIDENCE.md` 必须包含：
+`EVIDENCE.md` 必须移除 `<!-- RDO_TEMPLATE: EVIDENCE -->` marker，并包含：
 
 ```text
 Commands Run
@@ -469,7 +469,7 @@ Logs
 Known Limitations
 ```
 
-`HANDOFF.md` 用于 worker 向 Codex 交接：
+`HANDOFF.md` 必须移除 `<!-- RDO_TEMPLATE: HANDOFF -->` marker，并用于 worker 向 Codex 交接：
 
 ```text
 What changed
@@ -586,7 +586,7 @@ attempts/*/*
 Codex 通过：
 
 ```bash
-python scripts/collect_status.py --run-id <run-id>
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>
 ```
 
 收集状态。
@@ -751,7 +751,7 @@ Only creates pending task.
 3. 检查 LOCK。
 4. 创建 branch/worktree。
 5. 创建 attempt 目录。
-6. 拼接 prompt.md。
+6. 拼接 prompt.md，并显式写入 TASK_DIR、STATUS_PATH、EVIDENCE_PATH、HANDOFF_PATH、ATTEMPT_DIR 等绝对协议路径。
 7. 调用配置化 Claude Code CLI。
 8. 保存 transcript.log / result.md。
 9. 检查 worker 是否写出合法交付状态。
@@ -772,7 +772,7 @@ dispatch 后必须检查：
 ```text
 STATUS.json.state in [review, blocked]
 STATUS.json.current_attempt_id == current attempt
-EVIDENCE.md or HANDOFF.md has non-empty content
+EVIDENCE.md or HANDOFF.md has substantive content and no RDO_TEMPLATE marker
 attempt transcript/result exists
 ```
 
@@ -810,10 +810,10 @@ CLAUDE_CODE_CMD="${CLAUDE_CODE_CMD:-claude}"
 模式：
 
 ```bash
-python scripts/collect_status.py --run-id <run-id>
-python scripts/collect_status.py --run-id <run-id> --json
-python scripts/collect_status.py --run-id <run-id> --write-summary
-python scripts/collect_status.py --run-id <run-id> --write-diagnostics
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-diagnostics
 ```
 
 限制：

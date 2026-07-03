@@ -31,6 +31,12 @@ python -m py_compile scripts/init_run.py scripts/create_task.py scripts/collect_
 bash -n scripts/dispatch_claude.sh
 ```
 
+When using the skill from another target repository, keep the current working directory at that target repository root and call this repository's scripts by absolute path, or set:
+
+```bash
+export RESEARCH_DEV_ORCHESTRATOR_HOME=/path/to/research-dev-orchestrator
+```
+
 ## Notes
 
 This repository intentionally keeps the long design document separate from `SKILL.md`. If packaging the final skill for installation, include `SKILL.md`, `references/`, `scripts/`, and `agents/openai.yaml`; `DESIGN_SPEC.md` and this README can remain development artifacts.

@@ -30,6 +30,10 @@ REQUIRED_STATUS_FIELDS = {
 }
 
 BLOCKER_TYPES = {"needs_codex", "needs_user", "environment", "budget", "irrecoverable"}
+TEMPLATE_MARKERS = {
+    "EVIDENCE.md": "<!-- RDO_TEMPLATE: EVIDENCE -->",
+    "HANDOFF.md": "<!-- RDO_TEMPLATE: HANDOFF -->",
+}
 
 
 def utc_now() -> str:
@@ -60,8 +64,16 @@ def load_fsm() -> dict[str, Any]:
     return load_json(skill_root() / "references" / "state-machine.json")
 
 
-def nonempty(path: Path) -> bool:
-    return path.exists() and path.read_text(encoding="utf-8").strip() != ""
+def has_substantive_content(path: Path) -> bool:
+    if not path.exists():
+        return False
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return False
+    marker = TEMPLATE_MARKERS.get(path.name)
+    if marker and marker in text:
+        return False
+    return True
 
 
 def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any]) -> list[str]:
@@ -93,6 +105,15 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any])
             violations.append(f"{task_dir.name}: illegal transition {from_state!r} -> {to_state!r}")
         elif actor not in allowed:
             violations.append(f"{task_dir.name}: illegal actor {actor!r} for {from_state!r} -> {to_state!r}")
+        if idx == 0 and from_state != "pending":
+            violations.append(f"{task_dir.name}: first state_history transition must start from 'pending'")
+        if idx > 0 and isinstance(history[idx - 1], dict):
+            previous_to = history[idx - 1].get("to")
+            if previous_to != from_state:
+                violations.append(
+                    f"{task_dir.name}: non-continuous state_history at index {idx}: "
+                    f"previous to={previous_to!r}, current from={from_state!r}"
+                )
 
     if history:
         last = history[-1]
@@ -124,8 +145,8 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any])
                 if not log_path.exists():
                     violations.append(f"{task_dir.name}: evidence log missing: {log_ref}")
 
-    if state in {"review", "approved", "merged"} and not nonempty(task_dir / "EVIDENCE.md"):
-        violations.append(f"{task_dir.name}: {state} task has empty or missing EVIDENCE.md")
+    if state in {"review", "approved", "merged"} and not has_substantive_content(task_dir / "EVIDENCE.md"):
+        violations.append(f"{task_dir.name}: {state} task has missing or template-only EVIDENCE.md")
 
     attempt_id = status.get("current_attempt_id")
     if state in {"running", "blocked", "review", "approved", "merged"} and not attempt_id:

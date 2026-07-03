@@ -10,6 +10,9 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+HANDOFF_TEMPLATE_MARKER = "<!-- RDO_TEMPLATE: HANDOFF -->"
+EVIDENCE_TEMPLATE_MARKER = "<!-- RDO_TEMPLATE: EVIDENCE -->"
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -113,8 +116,14 @@ non_goals:
     )
     (task_dir / "CONTEXT.md").write_text("# Context\n\n## Relevant Requirements\n\n## Design Notes\n\n## Interfaces\n\n## Constraints\n", encoding="utf-8")
     (task_dir / "ACCEPTANCE.md").write_text("# Acceptance\n\n## Required Commands\n\n## Expected Outputs\n\n## Metrics Or Thresholds\n\n## Smoke Test\n\n## Failure Handoff Condition\n\n## Post-Merge Smoke Test\n", encoding="utf-8")
-    (task_dir / "HANDOFF.md").write_text("# Handoff\n\n## What Changed\n\n## What Failed\n\n## Evidence\n\n## Decision Needed\n\n## Suggested Next Action\n", encoding="utf-8")
-    (task_dir / "EVIDENCE.md").write_text("# Evidence\n\n## Commands Run\n\n## Tests Passed\n\n## Metrics / Outputs\n\n## Logs\n\n## Known Limitations\n", encoding="utf-8")
+    (task_dir / "HANDOFF.md").write_text(
+        f"{HANDOFF_TEMPLATE_MARKER}\n# Handoff\n\nRemove the template marker before submitting this task.\n\n## What Changed\n\n## What Failed\n\n## Evidence\n\n## Decision Needed\n\n## Suggested Next Action\n",
+        encoding="utf-8",
+    )
+    (task_dir / "EVIDENCE.md").write_text(
+        f"{EVIDENCE_TEMPLATE_MARKER}\n# Evidence\n\nRemove the template marker before submitting this task.\n\n## Commands Run\n\n## Tests Passed\n\n## Metrics / Outputs\n\n## Logs\n\n## Known Limitations\n",
+        encoding="utf-8",
+    )
 
     print(task_dir)
     return 0
