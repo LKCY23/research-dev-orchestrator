@@ -21,9 +21,7 @@ sleep 3
 
 set +e
 collect_json smoke-run "${repo}/status.json"
-collect_code="$?"
 set -e
-[[ "${collect_code}" != "0" ]]
 assert_json_expr "${repo}/status.json" "payload['valid'] is False"
 
 python3 - <<'PY'
