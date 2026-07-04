@@ -46,6 +46,10 @@ def main() -> int:
     if run_dir.exists():
         raise SystemExit(f"Run already exists: {run_dir}")
 
+    collab_dir = root / ".agent-collab"
+    collab_dir.mkdir(parents=True, exist_ok=True)
+    write_if_missing(collab_dir / "rdo.toml", render_template("run/rdo.toml"))
+
     for directory in [
         run_dir,
         run_dir / "ADR",

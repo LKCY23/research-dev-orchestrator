@@ -35,11 +35,14 @@ Do not introduce watcher, daemon, queue, RPC, or fire-and-forget semantics in th
 
 ## Configuration
 
+Project-level defaults may be stored in `.agent-collab/rdo.toml`; see `configuration.md`.
+
 ```bash
 RDO_WORKER_BACKEND=plain|tmux
 RDO_TMUX_SESSION_PREFIX=rdo
 RDO_TMUX_KEEP_SESSION=0|1
 RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
+RDO_TMUX_EXIT_CODE_GRACE_SECONDS=60
 ```
 
 Meanings:
@@ -58,6 +61,9 @@ RDO_TMUX_KEEP_SESSION
 RDO_TMUX_WAIT_TIMEOUT_SECONDS
   0: no timeout.
   >0: timeout while waiting for the attempt-local exit_code file.
+
+RDO_TMUX_EXIT_CODE_GRACE_SECONDS
+  Grace period for collect_status.py before a tmux exit_code file on a still-running attempt becomes a protocol violation.
 ```
 
 ## ATTEMPT.runtime Schema

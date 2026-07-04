@@ -11,6 +11,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from collect_status import collect, render_summary  # noqa: E402
+from config import load_config  # noqa: E402
 from protocol import append_event, repo_root, utc_now  # noqa: E402
 
 
@@ -36,7 +37,15 @@ def main() -> int:
     if not run_dir.exists():
         raise SystemExit(f"Run not found: {run_dir}")
 
-    report = collect(args.run_id, stale_lock_hours=6.0)
+    config_result = load_config(root)
+    report = collect(
+        args.run_id,
+        stale_lock_hours=config_result.config.stale_lock_hours,
+        stale_created_minutes=config_result.config.stale_created_minutes,
+        tmux_exit_code_grace_seconds=config_result.config.tmux_exit_code_grace_seconds,
+        config_warnings=config_result.warnings,
+        config_errors=config_result.errors,
+    )
     (run_dir / "SUMMARY.md").write_text(render_summary(report), encoding="utf-8")
 
     now = utc_now()

@@ -1032,6 +1032,8 @@ LOCK attempt_id 与 STATUS.json.current_attempt_id 不一致
 ```text
 scripts/
   protocol.py
+  config.py
+  config_cli.py
   validation.py
   protocol_cli.py
   init_run.py
@@ -1044,6 +1046,10 @@ scripts/
 ```
 
 `protocol.py` 是脚本内部协议常量和底层 helper 真源，不是用户接口或公共 SDK。
+
+`config.py` 是 operational defaults loader，读取 `.agent-collab/rdo.toml` 和环境变量。它不定义状态机、schema、event、blocker type 或 protocol version。
+
+`config_cli.py` 是配置检查和导出工具。第一阶段只用于 inspect/validate/export，不接管 dispatch 生命周期。
 
 `validation.py` 是共享协议校验规则层。在线 gate（例如 `protocol_cli.py validate-handoff`）和离线 audit（例如 `collect_status.py`）必须复用这里的规则，避免 handoff validation 漂移。
 
@@ -1277,12 +1283,16 @@ research-dev-orchestrator/
     state-machine.json
     status-schema.md
     attempt-lifecycle.md
+    configuration.md
     lock-recovery.md
     summary-template.md
     events-schema.md
     journal-template.md
   scripts/
     protocol.py
+    config.py
+    config_cli.py
+    validation.py
     protocol_cli.py
     init_run.py
     create_task.py

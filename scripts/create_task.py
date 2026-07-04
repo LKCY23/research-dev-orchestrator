@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 
+from config import load_config
 from protocol import append_event, render_template, repo_root, utc_now
 
 
@@ -36,6 +38,12 @@ def main() -> int:
 
     validate_task_id(args.task_id)
     root = repo_root(Path.cwd())
+    config_result = load_config(root)
+    for warning in config_result.warnings:
+        print(f"config warning: {warning}", file=sys.stderr)
+    if config_result.errors:
+        raise SystemExit("\n".join(f"config error: {error}" for error in config_result.errors))
+
     run_dir = root / ".agent-collab" / "runs" / args.run_id
     if not run_dir.exists():
         raise SystemExit(f"Run not found: {run_dir}")
@@ -47,8 +55,9 @@ def main() -> int:
     (task_dir / "logs").mkdir(exist_ok=True)
     (task_dir / "attempts").mkdir(exist_ok=True)
 
-    branch = args.branch or f"agent/{args.task_id}"
-    worktree = args.worktree or f".agent-worktrees/{args.task_id}"
+    config = config_result.config
+    branch = args.branch or f"{config.task_branch_prefix}{args.task_id}"
+    worktree = args.worktree or str(Path(config.worktree_root) / args.task_id)
     now = utc_now()
 
     status = {

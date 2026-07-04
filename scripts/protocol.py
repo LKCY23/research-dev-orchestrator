@@ -47,7 +47,6 @@ BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "ir
 ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
 HANDOFF_STATES = {"review", "blocked", None}
 RUNTIME_BACKENDS = {"plain", "tmux"}
-TMUX_EXIT_CODE_GRACE_SECONDS = 60
 
 CORE_EVENTS = {
     "run_created",

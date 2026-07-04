@@ -20,6 +20,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - `EVENTS.ndjson` and `JOURNAL.md` are required long-term memory artifacts. Use them to preserve cross-session history without adding a heavier decision database.
 - Task FSM stays about task progress only. `ATTEMPT.json` owns worker execution lifecycle. `collect_status.py` validates invariants across status, attempt, lock, events, evidence, and handoff files.
 - `scripts/protocol.py` is the script-internal source for protocol constants and low-level helpers. `scripts/validation.py` owns shared protocol validation rules used by online dispatch gates and offline status audit. Neither file is a user interface or public SDK.
+- `.agent-collab/rdo.toml` and `scripts/config.py` own operational defaults only. They must not configure protocol states, schema fields, events, blocker types, or protocol version.
 - Worker runtime backend is an execution detail. Default to `plain`; use `tmux` only when the user wants attachable long-running worker observation. Backend choice must not change protocol truth sources.
 - `/rdo ...` commands are Codex-facing intent grammar for human control. They are not executable shell slash commands and must still follow all protocol invariants.
 - Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
@@ -55,6 +56,7 @@ Read references only when they are needed:
 - `references/state-machine.json`: use as the authoritative machine-readable FSM.
 - `references/status-schema.md`: use before writing or reviewing `STATUS.json`.
 - `references/attempt-lifecycle.md`: use before dispatching workers or auditing running/review/blocked invariants.
+- `references/configuration.md`: use when changing `.agent-collab/rdo.toml`, config defaults, env overrides, stale thresholds, or task branch/worktree defaults.
 - `references/runtime-backends.md`: use before enabling `RDO_WORKER_BACKEND=tmux` or auditing backend-specific attempt metadata.
 - `references/protocol-constants.md`: use when changing script constants, exit codes, blocker types, or event types.
 - `references/command-surface.md`: use when the user invokes `/rdo ...` command-like intents.
@@ -78,6 +80,7 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-diagnostics
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/config_cli.py" validate
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/remove_dispatch_lock.py" --run-id <run-id> --task-id <task-id> --reason "<approved reason>" --confirmed
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-id> --summary "<session summary>" --changed "<change>" --next-action "<next>"
 "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/run_smoke_tests.sh"
@@ -107,6 +110,8 @@ Read `references/command-surface.md` before acting on `/rdo ...`. `/rdo review` 
 `protocol.py` is used by scripts for constants, template rendering, JSON helpers, and event append. Users should not call it directly.
 
 `validation.py` contains shared protocol validation rules, starting with worker handoff validation. `protocol_cli.py validate-handoff` and `collect_status.py` must reuse it so online gate checks and offline audit do not drift.
+
+`config.py` loads operational defaults from `.agent-collab/rdo.toml` and environment variables. It must not define or mutate protocol truth. CLI flags and `/rdo` one-off arguments still override config.
 
 `protocol_cli.py` is a narrow internal bridge for `dispatch_claude.sh`. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
 

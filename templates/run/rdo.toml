@@ -1,0 +1,26 @@
+# research-dev-orchestrator project defaults.
+# This file configures operational defaults only. It does not define protocol
+# version, task states, event types, schema fields, or FSM transitions.
+
+[worker]
+# Interpreted by the dispatch shell when dispatch config integration is enabled.
+# Do not put secrets in this command; prefer environment variables for credentials.
+command = "claude"
+agent_name = "claude-worker"
+
+[runtime]
+backend = "plain" # plain | tmux
+
+[tmux]
+session_prefix = "rdo"
+keep_session = false
+wait_timeout_seconds = 0
+exit_code_grace_seconds = 60
+
+[status]
+stale_lock_hours = 6.0
+stale_created_minutes = 10.0
+
+[task]
+branch_prefix = "agent/"
+worktree_root = ".agent-worktrees"

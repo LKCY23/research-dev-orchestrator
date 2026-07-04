@@ -10,16 +10,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from config import load_config
 from protocol import (  # noqa: E402
     ATTEMPT_EVENTS,
     ATTEMPT_STATES,
     BLOCKER_TYPES,
     CORE_EVENTS,
     HANDOFF_STATES,
+    PROTOCOL_VERSION,
     REQUIRED_STATUS_FIELDS,
     RUNTIME_BACKENDS,
     TASK_EVENTS,
-    TMUX_EXIT_CODE_GRACE_SECONDS,
     has_substantive_content,
     is_int_not_bool,
     is_non_empty_string,
@@ -76,7 +77,12 @@ def load_fsm() -> dict[str, Any]:
     return load_json(skill_root() / "references" / "state-machine.json")
 
 
-def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minutes: float) -> tuple[list[str], list[str], dict[str, Any] | None]:
+def validate_attempt(
+    task_dir: Path,
+    status: dict[str, Any],
+    stale_created_minutes: float,
+    tmux_exit_code_grace_seconds: int,
+) -> tuple[list[str], list[str], dict[str, Any] | None]:
     violations: list[str] = []
     warnings: list[str] = []
     state = status.get("state")
@@ -209,7 +215,7 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
                 exit_code_path = attempt_path.parent / "exit_code"
                 if exit_code_path.exists():
                     exit_code_age = (datetime.now(timezone.utc).timestamp() - exit_code_path.stat().st_mtime)
-                    if dispatch_pid_alive is True and exit_code_age <= TMUX_EXIT_CODE_GRACE_SECONDS:
+                    if dispatch_pid_alive is True and exit_code_age <= tmux_exit_code_grace_seconds:
                         warnings.append(
                             f"{task_dir.name}: tmux exit_code file exists while dispatch appears alive; "
                             f"handoff validation may be in progress ({exit_code_age:.1f}s old)"
@@ -231,7 +237,13 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
     return violations, warnings, attempt
 
 
-def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any], stale_created_minutes: float) -> tuple[list[str], list[str]]:
+def validate_status(
+    task_dir: Path,
+    status: dict[str, Any],
+    fsm: dict[str, Any],
+    stale_created_minutes: float,
+    tmux_exit_code_grace_seconds: int,
+) -> tuple[list[str], list[str]]:
     violations: list[str] = []
     warnings: list[str] = []
     missing = sorted(REQUIRED_STATUS_FIELDS - set(status))
@@ -308,7 +320,12 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any],
         violations.append(f"{task_dir.name}: {state} task is missing current_attempt_id")
     if attempt_id and not (task_dir / "attempts" / str(attempt_id)).exists():
         violations.append(f"{task_dir.name}: current_attempt_id directory missing: {attempt_id}")
-    attempt_violations, attempt_warnings, _ = validate_attempt(task_dir, status, stale_created_minutes)
+    attempt_violations, attempt_warnings, _ = validate_attempt(
+        task_dir,
+        status,
+        stale_created_minutes,
+        tmux_exit_code_grace_seconds,
+    )
     violations.extend(attempt_violations)
     warnings.extend(attempt_warnings)
 
@@ -321,7 +338,14 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any],
     return violations, warnings
 
 
-def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float = 10.0) -> dict[str, Any]:
+def collect(
+    run_id: str,
+    stale_lock_hours: float,
+    stale_created_minutes: float = 10.0,
+    tmux_exit_code_grace_seconds: int = 60,
+    config_warnings: list[str] | None = None,
+    config_errors: list[str] | None = None,
+) -> dict[str, Any]:
     root = repo_root(Path.cwd())
     run_dir = root / ".agent-collab" / "runs" / run_id
     if not run_dir.exists():
@@ -339,6 +363,22 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
     events, event_violations, event_warnings = load_events(run_dir, run_id)
     violations.extend(event_violations)
     warnings.extend(event_warnings)
+    warnings.extend(f"config: {warning}" for warning in (config_warnings or []))
+    violations.extend(f"config: {error}" for error in (config_errors or []))
+    run_json_path = run_dir / "RUN.json"
+    if not run_json_path.exists():
+        violations.append("run: missing required RUN.json")
+    else:
+        try:
+            run_json = load_json(run_json_path)
+        except json.JSONDecodeError as exc:
+            violations.append(f"run: invalid RUN.json: {exc}")
+        else:
+            recorded_protocol = run_json.get("protocol_version")
+            if recorded_protocol != PROTOCOL_VERSION:
+                warnings.append(
+                    f"run: RUN.json protocol_version {recorded_protocol!r} differs from installed {PROTOCOL_VERSION!r}"
+                )
     if not (run_dir / "JOURNAL.md").exists():
         violations.append("run: missing required JOURNAL.md")
 
@@ -357,7 +397,13 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
             violations.append(f"{task_dir.name}: invalid STATUS.json: {exc}")
             continue
 
-        status_violations, status_warnings = validate_status(task_dir, status, fsm, stale_created_minutes)
+        status_violations, status_warnings = validate_status(
+            task_dir,
+            status,
+            fsm,
+            stale_created_minutes,
+            tmux_exit_code_grace_seconds,
+        )
         violations.extend(status_violations)
         warnings.extend(status_warnings)
 
@@ -562,11 +608,25 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--write-summary", action="store_true", help="Write derived SUMMARY.md.")
     parser.add_argument("--write-diagnostics", action="store_true", help="Write derived diagnostics files.")
-    parser.add_argument("--stale-lock-hours", type=float, default=6.0)
-    parser.add_argument("--stale-created-minutes", type=float, default=10.0)
+    parser.add_argument("--stale-lock-hours", type=float, default=None)
+    parser.add_argument("--stale-created-minutes", type=float, default=None)
     args = parser.parse_args()
 
-    report = collect(args.run_id, args.stale_lock_hours, args.stale_created_minutes)
+    root = repo_root(Path.cwd())
+    config_result = load_config(root)
+    config = config_result.config
+    stale_lock_hours = args.stale_lock_hours if args.stale_lock_hours is not None else config.stale_lock_hours
+    stale_created_minutes = (
+        args.stale_created_minutes if args.stale_created_minutes is not None else config.stale_created_minutes
+    )
+    report = collect(
+        args.run_id,
+        stale_lock_hours,
+        stale_created_minutes,
+        config.tmux_exit_code_grace_seconds,
+        config_result.warnings,
+        config_result.errors,
+    )
 
     if args.write_summary:
         Path(report["run_dir"], "SUMMARY.md").write_text(render_summary(report), encoding="utf-8")

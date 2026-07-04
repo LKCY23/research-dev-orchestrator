@@ -79,6 +79,8 @@ timeout=<secs>   -> RDO_TMUX_WAIT_TIMEOUT_SECONDS=<secs>
 
 Default backend is `plain`. Use `tmux` only when attachable observation is useful.
 
+`.agent-collab/rdo.toml` may define project defaults, but explicit `/rdo dispatch` arguments are one-off overrides and must not rewrite the config file.
+
 ### /rdo status
 
 ```text
@@ -152,4 +154,3 @@ Purpose: close the current work session and update long-term memory.
 Action: run `scripts/close_session.py`.
 
 Outputs: updated `SUMMARY.md`, appended `JOURNAL.md`, appended `session_closed` event.
-
