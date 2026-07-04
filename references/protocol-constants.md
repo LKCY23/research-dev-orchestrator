@@ -2,6 +2,8 @@
 
 This file collects user-facing constants that scripts and references should keep aligned.
 
+The script-level source for these constants is `scripts/protocol.py`. This reference is the human-readable explanation, not an import target.
+
 ## Worker Backends
 
 ```text
@@ -75,4 +77,3 @@ experiment_recorded
 scope_changed
 session_closed
 ```
-

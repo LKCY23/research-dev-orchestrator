@@ -1031,12 +1031,22 @@ LOCK attempt_id 与 STATUS.json.current_attempt_id 不一致
 
 ```text
 scripts/
+  protocol.py
+  protocol_cli.py
   init_run.py
   create_task.py
   dispatch_claude.sh
   collect_status.py
+  remove_dispatch_lock.py
   close_session.py
+  run_smoke_tests.sh
 ```
+
+`protocol.py` 是脚本内部协议常量和纯 helper 真源，不是用户接口或公共 SDK。
+
+`protocol_cli.py` 是 `dispatch_claude.sh` 的窄桥接层，只执行机械协议操作，例如 attempt 创建、running transition、event append、handoff validation 和 diagnostics 写入。它不得实现 approve、merge、auto-review、auto-recover 等 coordinator-only 决策。
+
+`templates/` 是 scaffold 内容真源；`references/` 只保留协议说明、schema、rubric、workflow 和 memory 文档。
 
 ### init_run.py
 
@@ -1269,12 +1279,20 @@ research-dev-orchestrator/
     events-schema.md
     journal-template.md
   scripts/
+    protocol.py
+    protocol_cli.py
     init_run.py
     create_task.py
     dispatch_claude.sh
     collect_status.py
     remove_dispatch_lock.py
     close_session.py
+    run_smoke_tests.sh
+  templates/
+    run/
+    task/
+  tests/
+    smoke/
 ```
 
 ## 21. SKILL.md 的职责

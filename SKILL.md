@@ -19,7 +19,9 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - `SUMMARY.md` and `diagnostics/` are derived monitor artifacts, not sources of truth.
 - `EVENTS.ndjson` and `JOURNAL.md` are required long-term memory artifacts. Use them to preserve cross-session history without adding a heavier decision database.
 - Task FSM stays about task progress only. `ATTEMPT.json` owns worker execution lifecycle. `collect_status.py` validates invariants across status, attempt, lock, events, evidence, and handoff files.
+- `scripts/protocol.py` is the script-internal source for protocol constants and pure helpers. It is not a user interface or public SDK.
 - Worker runtime backend is an execution detail. Default to `plain`; use `tmux` only when the user wants attachable long-running worker observation. Backend choice must not change protocol truth sources.
+- `/rdo ...` commands are Codex-facing intent grammar for human control. They are not executable shell slash commands and must still follow all protocol invariants.
 - Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
 
 ## Standard Workflow
@@ -55,6 +57,7 @@ Read references only when they are needed:
 - `references/attempt-lifecycle.md`: use before dispatching workers or auditing running/review/blocked invariants.
 - `references/runtime-backends.md`: use before enabling `RDO_WORKER_BACKEND=tmux` or auditing backend-specific attempt metadata.
 - `references/protocol-constants.md`: use when changing script constants, exit codes, blocker types, or event types.
+- `references/command-surface.md`: use when the user invokes `/rdo ...` command-like intents.
 - `references/lock-recovery.md`: use when `.dispatch-lock` is stale, mismatched, or present outside `running`.
 - `references/review-rubric.md`: use before Codex review and merge decisions.
 - `references/summary-template.md`: use when updating or auditing `SUMMARY.md`.
@@ -77,11 +80,33 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-diagnostics
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/remove_dispatch_lock.py" --run-id <run-id> --task-id <task-id> --reason "<approved reason>" --confirmed
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-id> --summary "<session summary>" --changed "<change>" --next-action "<next>"
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/run_smoke_tests.sh"
 ```
+
+## Command Surface
+
+Users may invoke command-like intents. Treat these as structured natural language for Codex, not shell commands:
+
+```text
+/rdo init project=<slug> objective="<text>" [target=<branch>]
+/rdo plan run=<run-id> [scope=requirements|design|experiment|all]
+/rdo create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>]
+/rdo dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
+/rdo status run=<run-id> [json] [summary] [diagnostics]
+/rdo review run=<run-id> task=<task-id>
+/rdo recover-lock run=<run-id> task=<task-id>
+/rdo close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
+```
+
+Read `references/command-surface.md` before acting on `/rdo ...`. `/rdo review` does not automatically approve; it produces findings and recommendations, and mutates state only with explicit user instruction and valid review gates.
 
 `init_run.py` scaffolds only. It must not make substantive research, design, or architecture decisions.
 
 `create_task.py` creates `pending` tasks only. It must not overwrite existing tasks, dispatch, create locks, or merge.
+
+`protocol.py` is used by scripts for constants, template rendering, JSON helpers, event append, and pure validation helpers. Users should not call it directly.
+
+`protocol_cli.py` is a narrow internal bridge for `dispatch_claude.sh`. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
 
 `dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and must not synthesize `review` or `blocked` for the worker. A `review` handoff requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid.
 
@@ -100,6 +125,8 @@ RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
 `remove_dispatch_lock.py` is a user-approved mechanical recovery tool. Use it only after a Lock Recovery Review and explicit user confirmation. It snapshots `.dispatch-lock`, removes only `.dispatch-lock`, and appends `dispatch_lock_removed`; it must not modify `STATUS.json`, `ATTEMPT.json`, `LOCK`, `HANDOFF.md`, `EVIDENCE.md`, or FSM state.
 
 `close_session.py` is the standard session closeout command. It updates derived `SUMMARY.md`, appends a human-readable `JOURNAL.md` entry, and appends a `session_closed` event to `EVENTS.ndjson`.
+
+`templates/` is the scaffold content source for `init_run.py` and `create_task.py`. `references/` remains the protocol, schema, rubric, and workflow explanation layer.
 
 ## Long-Term Memory
 

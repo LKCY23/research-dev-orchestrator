@@ -18,6 +18,9 @@ The skill runtime entrypoint is [`SKILL.md`](SKILL.md). The detailed design base
 - Prevents destructive overwrites of audit-bearing artifacts; use a new run, new attempt, or revision task.
 - Uses `collect_status.py` as an invariant checker across `STATUS.json`, `ATTEMPT.json`, `LOCK`, `.dispatch-lock`, `EVENTS.ndjson`, `EVIDENCE.md`, and `HANDOFF.md`.
 - Provides an explicit stale dispatch-lock recovery workflow: detect with `collect_status.py`, review with the coordinator, confirm with the user, then remove only `.dispatch-lock` with an audited snapshot/event.
+- Keeps script-level protocol constants and helpers in `scripts/protocol.py`.
+- Uses `templates/` as the scaffold source for run and task packet files.
+- Provides `/rdo ...` command-like intents as a Codex-facing manual control surface.
 
 ## Worker Backends
 
@@ -40,8 +43,10 @@ The tmux backend is still synchronous from dispatch's protocol perspective. The 
 ```text
 SKILL.md                 # Codex skill entrypoint
 DESIGN_SPEC.md           # Full design baseline and protocol rationale
-references/              # Templates, FSM, schema, review rubric, memory docs
+references/              # FSM, schemas, review rubric, workflow and memory docs
 scripts/                 # init_run, create_task, dispatch, collect_status, close_session
+templates/               # Scaffold content source for run and task files
+tests/smoke/             # Behavioral smoke tests for protocol and dispatch paths
 agents/openai.yaml       # UI metadata
 ```
 
@@ -51,6 +56,7 @@ agents/openai.yaml       # UI metadata
 python /path/to/skill-creator/scripts/quick_validate.py /path/to/research-dev-orchestrator
 python -m py_compile scripts/init_run.py scripts/create_task.py scripts/collect_status.py scripts/close_session.py
 bash -n scripts/dispatch_claude.sh
+scripts/run_smoke_tests.sh
 ```
 
 When using the skill from another target repository, keep the current working directory at that target repository root and call this repository's scripts by absolute path, or set:

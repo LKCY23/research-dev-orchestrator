@@ -6,28 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 
-HANDOFF_TEMPLATE_MARKER = "<!-- RDO_TEMPLATE: HANDOFF -->"
-EVIDENCE_TEMPLATE_MARKER = "<!-- RDO_TEMPLATE: EVIDENCE -->"
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def run_git(args: list[str], cwd: Path, default: str = "") -> str:
-    try:
-        return subprocess.check_output(["git", *args], cwd=cwd, text=True, stderr=subprocess.DEVNULL).strip()
-    except subprocess.CalledProcessError:
-        return default
-
-
-def repo_root(cwd: Path) -> Path:
-    root = run_git(["rev-parse", "--show-toplevel"], cwd)
-    return Path(root) if root else cwd
+from protocol import append_event, render_template, repo_root, utc_now
 
 
 def validate_task_id(task_id: str) -> None:
@@ -39,12 +20,6 @@ def render_list(values: list[str]) -> str:
     if not values:
         return "[]"
     return "\n".join(f"  - {value}" for value in values)
-
-
-def append_event(run_dir: Path, event: dict) -> None:
-    events_path = run_dir / "EVENTS.ndjson"
-    with events_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, sort_keys=True) + "\n")
 
 
 def main() -> int:
@@ -99,36 +74,18 @@ def main() -> int:
     }
 
     (task_dir / "STATUS.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
-    (task_dir / "TASK.md").write_text(
-        f"""# Task {args.task_id}
-
-```yaml
-task_id: {args.task_id}
-goal: {args.goal}
-allowed_paths:
-{render_list(args.allowed_paths)}
-forbidden_paths:
-{render_list(args.forbidden_paths)}
-dependencies:
-{render_list(args.dependencies)}
-branch: {branch}
-worktree: {worktree}
-non_goals:
-  - Do not expand scope beyond this task packet.
-```
-""",
-        encoding="utf-8",
-    )
-    (task_dir / "CONTEXT.md").write_text("# Context\n\n## Relevant Requirements\n\n## Design Notes\n\n## Interfaces\n\n## Constraints\n", encoding="utf-8")
-    (task_dir / "ACCEPTANCE.md").write_text("# Acceptance\n\n## Required Commands\n\n## Expected Outputs\n\n## Metrics Or Thresholds\n\n## Smoke Test\n\n## Failure Handoff Condition\n\n## Post-Merge Smoke Test\n", encoding="utf-8")
-    (task_dir / "HANDOFF.md").write_text(
-        f"{HANDOFF_TEMPLATE_MARKER}\n# Handoff\n\nRemove the template marker before submitting this task.\n\n## What Changed\n\n## What Failed\n\n## Evidence\n\n## Decision Needed\n\n## Suggested Next Action\n",
-        encoding="utf-8",
-    )
-    (task_dir / "EVIDENCE.md").write_text(
-        f"{EVIDENCE_TEMPLATE_MARKER}\n# Evidence\n\nRemove the template marker before submitting this task.\n\n## Commands Run\n\n## Tests Passed\n\n## Metrics / Outputs\n\n## Logs\n\n## Known Limitations\n",
-        encoding="utf-8",
-    )
+    task_values = {
+        "TASK_ID": args.task_id,
+        "GOAL": args.goal,
+        "ALLOWED_PATHS": render_list(args.allowed_paths),
+        "FORBIDDEN_PATHS": render_list(args.forbidden_paths),
+        "DEPENDENCIES": render_list(args.dependencies),
+        "BRANCH": branch,
+        "WORKTREE": worktree,
+    }
+    (task_dir / "TASK.md").write_text(render_template("task/TASK.md", task_values), encoding="utf-8")
+    for filename in ["CONTEXT.md", "ACCEPTANCE.md", "HANDOFF.md", "EVIDENCE.md"]:
+        (task_dir / filename).write_text(render_template(f"task/{filename}"), encoding="utf-8")
     append_event(
         run_dir,
         {

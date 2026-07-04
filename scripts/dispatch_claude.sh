@@ -19,6 +19,7 @@ RDO_TMUX_WAIT_TIMEOUT_SECONDS="${RDO_TMUX_WAIT_TIMEOUT_SECONDS:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROTOCOL_CLI="${SCRIPT_DIR}/protocol_cli.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -36,92 +37,28 @@ sanitize_name() {
 }
 
 write_tmux_timeout_diagnostics() {
-  mkdir -p "${DIAGNOSTICS_DIR}"
-  local stamp
-  stamp="$(date -u +"%Y%m%dT%H%M%SZ")"
-  local json_path="${DIAGNOSTICS_DIR}/tmux-wait-timeout-${TASK_ID}-${stamp}.json"
-  local md_path="${DIAGNOSTICS_DIR}/tmux-wait-timeout-${TASK_ID}-${stamp}.md"
-  python3 - "$json_path" "$RUN_ID" "$TASK_ID" "${ATTEMPT_ID:-}" "${TMUX_SESSION:-}" "${TMUX_ATTACH_COMMAND:-}" "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" "${DISPATCH_LOCK_DIR}" "${ATTEMPT_DIR:-}" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-
-(
-    path,
-    run_id,
-    task_id,
-    attempt_id,
-    tmux_session,
-    attach_command,
-    timeout_seconds,
-    dispatch_lock_dir,
-    attempt_dir,
-) = sys.argv[1:10]
-payload = {
-    "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    "reason": "tmux_wait_timeout",
-    "run_id": run_id,
-    "task_id": task_id,
-    "attempt_id": attempt_id,
-    "tmux_session": tmux_session,
-    "attach_command": attach_command,
-    "timeout_seconds": int(timeout_seconds),
-    "dispatch_exit_code": 5,
-    "worker_exit_code": None,
-    "dispatch_lock_retained": True,
-    "dispatch_lock_dir": dispatch_lock_dir,
-    "attempt_dir": attempt_dir,
-}
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-PY
-  {
-    echo "# Tmux Wait Timeout"
-    echo
-    echo "- run_id: ${RUN_ID}"
-    echo "- task_id: ${TASK_ID}"
-    echo "- attempt_id: ${ATTEMPT_ID:-}"
-    echo "- reason: tmux_wait_timeout"
-    echo "- dispatch_exit_code: 5"
-    echo "- worker_exit_code: null"
-    echo "- dispatch_lock_retained: true"
-    echo "- tmux_session: ${TMUX_SESSION:-}"
-    echo "- attach_command: ${TMUX_ATTACH_COMMAND:-}"
-    echo "- timeout_seconds: ${RDO_TMUX_WAIT_TIMEOUT_SECONDS}"
-    echo "- time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo
-    echo "Dispatch lost supervision before the attempt-local exit_code file appeared."
-    echo "Do not assume the worker stopped. Use Lock Recovery Review before removing .dispatch-lock."
-  } > "${md_path}"
+  python3 "${PROTOCOL_CLI}" write-tmux-timeout-diagnostics \
+    --run-dir "${RUN_DIR}" \
+    --run-id "${RUN_ID}" \
+    --task-id "${TASK_ID}" \
+    --attempt-id "${ATTEMPT_ID:-}" \
+    --tmux-session "${TMUX_SESSION:-}" \
+    --attach-command "${TMUX_ATTACH_COMMAND:-}" \
+    --timeout-seconds "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" \
+    --dispatch-lock-dir "${DISPATCH_LOCK_DIR}" \
+    --attempt-dir "${ATTEMPT_DIR:-}"
 }
 
 append_event() {
   local event_name="$1"
-  python3 - "$RUN_DIR" "$RUN_ID" "$TASK_ID" "$ATTEMPT_ID" "$event_name" "$CLAUDE_AGENT_NAME" "$STATUS_PATH" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-run_dir, run_id, task_id, attempt_id, event_name, agent_name, status_path = sys.argv[1:8]
-payload = {
-    "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    "actor": "dispatch" if event_name in {"task_dispatched", "worker_exit_without_valid_status"} else "claude-code",
-    "event": event_name,
-    "run_id": run_id,
-    "task_id": task_id,
-    "attempt_id": attempt_id,
-}
-if event_name == "task_dispatched":
-    payload["worker"] = agent_name
-if event_name == "worker_blocked":
-    status = json.load(open(status_path, encoding="utf-8"))
-    payload["blocker_type"] = status.get("blocker_type", "")
-    payload["blocking_reason"] = status.get("blocking_reason", "")
-with Path(run_dir, "EVENTS.ndjson").open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps(payload, sort_keys=True) + "\n")
-PY
+  python3 "${PROTOCOL_CLI}" append-event \
+    --run-dir "${RUN_DIR}" \
+    --run-id "${RUN_ID}" \
+    --task-id "${TASK_ID}" \
+    --attempt-id "${ATTEMPT_ID}" \
+    --event-name "${event_name}" \
+    --agent-name "${CLAUDE_AGENT_NAME}" \
+    --status-path "${STATUS_PATH}"
 }
 
 dispatch_lock_matches_current_attempt() {
@@ -153,21 +90,15 @@ on_exit() {
     return 0
   fi
   if [[ -d "${RUN_DIR}" ]]; then
-    mkdir -p "${DIAGNOSTICS_DIR}"
-    local stamp
-    stamp="$(date -u +"%Y%m%dT%H%M%SZ")"
-    {
-      echo "# Dispatch Failure"
-      echo
-      echo "- run_id: ${RUN_ID}"
-      echo "- task_id: ${TASK_ID}"
-      echo "- exit_code: ${code}"
-      echo "- status_updated: ${STATUS_UPDATED}"
-      echo "- attempt_id: ${ATTEMPT_ID:-}"
-      echo "- lock_path: ${LOCK_PATH}"
-      echo "- dispatch_lock_dir: ${DISPATCH_LOCK_DIR}"
-      echo "- time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    } > "${DIAGNOSTICS_DIR}/dispatch-failure-${TASK_ID}-${stamp}.md"
+    python3 "${PROTOCOL_CLI}" write-dispatch-diagnostics \
+      --run-dir "${RUN_DIR}" \
+      --run-id "${RUN_ID}" \
+      --task-id "${TASK_ID}" \
+      --attempt-id "${ATTEMPT_ID:-}" \
+      --exit-code "${code}" \
+      --status-updated "${STATUS_UPDATED}" \
+      --lock-path "${LOCK_PATH}" \
+      --dispatch-lock-dir "${DISPATCH_LOCK_DIR}" || true
   fi
   if [[ "${STATUS_UPDATED}" == "0" ]] && lock_file_matches_current_attempt; then
     rm -f "${LOCK_PATH}"
@@ -242,18 +173,9 @@ if [[ "${RDO_WORKER_BACKEND}" == "tmux" ]]; then
   printf "%s\n" "${TMUX_ATTACH_COMMAND}" > "${DISPATCH_LOCK_DIR}/attach_command"
 fi
 
-python3 - "$STATUS_PATH" "$FSM_PATH" <<'PY'
-import json
-import sys
-
-status_path, fsm_path = sys.argv[1:3]
-status = json.load(open(status_path, encoding="utf-8"))
-fsm = json.load(open(fsm_path, encoding="utf-8"))
-state = status.get("state")
-allowed = fsm["transitions"].get(state, {}).get("running", [])
-if "dispatch" not in allowed:
-    raise SystemExit(f"illegal dispatch transition: {state!r} -> 'running'")
-PY
+python3 "${PROTOCOL_CLI}" check-dispatch-transition \
+  --status-path "${STATUS_PATH}" \
+  --fsm-path "${FSM_PATH}"
 
 BRANCH="$(python3 - "$STATUS_PATH" <<'PY'
 import json, sys
@@ -292,41 +214,17 @@ if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
   fi
 fi
 
-python3 - "$ATTEMPT_DIR/ATTEMPT.json" "$ATTEMPT_ID" "$TASK_ID" "$CLAUDE_AGENT_NAME" "$CLAUDE_SESSION_ID" "$CLAUDE_CODE_CMD" "$WORKTREE_PATH" "$RDO_WORKER_BACKEND" "$TMUX_SESSION" "$TMUX_ATTACH_COMMAND" <<'PY'
-import json
-import os
-import sys
-from datetime import datetime, timezone
-
-path, attempt_id, task_id, agent_name, session_id, command, cwd, backend, tmux_session, attach_command = sys.argv[1:11]
-runtime = {
-    "backend": backend,
-    "model": os.environ.get("CLAUDE_MODEL"),
-    "cli": command.split()[0] if command.split() else command,
-    "command": command,
-    "cwd": cwd,
-}
-if backend == "tmux":
-    runtime["tmux_session"] = tmux_session
-    runtime["attach_command"] = attach_command
-payload = {
-    "attempt_id": attempt_id,
-    "task_id": task_id,
-    "agent": "claude-code",
-    "agent_name": agent_name,
-    "session_id": session_id,
-    "state": "created",
-    "handoff_valid": None,
-    "handoff_state": None,
-    "started_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-    "ended_at": None,
-    "exit_code": None,
-    "runtime": runtime,
-}
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, indent=2)
-    handle.write("\n")
-PY
+python3 "${PROTOCOL_CLI}" create-attempt \
+  --path "${ATTEMPT_DIR}/ATTEMPT.json" \
+  --attempt-id "${ATTEMPT_ID}" \
+  --task-id "${TASK_ID}" \
+  --agent-name "${CLAUDE_AGENT_NAME}" \
+  --session-id "${CLAUDE_SESSION_ID}" \
+  --command "${CLAUDE_CODE_CMD}" \
+  --cwd "${WORKTREE_PATH}" \
+  --backend "${RDO_WORKER_BACKEND}" \
+  --tmux-session "${TMUX_SESSION}" \
+  --attach-command "${TMUX_ATTACH_COMMAND}"
 
 {
   echo "# Worker Task Prompt"
@@ -370,55 +268,15 @@ PY
   cat "${TASK_DIR}/ACCEPTANCE.md"
 } > "${ATTEMPT_DIR}/prompt.md"
 
-python3 - "$STATUS_PATH" "$FSM_PATH" "$ATTEMPT_ID" "$CLAUDE_AGENT_NAME" "$CLAUDE_SESSION_ID" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-
-status_path, fsm_path, attempt_id, agent_name, session_id = sys.argv[1:6]
-status = json.load(open(status_path, encoding="utf-8"))
-fsm = json.load(open(fsm_path, encoding="utf-8"))
-state = status.get("state")
-allowed = fsm["transitions"].get(state, {}).get("running", [])
-if "dispatch" not in allowed:
-    raise SystemExit(f"illegal dispatch transition: {state!r} -> 'running'")
-now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-status["previous_state"] = state
-status["state"] = "running"
-status["owner"] = "claude-code"
-status["updated_at"] = now
-status["needs_coordinator"] = False
-status["blocking_reason"] = ""
-status["blocker_type"] = ""
-status["current_attempt_id"] = attempt_id
-status["assigned_worker"] = {
-    "agent": "claude-code",
-    "agent_name": agent_name,
-    "session_id": session_id,
-    "role": "worker",
-}
-status.setdefault("state_history", []).append({
-    "from": state,
-    "to": "running",
-    "actor": "dispatch",
-    "at": now,
-})
-with open(status_path, "w", encoding="utf-8") as handle:
-    json.dump(status, handle, indent=2)
-    handle.write("\n")
-PY
+python3 "${PROTOCOL_CLI}" transition-running \
+  --status-path "${STATUS_PATH}" \
+  --fsm-path "${FSM_PATH}" \
+  --attempt-id "${ATTEMPT_ID}" \
+  --agent-name "${CLAUDE_AGENT_NAME}" \
+  --session-id "${CLAUDE_SESSION_ID}"
 STATUS_UPDATED=1
-python3 - "$ATTEMPT_DIR/ATTEMPT.json" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-attempt = json.load(open(path, encoding="utf-8"))
-attempt["state"] = "running"
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(attempt, handle, indent=2)
-    handle.write("\n")
-PY
+python3 "${PROTOCOL_CLI}" set-attempt-running \
+  --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json"
 append_event "task_dispatched"
 
 if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
@@ -518,93 +376,12 @@ PY
 fi
 
 set +e
-python3 - "$STATUS_PATH" "$ATTEMPT_ID" "$TASK_DIR" "$ATTEMPT_DIR/ATTEMPT.json" "$EXIT_CODE_RAW" <<'PY'
-import json
-import sys
-from pathlib import Path
-from datetime import datetime, timezone
-
-TEMPLATE_MARKERS = {
-    "EVIDENCE.md": "<!-- RDO_TEMPLATE: EVIDENCE -->",
-    "HANDOFF.md": "<!-- RDO_TEMPLATE: HANDOFF -->",
-}
-BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "irrecoverable"}
-
-def substantive(path: Path) -> bool:
-    if not path.exists():
-        return False
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return False
-    marker = TEMPLATE_MARKERS.get(path.name)
-    return not (marker and marker in text)
-
-def parse_iso(value):
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-status_path, attempt_id, task_dir, attempt_path, exit_code_raw = sys.argv[1:6]
-try:
-    exit_code = int(exit_code_raw)
-    exit_code_valid = True
-except (TypeError, ValueError):
-    exit_code = None
-    exit_code_valid = False
-status = json.load(open(status_path, encoding="utf-8"))
-state = status.get("state")
-valid_state = state in {"review", "blocked"}
-valid_attempt = status.get("current_attempt_id") == attempt_id
-valid_previous = status.get("previous_state") == "running"
-history = status.get("state_history") if isinstance(status.get("state_history"), list) else []
-last_transition = history[-1] if history else {}
-valid_history = (
-    isinstance(last_transition, dict)
-    and last_transition.get("from") == "running"
-    and last_transition.get("to") == state
-    and last_transition.get("actor") == "claude-code"
-    and parse_iso(last_transition.get("at")) is not None
-)
-handoff_ok = substantive(Path(task_dir, "HANDOFF.md"))
-evidence_ok = substantive(Path(task_dir, "EVIDENCE.md"))
-if state == "review":
-    artifacts_ok = handoff_ok and evidence_ok
-    exit_ok = exit_code_valid and exit_code == 0
-elif state == "blocked":
-    artifacts_ok = handoff_ok and status.get("blocker_type") in BLOCKER_TYPES and bool(status.get("blocking_reason"))
-    exit_ok = exit_code_valid
-else:
-    artifacts_ok = False
-    exit_ok = False
-
-attempt = json.load(open(attempt_path, encoding="utf-8"))
-attempt["ended_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-attempt["exit_code"] = exit_code
-
-if not (exit_code_valid and valid_state and valid_attempt and valid_previous and valid_history and artifacts_ok and exit_ok):
-    attempt["state"] = "invalid_handoff"
-    attempt["handoff_valid"] = False
-    attempt["handoff_state"] = None
-    with open(attempt_path, "w", encoding="utf-8") as handle:
-        json.dump(attempt, handle, indent=2)
-        handle.write("\n")
-    print("worker_exit_without_valid_status", file=sys.stderr)
-    print(f"state={state!r} current_attempt_id={status.get('current_attempt_id')!r}", file=sys.stderr)
-    print(f"exit_code_raw={exit_code_raw!r} exit_code={exit_code!r} exit_code_valid={exit_code_valid!r} exit_ok={exit_ok!r}", file=sys.stderr)
-    print(f"valid_previous={valid_previous!r}", file=sys.stderr)
-    print(f"valid_history={valid_history!r}", file=sys.stderr)
-    raise SystemExit(4)
-
-attempt["state"] = "completed"
-attempt["handoff_valid"] = True
-attempt["handoff_state"] = state
-with open(attempt_path, "w", encoding="utf-8") as handle:
-    json.dump(attempt, handle, indent=2)
-    handle.write("\n")
-PY
+python3 "${PROTOCOL_CLI}" validate-handoff \
+  --status-path "${STATUS_PATH}" \
+  --attempt-id "${ATTEMPT_ID}" \
+  --task-dir "${TASK_DIR}" \
+  --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
+  --exit-code-raw "${EXIT_CODE_RAW}"
 VALIDATION_CODE=$?
 set -e
 if [[ "${VALIDATION_CODE}" -ne 0 ]]; then

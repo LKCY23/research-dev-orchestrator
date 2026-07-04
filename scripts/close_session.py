@@ -4,37 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from collect_status import collect, render_summary  # noqa: E402
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def run_git(args: list[str], cwd: Path, default: str = "") -> str:
-    try:
-        return subprocess.check_output(["git", *args], cwd=cwd, text=True, stderr=subprocess.DEVNULL).strip()
-    except subprocess.CalledProcessError:
-        return default
-
-
-def repo_root(cwd: Path) -> Path:
-    root = run_git(["rev-parse", "--show-toplevel"], cwd)
-    return Path(root) if root else cwd
-
-
-def append_event(run_dir: Path, event: dict) -> None:
-    with (run_dir / "EVENTS.ndjson").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, sort_keys=True) + "\n")
+from protocol import append_event, repo_root, utc_now  # noqa: E402
 
 
 def bullet_lines(values: list[str]) -> str:

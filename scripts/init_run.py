@@ -7,27 +7,10 @@ import argparse
 import json
 import re
 import secrets
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROTOCOL_VERSION = "research-dev-orchestrator/v0.1"
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def run_git(args: list[str], cwd: Path, default: str = "") -> str:
-    try:
-        return subprocess.check_output(["git", *args], cwd=cwd, text=True, stderr=subprocess.DEVNULL).strip()
-    except subprocess.CalledProcessError:
-        return default
-
-
-def repo_root(cwd: Path) -> Path:
-    root = run_git(["rev-parse", "--show-toplevel"], cwd)
-    return Path(root) if root else cwd
+from protocol import PROTOCOL_VERSION, append_event, render_template, repo_root, run_git, utc_now
 
 
 def slugify(value: str) -> str:
@@ -38,12 +21,6 @@ def slugify(value: str) -> str:
 def write_if_missing(path: Path, content: str) -> None:
     if not path.exists():
         path.write_text(content, encoding="utf-8")
-
-
-def append_event(run_dir: Path, event: dict) -> None:
-    events_path = run_dir / "EVENTS.ndjson"
-    with events_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, sort_keys=True) + "\n")
 
 
 def main() -> int:
@@ -112,51 +89,19 @@ def main() -> int:
         },
     )
 
-    write_if_missing(
-        run_dir / "SUMMARY.md",
-        f"""# Run Summary
-
-## Objective
-
-{args.objective}
-
-## Current Status
-
-Initialized. This file is derived and may be regenerated.
-
-## Task Board
-
-| Task | State | Owner | Attempt | Blocker | Review |
-|---|---|---|---|---|---|
-
-## Active Blockers
-
-## Ready For Codex Review
-
-## Protocol Warnings
-
-## Recent Decisions
-
-## Recent Events
-
-## Experiment Results
-
-## Next Actions
-""",
-    )
-
-    scaffolds = {
-        "REQUIREMENTS.md": "# Requirements\n\n## Objective\n\n## Research Questions\n\n## Hypotheses\n\n## In Scope\n\n## Out of Scope\n\n## Datasets / Inputs\n\n## Baselines\n\n## Metrics\n\n## Constraints\n\n## Acceptance Criteria\n\n## Open Questions\n",
-        "DESIGN_METHOD_SELECTION.md": "# Design Method Selection\n\n## Problem Type\n\n## Candidate Styles\n\n## Selected Style\n\n## Decomposition Strategy\n\n## Data Flow Style\n\n## Interface Style\n\n## Testing Strategy\n\n## Experiment Tracking Strategy\n\n## Alternatives Considered\n\n## Decision\n\n## Risks\n",
-        "DESIGN_BRIEF.md": "# Design Brief\n\n## Overview\n\n## Architecture\n\n## Data Flow\n\n## Interfaces\n\n## Testing Strategy\n\n## Open Questions\n",
-        "EXPERIMENT_PLAN.md": "# Experiment Plan\n\n## Hypotheses\n\n## Claims To Support\n\n## Datasets\n\n## Data Splits\n\n## Baselines\n\n## Methods / Variants\n\n## Metrics\n\n## Ablations\n\n## Expected Outputs\n\n## Minimum Viable Smoke Test\n\n## Success Criteria\n\n## Risks And Confounders\n",
-        "REPRODUCIBILITY.md": "# Reproducibility\n\n## Environment\n\n## Dependencies\n\n## Hardware Notes\n\n## Random Seeds\n\n## Data Versions\n\n## Commands\n\n## Expected Outputs\n\n## Log Locations\n\n## Known Sources Of Nondeterminism\n\n## Reproduction Checklist\n",
-        "RESULT_LEDGER.md": "# Result Ledger\n\n| Time | Task | Attempt | Command | Metric | Result | Supports Claim | Logs | Notes |\n|---|---|---|---|---|---|---|---|---|\n",
-        "TASKS.md": "# Tasks\n\n| Task | Goal | State | Dependencies | Notes |\n|---|---|---|---|---|\n",
-        "JOURNAL.md": "# Journal\n\nAppend one concise entry at the end of every working session.\n",
-    }
-    for filename, content in scaffolds.items():
-        write_if_missing(run_dir / filename, content)
+    run_templates = [
+        "SUMMARY.md",
+        "REQUIREMENTS.md",
+        "DESIGN_METHOD_SELECTION.md",
+        "DESIGN_BRIEF.md",
+        "EXPERIMENT_PLAN.md",
+        "REPRODUCIBILITY.md",
+        "RESULT_LEDGER.md",
+        "TASKS.md",
+        "JOURNAL.md",
+    ]
+    for filename in run_templates:
+        write_if_missing(run_dir / filename, render_template(f"run/{filename}", {"OBJECTIVE": args.objective}))
 
     print(run_id)
     return 0

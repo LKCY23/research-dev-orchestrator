@@ -4,45 +4,16 @@
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+from protocol import append_event, load_json, repo_root, utc_now, write_json
 
 
 def stamp_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def run_git(args: list[str], cwd: Path, default: str = "") -> str:
-    try:
-        return subprocess.check_output(["git", *args], cwd=cwd, text=True, stderr=subprocess.DEVNULL).strip()
-    except subprocess.CalledProcessError:
-        return default
-
-
-def repo_root(cwd: Path) -> Path:
-    root = run_git(["rev-parse", "--show-toplevel"], cwd)
-    return Path(root) if root else cwd
-
-
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def append_event(run_dir: Path, event: dict[str, Any]) -> None:
-    with (run_dir / "EVENTS.ndjson").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, sort_keys=True) + "\n")
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def unique_snapshot_dir(diagnostics_dir: Path, task_id: str, stamp: str) -> Path:
