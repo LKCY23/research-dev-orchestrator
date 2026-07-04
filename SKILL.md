@@ -19,7 +19,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - `SUMMARY.md` and `diagnostics/` are derived monitor artifacts, not sources of truth.
 - `EVENTS.ndjson` and `JOURNAL.md` are required long-term memory artifacts. Use them to preserve cross-session history without adding a heavier decision database.
 - Task FSM stays about task progress only. `ATTEMPT.json` owns worker execution lifecycle. `collect_status.py` validates invariants across status, attempt, lock, events, evidence, and handoff files.
-- `scripts/protocol.py` is the script-internal source for protocol constants and pure helpers. It is not a user interface or public SDK.
+- `scripts/protocol.py` is the script-internal source for protocol constants and low-level helpers. `scripts/validation.py` owns shared protocol validation rules used by online dispatch gates and offline status audit. Neither file is a user interface or public SDK.
 - Worker runtime backend is an execution detail. Default to `plain`; use `tmux` only when the user wants attachable long-running worker observation. Backend choice must not change protocol truth sources.
 - `/rdo ...` commands are Codex-facing intent grammar for human control. They are not executable shell slash commands and must still follow all protocol invariants.
 - Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
@@ -104,7 +104,9 @@ Read `references/command-surface.md` before acting on `/rdo ...`. `/rdo review` 
 
 `create_task.py` creates `pending` tasks only. It must not overwrite existing tasks, dispatch, create locks, or merge.
 
-`protocol.py` is used by scripts for constants, template rendering, JSON helpers, event append, and pure validation helpers. Users should not call it directly.
+`protocol.py` is used by scripts for constants, template rendering, JSON helpers, and event append. Users should not call it directly.
+
+`validation.py` contains shared protocol validation rules, starting with worker handoff validation. `protocol_cli.py validate-handoff` and `collect_status.py` must reuse it so online gate checks and offline audit do not drift.
 
 `protocol_cli.py` is a narrow internal bridge for `dispatch_claude.sh`. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
 

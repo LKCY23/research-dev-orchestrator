@@ -1032,6 +1032,7 @@ LOCK attempt_id 与 STATUS.json.current_attempt_id 不一致
 ```text
 scripts/
   protocol.py
+  validation.py
   protocol_cli.py
   init_run.py
   create_task.py
@@ -1042,7 +1043,9 @@ scripts/
   run_smoke_tests.sh
 ```
 
-`protocol.py` 是脚本内部协议常量和纯 helper 真源，不是用户接口或公共 SDK。
+`protocol.py` 是脚本内部协议常量和底层 helper 真源，不是用户接口或公共 SDK。
+
+`validation.py` 是共享协议校验规则层。在线 gate（例如 `protocol_cli.py validate-handoff`）和离线 audit（例如 `collect_status.py`）必须复用这里的规则，避免 handoff validation 漂移。
 
 `protocol_cli.py` 是 `dispatch_claude.sh` 的窄桥接层，只执行机械协议操作，例如 attempt 创建、running transition、event append、handoff validation 和 diagnostics 写入。它不得实现 approve、merge、auto-review、auto-recover 等 coordinator-only 决策。
 

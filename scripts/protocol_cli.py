@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -12,14 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from protocol import (
-    BLOCKER_TYPES,
     append_event as append_event_line,
-    has_substantive_content,
     load_json,
-    parse_iso,
     utc_now,
     write_json,
 )
+from validation import validate_worker_handoff
 
 
 def add_common_event_args(parser: argparse.ArgumentParser) -> None:
@@ -131,66 +128,28 @@ def cmd_set_attempt_running(args: argparse.Namespace) -> int:
 
 
 def cmd_validate_handoff(args: argparse.Namespace) -> int:
-    status_path = Path(args.status_path)
     attempt_path = Path(args.attempt_path)
     task_dir = Path(args.task_dir)
-    exit_code_raw = args.exit_code_raw
-    try:
-        exit_code = int(exit_code_raw)
-        exit_code_valid = True
-    except (TypeError, ValueError):
-        exit_code = None
-        exit_code_valid = False
-
-    status = load_json(status_path)
-    state = status.get("state")
-    valid_state = state in {"review", "blocked"}
-    valid_attempt = status.get("current_attempt_id") == args.attempt_id
-    valid_previous = status.get("previous_state") == "running"
-    history = status.get("state_history") if isinstance(status.get("state_history"), list) else []
-    last_transition = history[-1] if history else {}
-    valid_history = (
-        isinstance(last_transition, dict)
-        and last_transition.get("from") == "running"
-        and last_transition.get("to") == state
-        and last_transition.get("actor") == "claude-code"
-        and parse_iso(last_transition.get("at")) is not None
-    )
-    handoff_ok = has_substantive_content(task_dir / "HANDOFF.md")
-    evidence_ok = has_substantive_content(task_dir / "EVIDENCE.md")
-    if state == "review":
-        artifacts_ok = handoff_ok and evidence_ok
-        exit_ok = exit_code_valid and exit_code == 0
-    elif state == "blocked":
-        artifacts_ok = handoff_ok and status.get("blocker_type") in BLOCKER_TYPES and bool(status.get("blocking_reason"))
-        exit_ok = exit_code_valid
-    else:
-        artifacts_ok = False
-        exit_ok = False
+    status = load_json(Path(args.status_path))
+    result = validate_worker_handoff(status, args.attempt_id, task_dir, args.exit_code_raw)
 
     attempt = load_json(attempt_path)
     attempt["ended_at"] = utc_now()
-    attempt["exit_code"] = exit_code
+    attempt["exit_code"] = result.exit_code
 
-    if not (exit_code_valid and valid_state and valid_attempt and valid_previous and valid_history and artifacts_ok and exit_ok):
+    if not result.valid:
         attempt["state"] = "invalid_handoff"
         attempt["handoff_valid"] = False
         attempt["handoff_state"] = None
         write_json(attempt_path, attempt)
         print("worker_exit_without_valid_status", file=sys.stderr)
-        print(f"state={state!r} current_attempt_id={status.get('current_attempt_id')!r}", file=sys.stderr)
-        print(
-            f"exit_code_raw={exit_code_raw!r} exit_code={exit_code!r} "
-            f"exit_code_valid={exit_code_valid!r} exit_ok={exit_ok!r}",
-            file=sys.stderr,
-        )
-        print(f"valid_previous={valid_previous!r}", file=sys.stderr)
-        print(f"valid_history={valid_history!r}", file=sys.stderr)
+        for reason in result.reasons:
+            print(f"- {reason}", file=sys.stderr)
         return 4
 
     attempt["state"] = "completed"
     attempt["handoff_valid"] = True
-    attempt["handoff_state"] = state
+    attempt["handoff_state"] = result.handoff_state
     write_json(attempt_path, attempt)
     return 0
 

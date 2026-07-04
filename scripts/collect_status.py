@@ -29,6 +29,7 @@ from protocol import (  # noqa: E402
     repo_root,
     utc_now,
 )
+from validation import validate_worker_handoff
 
 
 def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[str], list[str]]:
@@ -219,18 +220,13 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
                         )
     elif dispatch_lock.exists():
         violations.append(f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}")
-    if state == "review":
-        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "review":
-            violations.append(f"{task_dir.name}: STATUS review requires completed attempt with handoff_state=review")
-        if attempt.get("exit_code") != 0:
-            violations.append(f"{task_dir.name}: STATUS review requires ATTEMPT.exit_code=0")
-        if not has_substantive_content(task_dir / "HANDOFF.md"):
-            violations.append(f"{task_dir.name}: review task has missing or template-only HANDOFF.md")
-    if state == "blocked":
-        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "blocked":
-            violations.append(f"{task_dir.name}: STATUS blocked requires completed attempt with handoff_state=blocked")
-        if not has_substantive_content(task_dir / "HANDOFF.md"):
-            violations.append(f"{task_dir.name}: blocked task has missing or template-only HANDOFF.md")
+    if state in {"review", "blocked"}:
+        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != state:
+            violations.append(f"{task_dir.name}: STATUS {state} requires completed attempt with handoff_state={state}")
+        exit_code_raw = "" if attempt.get("exit_code") is None else str(attempt.get("exit_code"))
+        handoff_result = validate_worker_handoff(status, str(attempt_id), task_dir, exit_code_raw)
+        for reason in handoff_result.reasons:
+            violations.append(f"{task_dir.name}: handoff validation failed: {reason}")
 
     return violations, warnings, attempt
 
@@ -304,7 +300,7 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any],
                 if not log_path.exists():
                     violations.append(f"{task_dir.name}: evidence log missing: {log_ref}")
 
-    if state in {"review", "approved", "merged"} and not has_substantive_content(task_dir / "EVIDENCE.md"):
+    if state in {"approved", "merged"} and not has_substantive_content(task_dir / "EVIDENCE.md"):
         violations.append(f"{task_dir.name}: {state} task has missing or template-only EVIDENCE.md")
 
     attempt_id = status.get("current_attempt_id")

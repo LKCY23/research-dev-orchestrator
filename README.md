@@ -18,7 +18,7 @@ The skill runtime entrypoint is [`SKILL.md`](SKILL.md). The detailed design base
 - Prevents destructive overwrites of audit-bearing artifacts; use a new run, new attempt, or revision task.
 - Uses `collect_status.py` as an invariant checker across `STATUS.json`, `ATTEMPT.json`, `LOCK`, `.dispatch-lock`, `EVENTS.ndjson`, `EVIDENCE.md`, and `HANDOFF.md`.
 - Provides an explicit stale dispatch-lock recovery workflow: detect with `collect_status.py`, review with the coordinator, confirm with the user, then remove only `.dispatch-lock` with an audited snapshot/event.
-- Keeps script-level protocol constants and helpers in `scripts/protocol.py`.
+- Keeps script-level protocol constants/helpers in `scripts/protocol.py` and shared validation rules in `scripts/validation.py`.
 - Uses `templates/` as the scaffold source for run and task packet files.
 - Provides `/rdo ...` command-like intents as a Codex-facing manual control surface.
 
@@ -44,7 +44,7 @@ The tmux backend is still synchronous from dispatch's protocol perspective. The 
 SKILL.md                 # Codex skill entrypoint
 DESIGN_SPEC.md           # Full design baseline and protocol rationale
 references/              # FSM, schemas, review rubric, workflow and memory docs
-scripts/                 # init_run, create_task, dispatch, collect_status, close_session
+scripts/                 # protocol, validation, init_run, create_task, dispatch, collect, close_session
 templates/               # Scaffold content source for run and task files
 tests/smoke/             # Behavioral smoke tests for protocol and dispatch paths
 agents/openai.yaml       # UI metadata
@@ -54,7 +54,7 @@ agents/openai.yaml       # UI metadata
 
 ```bash
 python /path/to/skill-creator/scripts/quick_validate.py /path/to/research-dev-orchestrator
-python -m py_compile scripts/init_run.py scripts/create_task.py scripts/collect_status.py scripts/close_session.py
+python -m py_compile scripts/*.py
 bash -n scripts/dispatch_claude.sh
 scripts/run_smoke_tests.sh
 ```
