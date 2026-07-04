@@ -55,40 +55,20 @@ The design is built around four rules:
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"}}}%%
-flowchart LR
+flowchart TB
   U["User"]:::human
-  C["Coordinator Control Plane<br/>intent, design, task split, review"]:::coord
-  P["Planning Artifacts<br/>requirements, ADRs, experiment plan"]:::planning
-  T["Task Contract<br/>task, context, acceptance"]:::planning
-  D["Execution Dispatcher<br/>lock, worktree, attempt, launch"]:::exec
-  W["CLI Worker<br/>bounded implementation"]:::exec
-  G["Git Isolation<br/>branch + worktree"]:::exec
-  S["Task State<br/>STATUS.json"]:::truth
-  A["Attempt Record<br/>ATTEMPT.json"]:::truth
-  E["Evidence & Handoff<br/>EVIDENCE.md / HANDOFF.md"]:::truth
-  M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
-  V["Validation Gate<br/>deterministic protocol checks"]:::validate
-  O["Monitor & Audit<br/>read-only status collection"]:::validate
-  R["Recovery Review<br/>user-approved minimal mutation"]:::validate
+  C["Coordinator Control Plane<br/>intent, design, task split, review decisions"]:::coord
+  P["Intent & Planning Layer<br/>requirements, ADRs, experiment plan, task contract"]:::planning
+  E["Execution Layer<br/>dispatcher, CLI worker, runtime backend, Git worktree isolation"]:::exec
+  T["Protocol Truth Layer<br/>task state, attempt records, evidence, handoff, timeline, memory"]:::truth
+  V["Validation & Recovery Layer<br/>deterministic gates, read-only audit, recovery review"]:::validate
 
   U --> C
   C --> P
-  P --> T
-  T --> D
-  D --> W
-  D --> G
-  W --> S
-  W --> E
-  D --> A
-  C --> M
-  D --> M
-  S --> V
-  A --> V
-  E --> V
-  V --> O
-  M --> O
-  O --> R
-  R --> M
+  P --> E
+  E --> T
+  T --> V
+  V -. "status, blockers, review evidence" .-> C
 
   classDef human fill:#eff6ff,stroke:#2563eb,color:#1e3a8a;
   classDef coord fill:#eef2ff,stroke:#4f46e5,color:#312e81;
@@ -100,7 +80,15 @@ flowchart LR
 
 The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs and produces derived monitoring artifacts without becoming a long-running service.
 
-Implementation scripts are intentionally secondary: `dispatch_claude.sh` supervises execution, `validation.py` and `protocol_cli.py` gate handoffs, and `collect_status.py` audits protocol health.
+Implementation details are intentionally secondary in the diagram:
+
+| Layer | Responsibility | Main implementation |
+| --- | --- | --- |
+| Coordinator control plane | Requirements, design, task split, review, merge decisions | `SKILL.md`, `/rdo` command surface |
+| Intent & planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
+| Execution | Locking, worktree isolation, worker launch, attempt supervision | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends |
+| Protocol truth | Current state, attempt records, evidence, handoff, timeline, memory | `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md` |
+| Validation & recovery | Deterministic gates, read-only audit, derived reports, user-approved recovery | `validation.py`, `protocol_cli.py`, `collect_status.py`, `SUMMARY.md`, `diagnostics/` |
 
 ## Workflow
 
