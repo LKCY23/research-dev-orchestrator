@@ -115,6 +115,8 @@ Read `references/command-surface.md` before acting on `/rdo ...`. `/rdo review` 
 
 `protocol_cli.py` is a narrow internal bridge for `dispatch_claude.sh`. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
 
+`dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; `dispatch_claude.sh` remains responsible for locks, worktrees, process supervision, and handoff validation.
+
 `dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It loads operational defaults from config before any protocol mutation, but explicit env vars still win. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and must not synthesize `review` or `blocked` for the worker. A `review` handoff requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid.
 
 Worker backend configuration:

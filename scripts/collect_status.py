@@ -12,25 +12,21 @@ from typing import Any
 
 from config import load_config
 from protocol import (  # noqa: E402
-    ATTEMPT_EVENTS,
-    ATTEMPT_STATES,
-    BLOCKER_TYPES,
-    CORE_EVENTS,
-    HANDOFF_STATES,
     PROTOCOL_VERSION,
-    REQUIRED_STATUS_FIELDS,
-    RUNTIME_BACKENDS,
-    TASK_EVENTS,
     has_substantive_content,
-    is_int_not_bool,
-    is_non_empty_string,
     load_json,
     parse_iso,
     pid_is_alive,
     repo_root,
     utc_now,
 )
-from validation import validate_worker_handoff
+from validation import (
+    validate_attempt_schema,
+    validate_event,
+    validate_state_history,
+    validate_status_schema,
+    validate_worker_handoff,
+)
 
 
 def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[str], list[str]]:
@@ -51,20 +47,9 @@ def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[
         if not isinstance(event, dict):
             violations.append(f"EVENTS.ndjson line {line_no}: event must be a JSON object")
             continue
-        missing = [field for field in ("at", "actor", "event", "run_id") if not event.get(field)]
-        if missing:
-            violations.append(f"EVENTS.ndjson line {line_no}: missing required fields: {', '.join(missing)}")
-        if event.get("run_id") and event.get("run_id") != run_id:
-            violations.append(f"EVENTS.ndjson line {line_no}: run_id {event.get('run_id')!r} does not match {run_id!r}")
-        event_name = event.get("event")
-        if event_name and event_name not in CORE_EVENTS:
-            warnings.append(f"EVENTS.ndjson line {line_no}: unknown event type {event_name!r}")
-        if event_name in TASK_EVENTS and not event.get("task_id"):
-            violations.append(f"EVENTS.ndjson line {line_no}: event {event_name!r} requires task_id")
-        if event_name in ATTEMPT_EVENTS and not event.get("attempt_id"):
-            violations.append(f"EVENTS.ndjson line {line_no}: event {event_name!r} requires attempt_id")
-        if event.get("at") and parse_iso(event.get("at")) is None:
-            violations.append(f"EVENTS.ndjson line {line_no}: invalid at timestamp {event.get('at')!r}")
+        event_violations, event_warnings = validate_event(event, run_id, line_no)
+        violations.extend(event_violations)
+        warnings.extend(event_warnings)
         events.append(event)
     return events, violations, warnings
 
@@ -100,81 +85,12 @@ def validate_attempt(
         violations.append(f"{task_dir.name}: invalid ATTEMPT.json for {attempt_id}: {exc}")
         return violations, warnings, None
 
-    required = {
-        "attempt_id",
-        "task_id",
-        "agent",
-        "agent_name",
-        "session_id",
-        "state",
-        "handoff_valid",
-        "handoff_state",
-        "started_at",
-        "ended_at",
-        "exit_code",
-        "runtime",
-    }
-    missing = sorted(required - set(attempt))
-    if missing:
-        violations.append(f"{task_dir.name}: ATTEMPT.json missing fields: {', '.join(missing)}")
-    for field in ("attempt_id", "task_id", "agent", "agent_name"):
-        if field in attempt and not is_non_empty_string(attempt.get(field)):
-            violations.append(f"{task_dir.name}: ATTEMPT.{field} must be a non-empty string")
-    if "session_id" in attempt and not isinstance(attempt.get("session_id"), str):
-        violations.append(f"{task_dir.name}: ATTEMPT.session_id must be a string")
-    if attempt.get("attempt_id") != attempt_id:
-        violations.append(f"{task_dir.name}: ATTEMPT.json attempt_id does not match current_attempt_id")
-    if attempt.get("task_id") != status.get("task_id"):
-        violations.append(f"{task_dir.name}: ATTEMPT.json task_id does not match STATUS task_id")
-    if attempt.get("state") not in ATTEMPT_STATES:
-        violations.append(f"{task_dir.name}: invalid ATTEMPT.state {attempt.get('state')!r}")
-    if attempt.get("handoff_state") not in HANDOFF_STATES:
-        violations.append(f"{task_dir.name}: invalid ATTEMPT.handoff_state {attempt.get('handoff_state')!r}")
-    if parse_iso(attempt.get("started_at")) is None:
-        violations.append(f"{task_dir.name}: invalid ATTEMPT.started_at {attempt.get('started_at')!r}")
-    if attempt.get("ended_at") and parse_iso(attempt.get("ended_at")) is None:
-        violations.append(f"{task_dir.name}: invalid ATTEMPT.ended_at {attempt.get('ended_at')!r}")
+    violations.extend(validate_attempt_schema(attempt, status, str(attempt_id), task_dir.name))
     runtime = attempt.get("runtime")
     if not isinstance(runtime, dict):
-        violations.append(f"{task_dir.name}: ATTEMPT.runtime must be an object")
         runtime = {}
-    for field in ("cli", "command", "cwd"):
-        if field in runtime and not is_non_empty_string(runtime.get(field)):
-            violations.append(f"{task_dir.name}: ATTEMPT.runtime.{field} must be a non-empty string")
-        elif field not in runtime:
-            violations.append(f"{task_dir.name}: ATTEMPT.runtime missing field: {field}")
-    backend = runtime.get("backend")
-    if backend not in RUNTIME_BACKENDS:
-        violations.append(f"{task_dir.name}: ATTEMPT.runtime.backend must be plain or tmux")
-    if backend == "tmux":
-        for field in ("tmux_session", "attach_command"):
-            if not is_non_empty_string(runtime.get(field)):
-                violations.append(f"{task_dir.name}: ATTEMPT.runtime.{field} is required for tmux backend")
 
     attempt_state = attempt.get("state")
-    if attempt_state in {"completed", "invalid_handoff"}:
-        if not attempt.get("ended_at"):
-            violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires ended_at")
-    if attempt_state == "completed":
-        if not is_int_not_bool(attempt.get("exit_code")):
-            violations.append(f"{task_dir.name}: completed ATTEMPT requires integer exit_code")
-    if attempt_state == "invalid_handoff":
-        if attempt.get("exit_code") is not None and not is_int_not_bool(attempt.get("exit_code")):
-            violations.append(f"{task_dir.name}: invalid_handoff ATTEMPT requires exit_code integer or null")
-    if attempt_state in {"created", "running"}:
-        if attempt.get("ended_at") is not None:
-            violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires ended_at=null")
-        if attempt.get("exit_code") is not None:
-            violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires exit_code=null")
-    if attempt_state == "completed":
-        if attempt.get("handoff_valid") is not True:
-            violations.append(f"{task_dir.name}: completed ATTEMPT requires handoff_valid=true")
-        if attempt.get("handoff_state") not in {"review", "blocked"}:
-            violations.append(f"{task_dir.name}: completed ATTEMPT requires handoff_state review or blocked")
-    if attempt_state == "invalid_handoff":
-        if attempt.get("handoff_valid") is not False:
-            violations.append(f"{task_dir.name}: invalid_handoff ATTEMPT requires handoff_valid=false")
-
     if attempt_state == "created":
         started = parse_iso(attempt.get("started_at"))
         if started:
@@ -246,67 +162,14 @@ def validate_status(
 ) -> tuple[list[str], list[str]]:
     violations: list[str] = []
     warnings: list[str] = []
-    missing = sorted(REQUIRED_STATUS_FIELDS - set(status))
-    if missing:
-        violations.append(f"{task_dir.name}: missing STATUS fields: {', '.join(missing)}")
     state = status.get("state")
-    states = set(fsm.get("states", []))
-    if state not in states:
-        violations.append(f"{task_dir.name}: invalid state {state!r}")
-
-    history = status.get("state_history")
-    if not isinstance(history, list):
-        violations.append(f"{task_dir.name}: state_history must be a list")
-        history = []
-
-    transitions = fsm.get("transitions", {})
-    for idx, item in enumerate(history):
-        if not isinstance(item, dict):
-            violations.append(f"{task_dir.name}: state_history[{idx}] is not an object")
-            continue
-        from_state = item.get("from")
-        to_state = item.get("to")
-        actor = item.get("actor")
-        allowed = transitions.get(from_state, {}).get(to_state)
-        if allowed is None:
-            violations.append(f"{task_dir.name}: illegal transition {from_state!r} -> {to_state!r}")
-        elif actor not in allowed:
-            violations.append(f"{task_dir.name}: illegal actor {actor!r} for {from_state!r} -> {to_state!r}")
-        if idx == 0 and from_state != "pending":
-            violations.append(f"{task_dir.name}: first state_history transition must start from 'pending'")
-        if idx > 0 and isinstance(history[idx - 1], dict):
-            previous_to = history[idx - 1].get("to")
-            if previous_to != from_state:
-                violations.append(
-                    f"{task_dir.name}: non-continuous state_history at index {idx}: "
-                    f"previous to={previous_to!r}, current from={from_state!r}"
-                )
-
-    if history:
-        last = history[-1]
-        if isinstance(last, dict):
-            if state != last.get("to"):
-                violations.append(f"{task_dir.name}: state {state!r} does not match last history target {last.get('to')!r}")
-            if status.get("previous_state") != last.get("from"):
-                violations.append(f"{task_dir.name}: previous_state does not match last history source")
-    elif state != "pending":
-        violations.append(f"{task_dir.name}: non-pending task has empty state_history")
-
-    if state == "blocked":
-        blocker_type = status.get("blocker_type")
-        if blocker_type not in BLOCKER_TYPES:
-            violations.append(f"{task_dir.name}: blocked task has invalid blocker_type {blocker_type!r}")
-        if not status.get("blocking_reason"):
-            violations.append(f"{task_dir.name}: blocked task has empty blocking_reason")
+    violations.extend(validate_status_schema(status, fsm, task_dir.name))
+    violations.extend(validate_state_history(status, fsm, task_dir.name))
 
     evidence = status.get("evidence")
-    if not isinstance(evidence, dict):
-        violations.append(f"{task_dir.name}: evidence must be an object")
-    else:
+    if isinstance(evidence, dict):
         logs = evidence.get("logs", [])
-        if not isinstance(logs, list):
-            violations.append(f"{task_dir.name}: evidence.logs must be a list")
-        else:
+        if isinstance(logs, list):
             for log_ref in logs:
                 log_path = task_dir / str(log_ref)
                 if not log_path.exists():
@@ -316,8 +179,6 @@ def validate_status(
         violations.append(f"{task_dir.name}: {state} task has missing or template-only EVIDENCE.md")
 
     attempt_id = status.get("current_attempt_id")
-    if state in {"running", "blocked", "review", "approved", "merged"} and not attempt_id:
-        violations.append(f"{task_dir.name}: {state} task is missing current_attempt_id")
     if attempt_id and not (task_dir / "attempts" / str(attempt_id)).exists():
         violations.append(f"{task_dir.name}: current_attempt_id directory missing: {attempt_id}")
     attempt_violations, attempt_warnings, _ = validate_attempt(

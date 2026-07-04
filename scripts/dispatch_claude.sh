@@ -14,6 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROTOCOL_CLI="${SCRIPT_DIR}/protocol_cli.py"
 CONFIG_CLI="${SCRIPT_DIR}/config_cli.py"
+DISPATCH_ASSETS="${SCRIPT_DIR}/dispatch_assets.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -256,47 +257,12 @@ python3 "${PROTOCOL_CLI}" create-attempt \
   --tmux-session "${TMUX_SESSION}" \
   --attach-command "${TMUX_ATTACH_COMMAND}"
 
-{
-  echo "# Worker Task Prompt"
-  echo
-  echo "You are a Claude Code worker. Execute only this task packet."
-  echo
-  echo "## Protocol File Paths"
-  echo
-  echo "You are running in this worktree:"
-  echo
-  echo "- WORKTREE_PATH: ${WORKTREE_PATH}"
-  echo
-  echo "The orchestration protocol files are outside the worktree. Write to these absolute paths:"
-  echo
-  echo "- TASK_DIR: ${TASK_DIR}"
-  echo "- STATUS_PATH: ${STATUS_PATH}"
-  echo "- EVIDENCE_PATH: ${TASK_DIR}/EVIDENCE.md"
-  echo "- HANDOFF_PATH: ${TASK_DIR}/HANDOFF.md"
-  echo "- ATTEMPT_DIR: ${ATTEMPT_DIR}"
-  echo "- LOGS_DIR: ${TASK_DIR}/logs"
-  echo
-  echo "Do not create alternate STATUS/EVIDENCE/HANDOFF files inside the worktree."
-  echo
-  echo "## Protocol Reminders"
-  echo
-  echo "- You may only transition STATUS.json from running to review or blocked."
-  echo "- Append the matching state_history entry: running -> review|blocked with actor claude-code."
-  echo "- If blocked, blocker_type must be one of: needs_coordinator, needs_user, environment, budget, irrecoverable."
-  echo "- Do not write approved, merged, failed, or changes_requested."
-  echo "- Remove RDO_TEMPLATE markers from EVIDENCE.md or HANDOFF.md before ending."
-  echo "- Write substantive EVIDENCE.md and HANDOFF.md before ending."
-  echo "- Keep code changes inside allowed_paths."
-  echo
-  echo "## TASK.md"
-  cat "${TASK_DIR}/TASK.md"
-  echo
-  echo "## CONTEXT.md"
-  cat "${TASK_DIR}/CONTEXT.md"
-  echo
-  echo "## ACCEPTANCE.md"
-  cat "${TASK_DIR}/ACCEPTANCE.md"
-} > "${ATTEMPT_DIR}/prompt.md"
+python3 "${DISPATCH_ASSETS}" render-prompt \
+  --output "${ATTEMPT_DIR}/prompt.md" \
+  --worktree-path "${WORKTREE_PATH}" \
+  --task-dir "${TASK_DIR}" \
+  --status-path "${STATUS_PATH}" \
+  --attempt-dir "${ATTEMPT_DIR}"
 
 python3 "${PROTOCOL_CLI}" transition-running \
   --status-path "${STATUS_PATH}" \
@@ -327,47 +293,15 @@ else
     RUNNER_PATH="${ATTEMPT_DIR}/run-worker.sh"
     DONE_SIGNAL="rdo-done-${TMUX_SESSION}"
     rm -f "${EXIT_CODE_FILE}" "${EXIT_CODE_FILE}.tmp"
-    python3 - "$RUNNER_PATH" "$WORKTREE_PATH" "$CLAUDE_CODE_CMD" "$ATTEMPT_DIR/prompt.md" "$ATTEMPT_DIR/transcript.log" "$EXIT_CODE_FILE" "$DONE_SIGNAL" "$RDO_TMUX_KEEP_SESSION" <<'PY'
-import os
-import shlex
-import sys
-from pathlib import Path
-
-runner_path, worktree_path, command, prompt_path, transcript_path, exit_code_file, done_signal, keep_session = sys.argv[1:9]
-content = f"""#!/usr/bin/env bash
-set +e
-WORKTREE_PATH={shlex.quote(worktree_path)}
-CLAUDE_CODE_CMD={shlex.quote(command)}
-PROMPT_PATH={shlex.quote(prompt_path)}
-TRANSCRIPT_PATH={shlex.quote(transcript_path)}
-EXIT_CODE_FILE={shlex.quote(exit_code_file)}
-DONE_SIGNAL={shlex.quote(done_signal)}
-KEEP_SESSION={shlex.quote(keep_session)}
-
-finish() {{
-  local rc="$?"
-  local tmp="${{EXIT_CODE_FILE}}.tmp"
-  echo "${{rc}}" > "${{tmp}}"
-  mv "${{tmp}}" "${{EXIT_CODE_FILE}}"
-  tmux wait-for -S "${{DONE_SIGNAL}}" 2>/dev/null || true
-  if [[ "${{KEEP_SESSION}}" == "1" ]]; then
-    echo
-    echo "Worker finished with exit code ${{rc}}."
-    echo "Press Ctrl-D or run exit to close this tmux session."
-    exec bash -l
-  fi
-  exit "${{rc}}"
-}}
-trap finish EXIT
-
-cd "${{WORKTREE_PATH}}" || exit 127
-set -o pipefail
-eval "${{CLAUDE_CODE_CMD}}" < "${{PROMPT_PATH}}" 2>&1 | tee "${{TRANSCRIPT_PATH}}"
-exit "${{PIPESTATUS[0]}}"
-"""
-Path(runner_path).write_text(content, encoding="utf-8")
-os.chmod(runner_path, 0o755)
-PY
+    python3 "${DISPATCH_ASSETS}" render-tmux-runner \
+      --output "${RUNNER_PATH}" \
+      --worktree-path "${WORKTREE_PATH}" \
+      --command "${CLAUDE_CODE_CMD}" \
+      --prompt-path "${ATTEMPT_DIR}/prompt.md" \
+      --transcript-path "${ATTEMPT_DIR}/transcript.log" \
+      --exit-code-file "${EXIT_CODE_FILE}" \
+      --done-signal "${DONE_SIGNAL}" \
+      --keep-session "${RDO_TMUX_KEEP_SESSION}"
     TMUX_COMMAND="$(python3 - "$RUNNER_PATH" <<'PY'
 import shlex
 import sys

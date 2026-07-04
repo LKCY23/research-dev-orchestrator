@@ -19,6 +19,7 @@ The skill runtime entrypoint is [`SKILL.md`](SKILL.md). The detailed design base
 - Uses `collect_status.py` as an invariant checker across `STATUS.json`, `ATTEMPT.json`, `LOCK`, `.dispatch-lock`, `EVENTS.ndjson`, `EVIDENCE.md`, and `HANDOFF.md`.
 - Provides an explicit stale dispatch-lock recovery workflow: detect with `collect_status.py`, review with the coordinator, confirm with the user, then remove only `.dispatch-lock` with an audited snapshot/event.
 - Keeps script-level protocol constants/helpers in `scripts/protocol.py` and shared validation rules in `scripts/validation.py`.
+- Keeps dispatch asset rendering in `scripts/dispatch_assets.py`; `dispatch_claude.sh` remains the process supervisor.
 - Keeps operational defaults in `.agent-collab/rdo.toml` through `scripts/config.py`; protocol truth remains non-configurable.
 - Uses `templates/` as the scaffold source for run and task packet files.
 - Provides `/rdo ...` command-like intents as a Codex-facing manual control surface.
