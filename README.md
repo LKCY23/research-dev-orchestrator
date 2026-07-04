@@ -58,17 +58,41 @@ The design is built around four rules:
 flowchart TB
   U["User"]:::human
   C["Coordinator Control Plane<br/>intent, design, task split, review decisions"]:::coord
-  P["Intent & Planning Layer<br/>requirements, ADRs, experiment plan, task contract"]:::planning
-  E["Execution Layer<br/>dispatcher, CLI worker, runtime backend, Git worktree isolation"]:::exec
-  T["Protocol Truth Layer<br/>task state, attempt records, evidence, handoff, timeline, memory"]:::truth
-  V["Validation & Recovery Layer<br/>deterministic gates, read-only audit, recovery review"]:::validate
+  P["Planning Artifacts<br/>requirements, ADRs, experiment plan"]:::planning
+  T["Task Contract<br/>task, context, acceptance"]:::planning
+  D["Execution Dispatcher<br/>lock, attempt, worker launch"]:::exec
+  G["Git Isolation<br/>branch + worktree"]:::exec
+  B["Runtime Backend<br/>plain or tmux"]:::exec
+  W["CLI Worker<br/>bounded implementation"]:::exec
+  S["Task State<br/>STATUS.json"]:::truth
+  A["Attempt Record<br/>ATTEMPT.json"]:::truth
+  H["Evidence & Handoff<br/>EVIDENCE.md / HANDOFF.md"]:::truth
+  M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
+  V["Validation Gate<br/>deterministic protocol checks"]:::validate
+  O["Monitor & Audit<br/>read-only status collection"]:::validate
+  R["Recovery Review<br/>user-approved minimal mutation"]:::validate
 
   U --> C
   C --> P
-  P --> E
-  E --> T
-  T --> V
-  V -. "status, blockers, review evidence" .-> C
+  C --> T
+  P --> T
+  T --> D
+  D --> G
+  D --> B
+  B --> W
+  D --> A
+  W --> S
+  W --> H
+  C --> M
+  D --> M
+  S --> V
+  A --> V
+  H --> V
+  V --> O
+  M --> O
+  O --> R
+  O -. "status, blockers, review evidence" .-> C
+  R --> M
 
   classDef human fill:#eff6ff,stroke:#2563eb,color:#1e3a8a;
   classDef coord fill:#eef2ff,stroke:#4f46e5,color:#312e81;
