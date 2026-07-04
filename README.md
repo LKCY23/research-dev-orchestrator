@@ -54,22 +54,63 @@ The design is built around four rules:
 ## Architecture
 
 ```mermaid
-flowchart TD
-  U["User"] --> C["Codex Coordinator"]
-  C --> R["Requirements / Design / Experiment Plan"]
-  C --> T["Task Packet"]
-  T --> D["dispatch_claude.sh"]
-  D --> W["CLI Worker"]
-  D --> G["Git branch + worktree"]
-  W --> S["STATUS.json"]
-  W --> E["EVIDENCE.md / HANDOFF.md"]
-  D --> A["ATTEMPT.json"]
-  C --> CS["collect_status.py"]
-  CS --> M["SUMMARY.md / diagnostics"]
-  C --> RV["Review / Approve / Merge"]
+flowchart TB
+  subgraph Human["Human & Coordinator Layer"]
+    U["User"]
+    C["Coordinator Control Plane<br/>requirements, design, task split, review, merge decisions"]
+  end
+
+  subgraph Planning["Intent & Planning Layer"]
+    P["Research Intent<br/>requirements, design brief, ADRs, experiment plan"]
+    TC["Task Contract<br/>task, context, acceptance criteria"]
+  end
+
+  subgraph Execution["Execution Layer"]
+    ED["Execution Dispatcher<br/>lock, worktree, attempt, worker launch<br/>(dispatch_claude.sh)"]
+    RB["Runtime Backend<br/>plain or tmux"]
+    CW["CLI Worker<br/>implements one bounded task"]
+    GI["Git Isolation<br/>branch + worktree"]
+  end
+
+  subgraph Truth["Protocol Truth Layer"]
+    TS["Task State<br/>STATUS.json"]
+    AR["Attempt Record<br/>ATTEMPT.json"]
+    HE["Handoff Evidence<br/>EVIDENCE.md / HANDOFF.md"]
+    LM["Long-Term Memory<br/>EVENTS.ndjson / JOURNAL.md / RESULT_LEDGER.md"]
+  end
+
+  subgraph Validation["Validation & Recovery Layer"]
+    HG["Handoff Gate<br/>deterministic protocol validation<br/>(validation.py / protocol_cli.py)"]
+    MA["Monitor & Audit<br/>read-only status collection<br/>(collect_status.py)"]
+    DR["Derived Reports<br/>SUMMARY.md / diagnostics"]
+    RR["Recovery Review<br/>user-approved minimal mutation"]
+  end
+
+  U --> C
+  C --> P
+  C --> TC
+  TC --> ED
+  ED --> RB
+  RB --> CW
+  ED --> GI
+
+  CW --> TS
+  CW --> HE
+  ED --> AR
+  ED --> LM
+  C --> LM
+
+  TS --> HG
+  AR --> HG
+  HE --> HG
+  HG --> MA
+  LM --> MA
+  MA --> DR
+  MA --> RR
+  RR --> LM
 ```
 
-There is no long-running service. Dispatch starts a worker process, validates the handoff, updates attempt metadata, and exits.
+The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs and produces derived monitoring artifacts without becoming a long-running service.
 
 ## Workflow
 
@@ -138,23 +179,29 @@ See [references/state-machine.md](references/state-machine.md), [references/stat
 
 A task is not the same thing as an attempt.
 
-Task state tracks project progress:
+```mermaid
+flowchart LR
+  subgraph TaskFSM["Task FSM: project progress"]
+    P["pending"] --> R["running"]
+    R --> V["review"]
+    R --> B["blocked"]
+    V --> A["approved"]
+    V --> CR["changes_requested"]
+    A --> M["merged"]
+    CR --> R
+    B --> R
+    B --> F["failed"]
+    V --> F
+  end
 
-```text
-pending -> running -> review -> approved -> merged
-                 -> blocked
-review -> changes_requested -> running
-blocked -> running | failed
+  subgraph AttemptLifecycle["Attempt lifecycle: worker execution"]
+    C["created"] --> AR["running"]
+    AR --> DONE["completed<br/>valid review/blocked handoff"]
+    AR --> BAD["invalid_handoff<br/>bad or missing protocol handoff"]
+  end
 ```
 
-Attempt state tracks worker execution:
-
-```text
-created -> running -> completed
-                   -> invalid_handoff
-```
-
-This keeps the task FSM simple while preserving worker execution history. If a worker crashes, writes malformed protocol files, or exits without a valid handoff, the attempt can become `invalid_handoff` without inventing more task states.
+Task state tracks project progress. Attempt state tracks one worker execution. This keeps the task FSM simple while preserving worker execution history. If a worker crashes, writes malformed protocol files, or exits without a valid handoff, the attempt can become `invalid_handoff` without inventing more task states.
 
 ## Runtime Backends
 
