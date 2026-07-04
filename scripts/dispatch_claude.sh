@@ -21,8 +21,10 @@ TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
 STATUS_PATH="${TASK_DIR}/STATUS.json"
 FSM_PATH="${SKILL_ROOT}/references/state-machine.json"
 LOCK_PATH="${TASK_DIR}/LOCK"
+DISPATCH_LOCK_DIR="${TASK_DIR}/.dispatch-lock"
 DIAGNOSTICS_DIR="${RUN_DIR}/diagnostics"
 STATUS_UPDATED=0
+DISPATCH_LOCK_ACQUIRED=0
 
 append_event() {
   local event_name="$1"
@@ -52,9 +54,32 @@ with Path(run_dir, "EVENTS.ndjson").open("a", encoding="utf-8") as handle:
 PY
 }
 
-write_dispatch_failure() {
+dispatch_lock_matches_current_attempt() {
+  [[ "${DISPATCH_LOCK_ACQUIRED}" == "1" ]] || return 1
+  [[ -d "${DISPATCH_LOCK_DIR}" ]] || return 1
+  [[ -f "${DISPATCH_LOCK_DIR}/attempt_id" ]] || return 1
+  [[ -f "${DISPATCH_LOCK_DIR}/pid" ]] || return 1
+  [[ "$(cat "${DISPATCH_LOCK_DIR}/attempt_id" 2>/dev/null)" == "${ATTEMPT_ID:-}" ]] || return 1
+  [[ "$(cat "${DISPATCH_LOCK_DIR}/pid" 2>/dev/null)" == "$$" ]] || return 1
+}
+
+release_dispatch_lock() {
+  if dispatch_lock_matches_current_attempt; then
+    rm -rf "${DISPATCH_LOCK_DIR}"
+    DISPATCH_LOCK_ACQUIRED=0
+  fi
+}
+
+lock_file_matches_current_attempt() {
+  [[ -f "${LOCK_PATH}" ]] || return 1
+  [[ -n "${ATTEMPT_ID:-}" ]] || return 1
+  grep -qx "attempt_id: ${ATTEMPT_ID}" "${LOCK_PATH}" 2>/dev/null
+}
+
+on_exit() {
   local code="$?"
   if [[ "${code}" -eq 0 ]]; then
+    release_dispatch_lock
     return 0
   fi
   if [[ -d "${RUN_DIR}" ]]; then
@@ -70,16 +95,18 @@ write_dispatch_failure() {
       echo "- status_updated: ${STATUS_UPDATED}"
       echo "- attempt_id: ${ATTEMPT_ID:-}"
       echo "- lock_path: ${LOCK_PATH}"
+      echo "- dispatch_lock_dir: ${DISPATCH_LOCK_DIR}"
       echo "- time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     } > "${DIAGNOSTICS_DIR}/dispatch-failure-${TASK_ID}-${stamp}.md"
   fi
-  if [[ "${STATUS_UPDATED}" == "0" && -f "${LOCK_PATH}" ]]; then
+  if [[ "${STATUS_UPDATED}" == "0" ]] && lock_file_matches_current_attempt; then
     rm -f "${LOCK_PATH}"
   fi
+  release_dispatch_lock
   return 0
 }
 
-trap write_dispatch_failure EXIT
+trap on_exit EXIT
 
 if [[ ! -d "${TASK_DIR}" ]]; then
   echo "task not found: ${TASK_DIR}" >&2
@@ -91,11 +118,6 @@ if [[ ! -f "${STATUS_PATH}" ]]; then
   exit 2
 fi
 
-if [[ -e "${LOCK_PATH}" ]]; then
-  echo "task already locked: ${LOCK_PATH}" >&2
-  exit 3
-fi
-
 ATTEMPT_SEQ="$(find "${TASK_DIR}/attempts" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
 ATTEMPT_NUM="$(printf "%03d" "$((ATTEMPT_SEQ + 1))")"
 ATTEMPT_ID="A${ATTEMPT_NUM}-claude-$(python3 - <<'PY'
@@ -104,6 +126,21 @@ print(secrets.token_hex(3))
 PY
 )"
 ATTEMPT_DIR="${TASK_DIR}/attempts/${ATTEMPT_ID}"
+
+if ! mkdir "${DISPATCH_LOCK_DIR}" 2>/dev/null; then
+  echo "task already has active dispatch lock: ${DISPATCH_LOCK_DIR}" >&2
+  exit 3
+fi
+DISPATCH_LOCK_ACQUIRED=1
+{
+  echo "owner: dispatch"
+  echo "pid: $$"
+  echo "created_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo "command: $0 $RUN_ID $TASK_ID"
+  echo "attempt_id: ${ATTEMPT_ID}"
+} > "${DISPATCH_LOCK_DIR}/owner"
+printf "%s\n" "${ATTEMPT_ID}" > "${DISPATCH_LOCK_DIR}/attempt_id"
+printf "%s\n" "$$" > "${DISPATCH_LOCK_DIR}/pid"
 
 python3 - "$STATUS_PATH" "$FSM_PATH" <<'PY'
 import json
@@ -315,11 +352,21 @@ def substantive(path: Path) -> bool:
     marker = TEMPLATE_MARKERS.get(path.name)
     return not (marker and marker in text)
 
+def parse_iso(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
 status_path, attempt_id, task_dir, attempt_path, exit_code = sys.argv[1:6]
+exit_code = int(exit_code)
 status = json.load(open(status_path, encoding="utf-8"))
 state = status.get("state")
 valid_state = state in {"review", "blocked"}
 valid_attempt = status.get("current_attempt_id") == attempt_id
+valid_previous = status.get("previous_state") == "running"
 history = status.get("state_history") if isinstance(status.get("state_history"), list) else []
 last_transition = history[-1] if history else {}
 valid_history = (
@@ -327,21 +374,25 @@ valid_history = (
     and last_transition.get("from") == "running"
     and last_transition.get("to") == state
     and last_transition.get("actor") == "claude-code"
+    and parse_iso(last_transition.get("at")) is not None
 )
 handoff_ok = substantive(Path(task_dir, "HANDOFF.md"))
 evidence_ok = substantive(Path(task_dir, "EVIDENCE.md"))
 if state == "review":
     artifacts_ok = handoff_ok and evidence_ok
+    exit_ok = exit_code == 0
 elif state == "blocked":
     artifacts_ok = handoff_ok and bool(status.get("blocker_type")) and bool(status.get("blocking_reason"))
+    exit_ok = True
 else:
     artifacts_ok = False
+    exit_ok = False
 
 attempt = json.load(open(attempt_path, encoding="utf-8"))
 attempt["ended_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-attempt["exit_code"] = int(exit_code)
+attempt["exit_code"] = exit_code
 
-if not (valid_state and valid_attempt and valid_history and artifacts_ok):
+if not (valid_state and valid_attempt and valid_previous and valid_history and artifacts_ok and exit_ok):
     attempt["state"] = "invalid_handoff"
     attempt["handoff_valid"] = False
     attempt["handoff_state"] = None
@@ -350,6 +401,8 @@ if not (valid_state and valid_attempt and valid_history and artifacts_ok):
         handle.write("\n")
     print("worker_exit_without_valid_status", file=sys.stderr)
     print(f"state={state!r} current_attempt_id={status.get('current_attempt_id')!r}", file=sys.stderr)
+    print(f"exit_code={exit_code!r} exit_ok={exit_ok!r}", file=sys.stderr)
+    print(f"valid_previous={valid_previous!r}", file=sys.stderr)
     print(f"valid_history={valid_history!r}", file=sys.stderr)
     raise SystemExit(4)
 

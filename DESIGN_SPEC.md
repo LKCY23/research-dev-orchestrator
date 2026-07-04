@@ -98,7 +98,8 @@ Codex review
           STATUS.json
           HANDOFF.md
           EVIDENCE.md
-          LOCK  # present only while execution ownership is held
+          LOCK  # human-readable ownership/audit metadata
+          .dispatch-lock/  # present only while active dispatch/worker execution is held
           logs/
           attempts/
             A001-claude-x4p9a/
@@ -110,7 +111,7 @@ Codex review
       final/
 ```
 
-`LOCK` 是条件存在文件。`create_task.py` 不创建 `LOCK`，只有 dispatch 或执行权占用时才创建。
+`LOCK` 是人类可读审计文件。`.dispatch-lock` 是原子执行互斥目录。`create_task.py` 两者都不创建。
 
 ## 4. Identity Contract
 
@@ -521,6 +522,25 @@ tasks/T001-name/
 
 `runtime.model` 可选，不作为协议主键。
 
+ATTEMPT schema constraints:
+
+```text
+attempt_id: non-empty string
+task_id: non-empty string
+agent: non-empty string
+agent_name: non-empty string
+session_id: string; may be empty only if runtime cannot provide one
+state: created|running|completed|invalid_handoff
+started_at: non-empty valid ISO timestamp
+ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff
+exit_code: null for created/running; integer for completed/invalid_handoff
+runtime: object
+runtime.cli: non-empty string
+runtime.command: non-empty string
+runtime.cwd: non-empty string
+runtime.model: optional/null
+```
+
 Attempt state 是 worker execution lifecycle，不是 task progress：
 
 ```text
@@ -544,12 +564,15 @@ STATUS.state = running requires:
   current_attempt_id exists
   ATTEMPT.state in [created, running]
   LOCK exists and matches current_attempt_id
+  .dispatch-lock exists and matches current_attempt_id
 
 STATUS.state = review requires:
   ATTEMPT.state = completed
   ATTEMPT.handoff_valid = true
   ATTEMPT.handoff_state = review
   STATUS.state_history ends with running -> review by actor claude-code
+  STATUS.previous_state = running
+  worker exit_code = 0
   EVIDENCE.md and HANDOFF.md have substantive content
 
 STATUS.state = blocked requires:
@@ -557,6 +580,8 @@ STATUS.state = blocked requires:
   ATTEMPT.handoff_valid = true
   ATTEMPT.handoff_state = blocked
   STATUS.state_history ends with running -> blocked by actor claude-code
+  STATUS.previous_state = running
+  worker exit_code may be zero or nonzero
   HANDOFF.md has substantive content
   blocker_type valid and blocking_reason non-empty
 ```
@@ -586,12 +611,13 @@ STATUS.state = blocked requires:
 
 ## 12. LOCK 规则
 
-`LOCK` 表示当前有 worker/dispatch 占用执行权，不表示任务完成状态。
+`.dispatch-lock` 表示当前有 dispatch/worker 占用执行权，是原子互斥边界。`LOCK` 是人类可读 ownership/audit metadata，不是互斥真源。
 
 位置：
 
 ```text
 tasks/T001-name/LOCK
+tasks/T001-name/.dispatch-lock/
 ```
 
 内容：
@@ -607,12 +633,13 @@ attempt_id:
 规则：
 
 ```text
-1. dispatch_claude.sh 创建 LOCK。
-2. create_task.py 不创建 LOCK。
-3. LOCK 存在则不重复派发。
-4. worker 到 review 或 blocked 后，Codex review 前必须检查 LOCK。
-5. Codex 负责释放、保留或重建 LOCK。
-6. collect_status.py 只报告 LOCK 状态，不删除、不修复。
+1. dispatch_claude.sh 用 mkdir 原子创建 .dispatch-lock。
+2. .dispatch-lock 内必须写 owner/pid/attempt_id，释放前必须确认属于当前 dispatch。
+3. worker 进程退出且 handoff validation 完成后释放 .dispatch-lock，包括 invalid_handoff。
+4. dispatch_claude.sh 创建或更新 LOCK 作为可读审计元数据。
+5. LOCK 可以保留到 Codex review/triage；不能作为互斥判断依据。
+6. create_task.py 不创建 LOCK 或 .dispatch-lock。
+7. collect_status.py 只报告和校验，不删除、不修复。
 ```
 
 ## 13. 反向通知机制
@@ -909,13 +936,13 @@ Only creates pending task.
 ```text
 1. 读取 state-machine.json。
 2. 校验 pending|blocked|changes_requested -> running 是否合法。
-3. 检查 LOCK。
+3. 原子获取 .dispatch-lock；不能用 LOCK 作为互斥判断。
 4. 创建 branch/worktree。
 5. 创建 attempt 目录。
 6. 拼接 prompt.md，并显式写入 TASK_DIR、STATUS_PATH、EVIDENCE_PATH、HANDOFF_PATH、ATTEMPT_DIR 等绝对协议路径。
 7. 调用配置化 Claude Code CLI。
 8. 保存 transcript.log / result.md。
-9. 检查 worker 是否写出合法交付状态。
+9. 检查 worker 是否写出合法交付状态；review 必须 exit_code = 0，blocked 可为非零。
 10. 维护 ATTEMPT.json state / ended_at / exit_code / handoff_valid / handoff_state。
 11. 追加 task_dispatched / worker_review_ready / worker_blocked / worker_exit_without_valid_status events。
 ```
@@ -935,7 +962,10 @@ dispatch 后必须检查：
 ```text
 STATUS.json.state in [review, blocked]
 STATUS.json.current_attempt_id == current attempt
-EVIDENCE.md or HANDOFF.md has substantive content and no RDO_TEMPLATE marker
+STATUS.json.previous_state == running
+last state_history is running -> review|blocked by claude-code with valid timestamp
+review: exit_code == 0 and EVIDENCE.md + HANDOFF.md have substantive content
+blocked: HANDOFF.md + blocker_type + blocking_reason have substantive content
 attempt transcript/result exists
 ```
 

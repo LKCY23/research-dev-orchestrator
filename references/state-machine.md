@@ -29,7 +29,7 @@ Claude Code must not write `approved`, `merged`, `failed`, or `changes_requested
 
 Do not add worker/process failure states to the task FSM. A worker that exits without valid handoff should set `ATTEMPT.state = invalid_handoff`; `collect_status.py` reports this as a protocol violation while the task remains available for Codex triage.
 
-`running`, `review`, and `blocked` have cross-file invariants defined in `attempt-lifecycle.md`.
+`running`, `review`, and `blocked` have cross-file invariants defined in `attempt-lifecycle.md`, including `.dispatch-lock` execution mutex semantics and worker `exit_code` handoff rules.
 
 ## Changes Requested
 

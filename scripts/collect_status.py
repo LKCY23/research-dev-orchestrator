@@ -155,6 +155,14 @@ def has_substantive_content(path: Path) -> bool:
     return True
 
 
+def is_non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def is_int_not_bool(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minutes: float) -> tuple[list[str], list[str], dict[str, Any] | None]:
     violations: list[str] = []
     warnings: list[str] = []
@@ -190,6 +198,11 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
     missing = sorted(required - set(attempt))
     if missing:
         violations.append(f"{task_dir.name}: ATTEMPT.json missing fields: {', '.join(missing)}")
+    for field in ("attempt_id", "task_id", "agent", "agent_name"):
+        if field in attempt and not is_non_empty_string(attempt.get(field)):
+            violations.append(f"{task_dir.name}: ATTEMPT.{field} must be a non-empty string")
+    if "session_id" in attempt and not isinstance(attempt.get("session_id"), str):
+        violations.append(f"{task_dir.name}: ATTEMPT.session_id must be a string")
     if attempt.get("attempt_id") != attempt_id:
         violations.append(f"{task_dir.name}: ATTEMPT.json attempt_id does not match current_attempt_id")
     if attempt.get("task_id") != status.get("task_id"):
@@ -198,17 +211,31 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
         violations.append(f"{task_dir.name}: invalid ATTEMPT.state {attempt.get('state')!r}")
     if attempt.get("handoff_state") not in HANDOFF_STATES:
         violations.append(f"{task_dir.name}: invalid ATTEMPT.handoff_state {attempt.get('handoff_state')!r}")
-    if attempt.get("started_at") and parse_iso(attempt.get("started_at")) is None:
+    if parse_iso(attempt.get("started_at")) is None:
         violations.append(f"{task_dir.name}: invalid ATTEMPT.started_at {attempt.get('started_at')!r}")
     if attempt.get("ended_at") and parse_iso(attempt.get("ended_at")) is None:
         violations.append(f"{task_dir.name}: invalid ATTEMPT.ended_at {attempt.get('ended_at')!r}")
+    runtime = attempt.get("runtime")
+    if not isinstance(runtime, dict):
+        violations.append(f"{task_dir.name}: ATTEMPT.runtime must be an object")
+        runtime = {}
+    for field in ("cli", "command", "cwd"):
+        if field in runtime and not is_non_empty_string(runtime.get(field)):
+            violations.append(f"{task_dir.name}: ATTEMPT.runtime.{field} must be a non-empty string")
+        elif field not in runtime:
+            violations.append(f"{task_dir.name}: ATTEMPT.runtime missing field: {field}")
 
     attempt_state = attempt.get("state")
     if attempt_state in {"completed", "invalid_handoff"}:
         if not attempt.get("ended_at"):
             violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires ended_at")
-        if attempt.get("exit_code") is None:
+        if not is_int_not_bool(attempt.get("exit_code")):
             violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires exit_code")
+    if attempt_state in {"created", "running"}:
+        if attempt.get("ended_at") is not None:
+            violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires ended_at=null")
+        if attempt.get("exit_code") is not None:
+            violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires exit_code=null")
     if attempt_state == "completed":
         if attempt.get("handoff_valid") is not True:
             violations.append(f"{task_dir.name}: completed ATTEMPT requires handoff_valid=true")
@@ -226,14 +253,25 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
                 warnings.append(f"{task_dir.name}: ATTEMPT.state created for {age_minutes:.1f} minutes")
 
     lock = task_dir / "LOCK"
+    dispatch_lock = task_dir / ".dispatch-lock"
     if state == "running":
         if attempt_state not in {"created", "running"}:
             violations.append(f"{task_dir.name}: STATUS running requires ATTEMPT.state created or running, got {attempt_state!r}")
         if not lock.exists():
             violations.append(f"{task_dir.name}: STATUS running requires LOCK")
+        if not dispatch_lock.is_dir():
+            violations.append(f"{task_dir.name}: STATUS running requires active .dispatch-lock")
+        else:
+            dispatch_attempt = dispatch_lock / "attempt_id"
+            if not dispatch_attempt.exists():
+                violations.append(f"{task_dir.name}: .dispatch-lock missing attempt_id")
+            elif dispatch_attempt.read_text(encoding="utf-8", errors="replace").strip() != str(attempt_id):
+                violations.append(f"{task_dir.name}: .dispatch-lock attempt_id does not match STATUS current_attempt_id")
     if state == "review":
         if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "review":
             violations.append(f"{task_dir.name}: STATUS review requires completed attempt with handoff_state=review")
+        if attempt.get("exit_code") != 0:
+            violations.append(f"{task_dir.name}: STATUS review requires ATTEMPT.exit_code=0")
         if not has_substantive_content(task_dir / "HANDOFF.md"):
             violations.append(f"{task_dir.name}: review task has missing or template-only HANDOFF.md")
     if state == "blocked":

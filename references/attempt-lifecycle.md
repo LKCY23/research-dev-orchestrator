@@ -11,6 +11,17 @@ collect_status.py validates invariants across STATUS, ATTEMPT, LOCK, EVENTS, EVI
 No destructive overwrite; use a new run, new attempt, or revision task.
 ```
 
+## Dispatch Locking
+
+```text
+.dispatch-lock = active dispatch/worker execution mutex
+LOCK           = human-readable ownership metadata
+```
+
+`dispatch_claude.sh` must acquire `.dispatch-lock` atomically with `mkdir` before starting a worker. The directory contains `attempt_id`, `pid`, and owner metadata so cleanup only removes a lock owned by the current dispatch.
+
+Release `.dispatch-lock` after the worker process exits and handoff validation finishes, including invalid handoff. Keep `LOCK` for audit until Codex review or triage.
+
 ## ATTEMPT.json Schema
 
 ```json
@@ -33,6 +44,25 @@ No destructive overwrite; use a new run, new attempt, or revision task.
     "cwd": "/path/to/worktree"
   }
 }
+```
+
+Schema constraints:
+
+```text
+attempt_id: non-empty string
+task_id: non-empty string
+agent: non-empty string
+agent_name: non-empty string
+session_id: string; may be empty only if runtime cannot provide one
+state: created|running|completed|invalid_handoff
+started_at: non-empty valid ISO timestamp
+ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff
+exit_code: null for created/running; integer for completed/invalid_handoff
+runtime: object
+runtime.cli: non-empty string
+runtime.command: non-empty string
+runtime.cwd: non-empty string
+runtime.model: optional/null
 ```
 
 ## Attempt States
@@ -72,6 +102,7 @@ attempts/<current_attempt_id>/ATTEMPT.json exists
 ATTEMPT.state in [created, running]
 LOCK exists
 LOCK.attempt_id == current_attempt_id
+.dispatch-lock exists and matches current_attempt_id
 ```
 
 `STATUS.state = review` requires:
@@ -81,6 +112,8 @@ ATTEMPT.state = completed
 ATTEMPT.handoff_valid = true
 ATTEMPT.handoff_state = review
 STATUS.state_history ends with running -> review by actor claude-code
+STATUS.previous_state = running
+worker exit_code = 0
 EVIDENCE.md has substantive content
 HANDOFF.md has substantive content
 ```
@@ -92,6 +125,8 @@ ATTEMPT.state = completed
 ATTEMPT.handoff_valid = true
 ATTEMPT.handoff_state = blocked
 STATUS.state_history ends with running -> blocked by actor claude-code
+STATUS.previous_state = running
+worker exit_code may be zero or nonzero
 HANDOFF.md has substantive content
 blocker_type valid
 blocking_reason non-empty

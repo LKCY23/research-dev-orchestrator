@@ -74,8 +74,8 @@ Template-only `EVIDENCE.md` or `HANDOFF.md` files with `RDO_TEMPLATE` markers ar
 
 `current_attempt_id` points to the current `attempts/<attempt-id>/ATTEMPT.json`.
 
-`STATUS.state = running` requires a matching lock and an attempt whose state is `created` or `running`.
+`STATUS.state = running` requires matching `LOCK` metadata, an active `.dispatch-lock`, and an attempt whose state is `created` or `running`.
 
-`STATUS.state = review` requires a completed attempt with `handoff_valid = true`, `handoff_state = review`, and substantive `EVIDENCE.md` and `HANDOFF.md`.
+`STATUS.state = review` requires `previous_state = running`, a completed attempt with `handoff_valid = true`, `handoff_state = review`, worker `exit_code = 0`, and substantive `EVIDENCE.md` and `HANDOFF.md`.
 
-`STATUS.state = blocked` requires a completed attempt with `handoff_valid = true`, `handoff_state = blocked`, substantive `HANDOFF.md`, valid `blocker_type`, and non-empty `blocking_reason`.
+`STATUS.state = blocked` requires `previous_state = running`, a completed attempt with `handoff_valid = true`, `handoff_state = blocked`, substantive `HANDOFF.md`, valid `blocker_type`, and non-empty `blocking_reason`. Blocked handoff may have a zero or nonzero worker `exit_code`.
