@@ -1,0 +1,57 @@
+name: Smoke Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+
+      - name: Show environment
+        run: |
+          python3 --version
+          bash --version
+          git --version
+          tmux -V
+
+      - name: Python compile
+        run: |
+          python3 -m py_compile scripts/*.py .github/ci/quick_validate_skill.py
+
+      - name: Bash syntax
+        run: |
+          bash -n scripts/dispatch_claude.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
+
+      - name: Skill validation
+        run: |
+          python3 .github/ci/quick_validate_skill.py .
+
+      - name: Smoke tests
+        env:
+          RDO_KEEP_SMOKE_REPOS: "0"
+        run: |
+          scripts/run_smoke_tests.sh
+
+      - name: Diff check
+        run: |
+          git diff --check
