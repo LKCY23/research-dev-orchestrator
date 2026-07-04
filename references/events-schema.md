@@ -29,6 +29,7 @@ task_dispatched
 worker_blocked
 worker_review_ready
 worker_exit_without_valid_status
+dispatch_lock_removed
 codex_reviewed
 changes_requested
 task_approved
@@ -40,6 +41,8 @@ session_closed
 ```
 
 Do not record every small edit. Record events needed to reconstruct the history of requirements, design, dispatch, review, merge, experiments, blockers, and session closeout.
+
+`dispatch_lock_removed` records a user-approved recovery action that removed a stale `.dispatch-lock`. It must include `task_id`, should include `attempt_id` when known, and should include `reason` plus a diagnostics `snapshot` path.
 
 ## Validation
 

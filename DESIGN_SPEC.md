@@ -377,7 +377,7 @@ Codex determines the task should stop under current requirements.
   "branch": "agent/T001-name",
   "worktree": ".agent-worktrees/T001-name",
   "updated_at": "2026-07-03T12:00:00Z",
-  "needs_codex": false,
+  "needs_coordinator": false,
   "summary": "",
   "blocking_reason": "",
   "blocker_type": "",
@@ -407,11 +407,30 @@ Codex determines the task should stop under current requirements.
 `blocker_type` 在 `state = blocked` 时必填：
 
 ```text
-needs_codex
+needs_coordinator
 needs_user
 environment
 budget
 irrecoverable
+```
+
+含义：
+
+```text
+needs_coordinator
+  需要协调者判断、重拆任务、设计决策、review、merge/conflict 处理或验收澄清。
+
+needs_user
+  需要用户输入、授权、偏好、数据访问或研究决策。
+
+environment
+  依赖、数据、硬件、服务、权限、文件系统、本地/远程运行环境问题。
+
+budget
+  时间、token、计算、成本或上下文预算问题。
+
+irrecoverable
+  worker 认为当前要求下不可完成，需要 coordinator 判定 failed、revision task 或 scope change。
 ```
 
 `STATUS.json.evidence` 只是索引和摘要，真源是：
@@ -583,7 +602,7 @@ STATUS.state = blocked requires:
   STATUS.previous_state = running
   worker exit_code may be zero or nonzero
   HANDOFF.md has substantive content
-  blocker_type in [needs_codex, needs_user, environment, budget, irrecoverable]
+  blocker_type in [needs_coordinator, needs_user, environment, budget, irrecoverable]
   blocking_reason non-empty
 ```
 
@@ -668,7 +687,94 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run
 
 `codex resume`、`cc`、Codex plugin 可以作为可选增强，但不是协议依赖。
 
-## 14. Human / Machine Monitor
+## 14. Lock Recovery Review
+
+`.dispatch-lock` 异常不能由脚本自动修复，必须进入 Lock Recovery Review。
+
+分工：
+
+```text
+collect_status.py  检测协议异常，只读
+Codex/coordinator  检查上下文并给出判断
+User               最终批准是否清理
+remove_dispatch_lock.py 执行已批准的最小变更
+EVENTS + diagnostics  保留审计记录
+```
+
+触发条件：
+
+```text
+STATUS.state != running but .dispatch-lock exists
+STATUS.state = running but .dispatch-lock/attempt_id mismatch
+STATUS.state = running but ATTEMPT.state in [completed, invalid_handoff]
+.dispatch-lock age > stale threshold
+.dispatch-lock/pid missing
+.dispatch-lock/pid not alive
+```
+
+Codex/coordinator 检查：
+
+```text
+STATUS.json
+ATTEMPT.json
+LOCK
+.dispatch-lock/*
+attempts/<attempt>/transcript.log
+attempts/<attempt>/result.md
+recent EVENTS.ndjson entries
+HANDOFF.md
+EVIDENCE.md
+git worktree / branch state
+.dispatch-lock/pid liveness
+whether transcript.log is still growing
+```
+
+分类：
+
+```text
+active     worker/dispatch 可能仍在运行，不清理
+stale      worker/dispatch 明确已结束，建议只清理 .dispatch-lock
+ambiguous  证据不足，继续观察或询问用户
+```
+
+用户确认前输出：
+
+```text
+Finding
+Evidence
+Risk
+Recommendation
+Proposed mutation
+```
+
+`Proposed mutation` 必须写明：
+
+```text
+Will:
+  snapshot tasks/<task>/.dispatch-lock -> diagnostics/
+  remove tasks/<task>/.dispatch-lock
+  append dispatch_lock_removed to EVENTS.ndjson
+
+Will not:
+  modify STATUS.json
+  modify ATTEMPT.json
+  modify HANDOFF.md
+  modify EVIDENCE.md
+  remove LOCK
+  change FSM state
+```
+
+`remove_dispatch_lock.py` 默认 dry-run；必须有 `--confirmed` 才会修改文件。执行顺序：
+
+```text
+1. snapshot .dispatch-lock
+2. rm -rf .dispatch-lock
+3. append dispatch_lock_removed event
+```
+
+脚本不判断 active/stale，只执行用户批准后的机械清理。
+
+## 15. Human / Machine Monitor
 
 新增 `SUMMARY.md`：
 
@@ -734,7 +840,7 @@ Interactive monitor:
   collect_status.py default output
 ```
 
-## 15. Long-Term Memory
+## 16. Long-Term Memory
 
 长期迭代需要两个 required memory artifacts：
 
@@ -791,7 +897,7 @@ session_closed
 
 `close_session.py` 是推荐入口，因为它会同时更新 `SUMMARY.md`、追加 `JOURNAL.md`、追加 `session_closed` event。
 
-## 16. Attempt Lifecycle And Audit Integrity
+## 17. Attempt Lifecycle And Audit Integrity
 
 Task FSM 只表达任务目标进展。Worker/process 状态必须放在 `ATTEMPT.json`。`collect_status.py` 是 invariant checker，负责跨 `STATUS.json`、`ATTEMPT.json`、`LOCK`、`EVENTS.ndjson`、`EVIDENCE.md`、`HANDOFF.md` 检测协议一致性，但不自动修复。
 
@@ -841,7 +947,7 @@ same task retry -> new attempt
 scope / acceptance / design change -> revision task, e.g. T001R1-*
 ```
 
-## 17. Diagnostics
+## 18. Diagnostics
 
 协议错误和状态异常可以写入：
 
@@ -871,7 +977,7 @@ STATUS.json.evidence 与 EVIDENCE.md/logs 冲突
 LOCK attempt_id 与 STATUS.json.current_attempt_id 不一致
 ```
 
-## 18. scripts 设计
+## 19. scripts 设计
 
 第一版 scripts：
 
@@ -1011,7 +1117,6 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-diagnostics
-python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-id> --summary "<summary>"
 ```
 
 限制：
@@ -1025,6 +1130,38 @@ Never modify STATUS.json.
 Never delete LOCK.
 Never change FSM state.
 Never repair protocol violations automatically.
+```
+
+### remove_dispatch_lock.py
+
+职责：
+
+```text
+1. 只在 Lock Recovery Review 后、用户明确批准时使用。
+2. 默认 dry-run；没有 --confirmed 不修改文件。
+3. 读取 STATUS.current_attempt_id 作为 attempt_id。
+4. snapshot tasks/<task>/.dispatch-lock 到 diagnostics/dispatch-lock-removed-<task>-<timestamp>/。
+5. 删除 tasks/<task>/.dispatch-lock。
+6. 删除成功后追加 dispatch_lock_removed event。
+```
+
+限制：
+
+```text
+Does not decide active/stale/ambiguous.
+Does not modify STATUS.json.
+Does not modify ATTEMPT.json.
+Does not modify LOCK.
+Does not modify HANDOFF.md / EVIDENCE.md.
+Does not change FSM state.
+Fails if .dispatch-lock does not exist.
+```
+
+模式：
+
+```bash
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/remove_dispatch_lock.py" --run-id <run-id> --task-id <task-id> --reason "<reason>"
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/remove_dispatch_lock.py" --run-id <run-id> --task-id <task-id> --reason "<reason>" --confirmed
 ```
 
 ### close_session.py
@@ -1047,7 +1184,7 @@ review_task.py
 
 原因：review 依赖工程判断、研究目标、实验语义、diff 质量和 integration context，先由 Codex 按 `review-rubric.md` 手动 review 更稳。
 
-## 19. Skill 文件结构
+## 20. Skill 文件结构
 
 ```text
 research-dev-orchestrator/
@@ -1065,6 +1202,7 @@ research-dev-orchestrator/
     state-machine.json
     status-schema.md
     attempt-lifecycle.md
+    lock-recovery.md
     summary-template.md
     events-schema.md
     journal-template.md
@@ -1073,10 +1211,11 @@ research-dev-orchestrator/
     create_task.py
     dispatch_claude.sh
     collect_status.py
+    remove_dispatch_lock.py
     close_session.py
 ```
 
-## 20. SKILL.md 的职责
+## 21. SKILL.md 的职责
 
 `SKILL.md` 保持轻量，只写：
 
@@ -1093,11 +1232,12 @@ research-dev-orchestrator/
 10. SUMMARY.md 是派生 monitor，不是真源。
 11. 每个 session 结束必须维护 EVENTS.ndjson 和 JOURNAL.md。
 12. Task FSM / Attempt lifecycle / audit integrity 必须分层处理。
+13. Lock Recovery Review 必须先判断、再用户确认、再最小清理。
 ```
 
 详细模板、schema、rubric、FSM 解释放进 `references`。
 
-## 21. 推荐 references 内容
+## 22. 推荐 references 内容
 
 ```text
 requirements-template.md:
@@ -1136,6 +1276,9 @@ status-schema.md:
 attempt-lifecycle.md:
   ATTEMPT.json schema、attempt states、handoff_valid、handoff_state、running/review/blocked invariants。
 
+lock-recovery.md:
+  .dispatch-lock 异常检测、Lock Recovery Review、用户确认格式、remove_dispatch_lock.py 边界。
+
 summary-template.md:
   SUMMARY.md 结构和 derived artifact 约束。
 
@@ -1146,7 +1289,7 @@ journal-template.md:
   JOURNAL.md 的 session closeout 模板和写入边界。
 ```
 
-## 22. 最终审计结论
+## 23. 最终审计结论
 
 这版可以作为实现基线。
 

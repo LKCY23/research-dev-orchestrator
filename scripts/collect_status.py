@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 from collections import Counter
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ REQUIRED_STATUS_FIELDS = {
     "branch",
     "worktree",
     "updated_at",
-    "needs_codex",
+    "needs_coordinator",
     "summary",
     "blocking_reason",
     "blocker_type",
@@ -29,7 +30,7 @@ REQUIRED_STATUS_FIELDS = {
     "state_history",
 }
 
-BLOCKER_TYPES = {"needs_codex", "needs_user", "environment", "budget", "irrecoverable"}
+BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "irrecoverable"}
 ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
 HANDOFF_STATES = {"review", "blocked", None}
 CORE_EVENTS = {
@@ -42,6 +43,7 @@ CORE_EVENTS = {
     "worker_blocked",
     "worker_review_ready",
     "worker_exit_without_valid_status",
+    "dispatch_lock_removed",
     "codex_reviewed",
     "changes_requested",
     "task_approved",
@@ -57,6 +59,7 @@ TASK_EVENTS = {
     "worker_blocked",
     "worker_review_ready",
     "worker_exit_without_valid_status",
+    "dispatch_lock_removed",
     "codex_reviewed",
     "changes_requested",
     "task_approved",
@@ -161,6 +164,16 @@ def is_non_empty_string(value: Any) -> bool:
 
 def is_int_not_bool(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minutes: float) -> tuple[list[str], list[str], dict[str, Any] | None]:
@@ -291,6 +304,8 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any],
     missing = sorted(REQUIRED_STATUS_FIELDS - set(status))
     if missing:
         violations.append(f"{task_dir.name}: missing STATUS fields: {', '.join(missing)}")
+    if "needs_codex" in status:
+        warnings.append(f"{task_dir.name}: legacy STATUS.needs_codex is deprecated; use needs_coordinator")
 
     state = status.get("state")
     states = set(fsm.get("states", []))
@@ -430,6 +445,18 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
             dispatch_lock_info = {"path": str(dispatch_lock), "age_hours": round(age_hours, 2)}
             if age_hours > stale_lock_hours:
                 stale_dispatch_locks.append(str(dispatch_lock))
+            pid_path = dispatch_lock / "pid"
+            if not pid_path.exists():
+                warnings.append(f"{task_dir.name}: .dispatch-lock missing pid")
+            else:
+                pid_text = pid_path.read_text(encoding="utf-8", errors="replace").strip()
+                try:
+                    pid = int(pid_text)
+                except ValueError:
+                    warnings.append(f"{task_dir.name}: .dispatch-lock pid is not an integer: {pid_text!r}")
+                else:
+                    if not pid_is_alive(pid):
+                        warnings.append(f"{task_dir.name}: .dispatch-lock pid is not alive: {pid}")
 
         tasks.append(
             {
@@ -439,7 +466,7 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
                 "branch": status.get("branch"),
                 "worktree": status.get("worktree"),
                 "current_attempt_id": status.get("current_attempt_id"),
-                "needs_codex": status.get("needs_codex"),
+                "needs_coordinator": status.get("needs_coordinator"),
                 "blocker_type": status.get("blocker_type"),
                 "blocking_reason": status.get("blocking_reason"),
                 "summary": status.get("summary"),

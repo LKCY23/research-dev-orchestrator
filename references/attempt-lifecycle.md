@@ -130,7 +130,7 @@ STATUS.state_history ends with running -> blocked by actor claude-code
 STATUS.previous_state = running
 worker exit_code may be zero or nonzero
 HANDOFF.md has substantive content
-blocker_type in [needs_codex, needs_user, environment, budget, irrecoverable]
+blocker_type in [needs_coordinator, needs_user, environment, budget, irrecoverable]
 blocking_reason non-empty
 ```
 

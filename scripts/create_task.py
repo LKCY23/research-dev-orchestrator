@@ -84,7 +84,7 @@ def main() -> int:
         "branch": branch,
         "worktree": worktree,
         "updated_at": now,
-        "needs_codex": False,
+        "needs_coordinator": False,
         "summary": "",
         "blocking_reason": "",
         "blocker_type": "",

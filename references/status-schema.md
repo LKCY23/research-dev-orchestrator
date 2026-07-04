@@ -13,7 +13,7 @@
   "branch": "agent/T001-name",
   "worktree": ".agent-worktrees/T001-name",
   "updated_at": "2026-07-03T12:00:00Z",
-  "needs_codex": false,
+  "needs_coordinator": false,
   "summary": "",
   "blocking_reason": "",
   "blocker_type": "",
@@ -42,18 +42,37 @@
 
 ## Required Fields
 
-Always include `task_id`, `state`, `previous_state`, `owner`, `branch`, `worktree`, `updated_at`, `needs_codex`, `summary`, `blocking_reason`, `blocker_type`, `current_attempt_id`, `assigned_worker`, `evidence`, and `state_history`.
+Always include `task_id`, `state`, `previous_state`, `owner`, `branch`, `worktree`, `updated_at`, `needs_coordinator`, `summary`, `blocking_reason`, `blocker_type`, `current_attempt_id`, `assigned_worker`, `evidence`, and `state_history`.
 
 For `pending`, `previous_state`, `current_attempt_id`, and `assigned_worker` may be `null`.
 
 For `blocked`, `blocker_type` is required and must be one of:
 
 ```text
-needs_codex
+needs_coordinator
 needs_user
 environment
 budget
 irrecoverable
+```
+
+Meanings:
+
+```text
+needs_coordinator
+  Needs coordinator judgment, task split, design decision, review, merge/conflict handling, or acceptance clarification.
+
+needs_user
+  Needs user input, authorization, preference, data access, or research decision.
+
+environment
+  Blocked by dependency, data, hardware, service, permission, filesystem, or local/remote runtime condition.
+
+budget
+  Continuing would exceed or has exceeded time, token, compute, cost, or context budget.
+
+irrecoverable
+  Worker believes the task cannot be completed under current requirements; coordinator must decide failed, revision task, or scope change.
 ```
 
 ## Evidence Summary

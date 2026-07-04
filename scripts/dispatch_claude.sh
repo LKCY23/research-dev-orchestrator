@@ -248,6 +248,7 @@ PY
   echo
   echo "- You may only transition STATUS.json from running to review or blocked."
   echo "- Append the matching state_history entry: running -> review|blocked with actor claude-code."
+  echo "- If blocked, blocker_type must be one of: needs_coordinator, needs_user, environment, budget, irrecoverable."
   echo "- Do not write approved, merged, failed, or changes_requested."
   echo "- Remove RDO_TEMPLATE markers from EVIDENCE.md or HANDOFF.md before ending."
   echo "- Write substantive EVIDENCE.md and HANDOFF.md before ending."
@@ -280,7 +281,7 @@ status["previous_state"] = state
 status["state"] = "running"
 status["owner"] = "claude-code"
 status["updated_at"] = now
-status["needs_codex"] = False
+status["needs_coordinator"] = False
 status["blocking_reason"] = ""
 status["blocker_type"] = ""
 status["current_attempt_id"] = attempt_id
@@ -342,7 +343,7 @@ TEMPLATE_MARKERS = {
     "EVIDENCE.md": "<!-- RDO_TEMPLATE: EVIDENCE -->",
     "HANDOFF.md": "<!-- RDO_TEMPLATE: HANDOFF -->",
 }
-BLOCKER_TYPES = {"needs_codex", "needs_user", "environment", "budget", "irrecoverable"}
+BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "irrecoverable"}
 
 def substantive(path: Path) -> bool:
     if not path.exists():
