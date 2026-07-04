@@ -8,18 +8,12 @@ fi
 
 RUN_ID="$1"
 TASK_ID="$2"
-CLAUDE_CODE_CMD="${CLAUDE_CODE_CMD:-claude}"
-CLAUDE_AGENT_NAME="${CLAUDE_AGENT_NAME:-claude-worker}"
-CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}"
 DISPATCH_DRY_RUN="${DISPATCH_DRY_RUN:-0}"
-RDO_WORKER_BACKEND="${RDO_WORKER_BACKEND:-plain}"
-RDO_TMUX_SESSION_PREFIX="${RDO_TMUX_SESSION_PREFIX:-rdo}"
-RDO_TMUX_KEEP_SESSION="${RDO_TMUX_KEEP_SESSION:-0}"
-RDO_TMUX_WAIT_TIMEOUT_SECONDS="${RDO_TMUX_WAIT_TIMEOUT_SECONDS:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROTOCOL_CLI="${SCRIPT_DIR}/protocol_cli.py"
+CONFIG_CLI="${SCRIPT_DIR}/config_cli.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -120,6 +114,23 @@ if [[ ! -f "${STATUS_PATH}" ]]; then
   echo "STATUS.json not found: ${STATUS_PATH}" >&2
   exit 2
 fi
+
+set +e
+CONFIG_ENV="$(python3 "${CONFIG_CLI}" export-env --no-env --prefix CONFIG_)"
+CONFIG_STATUS=$?
+set -e
+if [[ "${CONFIG_STATUS}" -ne 0 ]]; then
+  exit "${CONFIG_STATUS}"
+fi
+eval "${CONFIG_ENV}"
+
+: "${CLAUDE_CODE_CMD:=${CONFIG_CLAUDE_CODE_CMD}}"
+: "${CLAUDE_AGENT_NAME:=${CONFIG_CLAUDE_AGENT_NAME}}"
+: "${CLAUDE_SESSION_ID:=${CONFIG_CLAUDE_SESSION_ID}}"
+: "${RDO_WORKER_BACKEND:=${CONFIG_RDO_WORKER_BACKEND}}"
+: "${RDO_TMUX_SESSION_PREFIX:=${CONFIG_RDO_TMUX_SESSION_PREFIX}}"
+: "${RDO_TMUX_KEEP_SESSION:=${CONFIG_RDO_TMUX_KEEP_SESSION}}"
+: "${RDO_TMUX_WAIT_TIMEOUT_SECONDS:=${CONFIG_RDO_TMUX_WAIT_TIMEOUT_SECONDS}}"
 
 case "${RDO_WORKER_BACKEND}" in
   plain|tmux) ;;
@@ -287,7 +298,7 @@ if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
 else
   if [[ "${RDO_WORKER_BACKEND}" == "plain" ]]; then
     set +e
-    (cd "${WORKTREE_PATH}" && ${CLAUDE_CODE_CMD} < "${ATTEMPT_DIR}/prompt.md") \
+    (cd "${WORKTREE_PATH}" && eval "${CLAUDE_CODE_CMD}" < "${ATTEMPT_DIR}/prompt.md") \
       > "${ATTEMPT_DIR}/transcript.log" 2>&1
     EXIT_CODE=$?
     set -e

@@ -66,6 +66,8 @@ RDO_TMUX_EXIT_CODE_GRACE_SECONDS
   Grace period for collect_status.py before a tmux exit_code file on a still-running attempt becomes a protocol violation.
 ```
 
+For dispatch, explicit environment variables override `.agent-collab/rdo.toml`. Invalid config must fail before `.dispatch-lock`, `LOCK`, attempts, worktrees, or `STATUS -> running` mutations.
+
 ## ATTEMPT.runtime Schema
 
 Common fields:

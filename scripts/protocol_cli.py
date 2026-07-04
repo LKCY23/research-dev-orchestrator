@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,10 +58,11 @@ def cmd_append_event(args: argparse.Namespace) -> int:
 
 def cmd_create_attempt(args: argparse.Namespace) -> int:
     command = args.command
+    command_parts = shlex.split(command)
     runtime: dict[str, Any] = {
         "backend": args.backend,
         "model": os.environ.get("CLAUDE_MODEL"),
-        "cli": command.split()[0] if command.split() else command,
+        "cli": command_parts[0] if command_parts else command,
         "command": command,
         "cwd": args.cwd,
     }

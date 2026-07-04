@@ -81,6 +81,13 @@ RDO_WORKTREE_ROOT
 
 `worker.command` and `CLAUDE_CODE_CMD` are interpreted by the dispatch shell. Do not put secrets in them; prefer environment variables for credentials.
 
+If the command path contains spaces, quote it inside TOML as a shell command string, for example:
+
+```toml
+[worker]
+command = "'/path/with spaces/worker.sh'"
+```
+
 ## Current Script Integration
 
 Python-side scripts consume config first:
@@ -96,15 +103,17 @@ create_task.py
   default branch and worktree from task.branch_prefix and task.worktree_root
 ```
 
-`dispatch_claude.sh` continues to use explicit environment variables in this phase. Use `scripts/config_cli.py export-env` to inspect resolved values before dispatch integration.
+`dispatch_claude.sh` reads config defaults through `scripts/config_cli.py export-env --no-env --prefix CONFIG_` before any protocol mutation. Explicit environment variables still win over config defaults.
 
-When dispatch integration is added, do not use unchecked command substitution:
+Do not use unchecked command substitution:
 
 ```bash
 eval "$(python scripts/config_cli.py export-env)"
 ```
 
 Capture output and exit status first, then `eval` only on success. Config errors must stop dispatch before locks, attempts, worktrees, or `STATUS -> running` mutations.
+
+Dispatch must still read existing task `branch` and `worktree` only from `STATUS.json`. `task.branch_prefix` and `task.worktree_root` are used only by `create_task.py` when creating a new task.
 
 ## Diagnostics
 

@@ -111,11 +111,11 @@ Read `references/command-surface.md` before acting on `/rdo ...`. `/rdo review` 
 
 `validation.py` contains shared protocol validation rules, starting with worker handoff validation. `protocol_cli.py validate-handoff` and `collect_status.py` must reuse it so online gate checks and offline audit do not drift.
 
-`config.py` loads operational defaults from `.agent-collab/rdo.toml` and environment variables. It must not define or mutate protocol truth. CLI flags and `/rdo` one-off arguments still override config.
+`config.py` loads operational defaults from `.agent-collab/rdo.toml` and environment variables. It must not define or mutate protocol truth. CLI flags, `/rdo` one-off arguments, and explicit env vars still override config.
 
 `protocol_cli.py` is a narrow internal bridge for `dispatch_claude.sh`. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
 
-`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and must not synthesize `review` or `blocked` for the worker. A `review` handoff requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid.
+`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It loads operational defaults from config before any protocol mutation, but explicit env vars still win. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and must not synthesize `review` or `blocked` for the worker. A `review` handoff requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid.
 
 Worker backend configuration:
 

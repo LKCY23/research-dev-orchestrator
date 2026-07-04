@@ -34,3 +34,9 @@ set -e
 assert_json_expr "${repo}/status.json" "'config: [runtime].backend must be one of' in '\\n'.join(payload['protocol_violations'])"
 assert_json_expr "${repo}/status.json" "'config: [tmux].exit_code_grace_seconds must be a non-negative integer' in '\\n'.join(payload['protocol_violations'])"
 assert_json_expr "${repo}/status.json" "'config: unknown section [unknown]' in '\\n'.join(payload['protocol_warnings'])"
+
+set +e
+python3 "${RDO_ROOT}/scripts/config_cli.py" export-env --no-env --prefix BAD_ >/dev/null 2>&1
+prefix_code="$?"
+set -e
+[[ "${prefix_code}" != "0" ]]
