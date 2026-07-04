@@ -583,7 +583,8 @@ STATUS.state = blocked requires:
   STATUS.previous_state = running
   worker exit_code may be zero or nonzero
   HANDOFF.md has substantive content
-  blocker_type valid and blocking_reason non-empty
+  blocker_type in [needs_codex, needs_user, environment, budget, irrecoverable]
+  blocking_reason non-empty
 ```
 
 `changes_requested` 后的修复入口：
@@ -639,7 +640,8 @@ attempt_id:
 4. dispatch_claude.sh 创建或更新 LOCK 作为可读审计元数据。
 5. LOCK 可以保留到 Codex review/triage；不能作为互斥判断依据。
 6. create_task.py 不创建 LOCK 或 .dispatch-lock。
-7. collect_status.py 只报告和校验，不删除、不修复。
+7. STATUS.state 不是 running 时，残留 .dispatch-lock 是 protocol violation。
+8. collect_status.py 只报告和校验，不删除、不修复。
 ```
 
 ## 13. 反向通知机制
@@ -965,7 +967,7 @@ STATUS.json.current_attempt_id == current attempt
 STATUS.json.previous_state == running
 last state_history is running -> review|blocked by claude-code with valid timestamp
 review: exit_code == 0 and EVIDENCE.md + HANDOFF.md have substantive content
-blocked: HANDOFF.md + blocker_type + blocking_reason have substantive content
+blocked: HANDOFF.md + allowed blocker_type + blocking_reason have substantive content
 attempt transcript/result exists
 ```
 

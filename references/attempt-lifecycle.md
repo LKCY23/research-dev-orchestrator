@@ -22,6 +22,8 @@ LOCK           = human-readable ownership metadata
 
 Release `.dispatch-lock` after the worker process exits and handoff validation finishes, including invalid handoff. Keep `LOCK` for audit until Codex review or triage.
 
+If `.dispatch-lock` exists while `STATUS.state` is not `running`, report a protocol violation. A stale execution mutex can block future dispatch even when the task appears ready for review or triage.
+
 ## ATTEMPT.json Schema
 
 ```json
@@ -128,7 +130,7 @@ STATUS.state_history ends with running -> blocked by actor claude-code
 STATUS.previous_state = running
 worker exit_code may be zero or nonzero
 HANDOFF.md has substantive content
-blocker_type valid
+blocker_type in [needs_codex, needs_user, environment, budget, irrecoverable]
 blocking_reason non-empty
 ```
 

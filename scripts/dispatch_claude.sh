@@ -342,6 +342,7 @@ TEMPLATE_MARKERS = {
     "EVIDENCE.md": "<!-- RDO_TEMPLATE: EVIDENCE -->",
     "HANDOFF.md": "<!-- RDO_TEMPLATE: HANDOFF -->",
 }
+BLOCKER_TYPES = {"needs_codex", "needs_user", "environment", "budget", "irrecoverable"}
 
 def substantive(path: Path) -> bool:
     if not path.exists():
@@ -382,7 +383,7 @@ if state == "review":
     artifacts_ok = handoff_ok and evidence_ok
     exit_ok = exit_code == 0
 elif state == "blocked":
-    artifacts_ok = handoff_ok and bool(status.get("blocker_type")) and bool(status.get("blocking_reason"))
+    artifacts_ok = handoff_ok and status.get("blocker_type") in BLOCKER_TYPES and bool(status.get("blocking_reason"))
     exit_ok = True
 else:
     artifacts_ok = False

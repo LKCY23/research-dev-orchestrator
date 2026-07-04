@@ -267,6 +267,8 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
                 violations.append(f"{task_dir.name}: .dispatch-lock missing attempt_id")
             elif dispatch_attempt.read_text(encoding="utf-8", errors="replace").strip() != str(attempt_id):
                 violations.append(f"{task_dir.name}: .dispatch-lock attempt_id does not match STATUS current_attempt_id")
+    elif dispatch_lock.exists():
+        violations.append(f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}")
     if state == "review":
         if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "review":
             violations.append(f"{task_dir.name}: STATUS review requires completed attempt with handoff_state=review")
@@ -385,6 +387,7 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
     violations: list[str] = []
     warnings: list[str] = []
     stale_locks: list[str] = []
+    stale_dispatch_locks: list[str] = []
     invalid_status_files: list[str] = []
     now_ts = datetime.now(timezone.utc).timestamp()
 
@@ -420,6 +423,13 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
             lock_info = {"path": str(lock), "age_hours": round(age_hours, 2)}
             if age_hours > stale_lock_hours:
                 stale_locks.append(str(lock))
+        dispatch_lock = task_dir / ".dispatch-lock"
+        dispatch_lock_info = None
+        if dispatch_lock.exists():
+            age_hours = (now_ts - dispatch_lock.stat().st_mtime) / 3600
+            dispatch_lock_info = {"path": str(dispatch_lock), "age_hours": round(age_hours, 2)}
+            if age_hours > stale_lock_hours:
+                stale_dispatch_locks.append(str(dispatch_lock))
 
         tasks.append(
             {
@@ -434,6 +444,7 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
                 "blocking_reason": status.get("blocking_reason"),
                 "summary": status.get("summary"),
                 "lock": lock_info,
+                "dispatch_lock": dispatch_lock_info,
             }
         )
 
@@ -449,6 +460,7 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
         "ready_for_review": [task for task in tasks if task["state"] == "review"],
         "invalid_status_files": invalid_status_files,
         "stale_locks": stale_locks,
+        "stale_dispatch_locks": stale_dispatch_locks,
         "protocol_violations": violations,
         "protocol_warnings": warnings,
         "recent_events": events[-10:],
@@ -474,7 +486,8 @@ def render_human(report: dict[str, Any]) -> str:
     for task in report["tasks"]:
         blocker = f" blocker={task['blocker_type']}" if task.get("blocker_type") else ""
         lock = " lock=yes" if task.get("lock") else ""
-        lines.append(f"  {task['task_id']}: {task['state']} attempt={task.get('current_attempt_id')}{blocker}{lock}")
+        dispatch_lock = " dispatch_lock=yes" if task.get("dispatch_lock") else ""
+        lines.append(f"  {task['task_id']}: {task['state']} attempt={task.get('current_attempt_id')}{blocker}{lock}{dispatch_lock}")
 
     if report["protocol_violations"]:
         lines.append("")
@@ -491,6 +504,11 @@ def render_human(report: dict[str, Any]) -> str:
         lines.append("")
         lines.append("Stale locks:")
         for lock in report["stale_locks"]:
+            lines.append(f"  - {lock}")
+    if report["stale_dispatch_locks"]:
+        lines.append("")
+        lines.append("Stale dispatch locks:")
+        for lock in report["stale_dispatch_locks"]:
             lines.append(f"  - {lock}")
 
     if report["recent_events"]:
