@@ -145,7 +145,17 @@ blocking_reason non-empty
 
 If `STATUS.state = running` and `ATTEMPT.state` is `completed` or `invalid_handoff`, report a protocol violation. Codex must inspect the attempt and decide whether to re-dispatch, request changes, mark blocked, or fail the task.
 
-For `runtime.backend = tmux`, if `attempts/<current_attempt_id>/exit_code` exists while `STATUS.state = running` and `ATTEMPT.state = running`, report a protocol violation. This means the tmux runner produced a completion artifact after dispatch supervision was lost or failed to update `ATTEMPT.json`; Codex must perform Lock Recovery Review.
+For `runtime.backend = tmux`, if `attempts/<current_attempt_id>/exit_code` exists while `STATUS.state = running` and `ATTEMPT.state = running`, classify it by supervision evidence:
+
+```text
+dispatch pid alive and exit_code age <= grace period:
+  report a warning; handoff validation may be in progress
+
+dispatch pid dead, missing, invalid, or exit_code age > grace period:
+  report a protocol violation
+```
+
+The violation means the tmux runner produced a completion artifact after dispatch supervision was lost or dispatch failed to update `ATTEMPT.json`; Codex must perform Lock Recovery Review.
 
 ## No Destructive Overwrite
 

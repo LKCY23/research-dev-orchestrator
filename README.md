@@ -54,14 +54,17 @@ agents/openai.yaml       # UI metadata
 
 ## Basic Validation
 
+Local equivalent of the GitHub Actions smoke workflow:
+
 ```bash
-python /path/to/skill-creator/scripts/quick_validate.py /path/to/research-dev-orchestrator
-python -m py_compile scripts/*.py
-bash -n scripts/dispatch_claude.sh
-scripts/run_smoke_tests.sh
+python3 .github/ci/quick_validate_skill.py .
+python3 -m py_compile scripts/*.py .github/ci/quick_validate_skill.py
+bash -n scripts/dispatch_claude.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
+RDO_KEEP_SMOKE_REPOS=0 scripts/run_smoke_tests.sh
+git diff --check
 ```
 
-Smoke tests keep temporary repositories by default for debugging. Use `RDO_KEEP_SMOKE_REPOS=0 scripts/run_smoke_tests.sh` to remove them automatically.
+For local debugging, omit `RDO_KEEP_SMOKE_REPOS=0` to keep temporary smoke-test repositories.
 
 When using the skill from another target repository, keep the current working directory at that target repository root and call this repository's scripts by absolute path, or set:
 
@@ -77,4 +80,4 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-
 
 ## Notes
 
-This repository intentionally keeps the long design document separate from `SKILL.md`. If packaging the final skill for installation, include `SKILL.md`, `references/`, `scripts/`, and `agents/openai.yaml`; `DESIGN_SPEC.md` and this README can remain development artifacts.
+This repository intentionally keeps the long design document separate from `SKILL.md`. If packaging the final skill for installation, include `SKILL.md`, `references/`, `scripts/`, `templates/`, and `agents/openai.yaml`; `DESIGN_SPEC.md`, `.github/`, `tests/`, and this README can remain development artifacts.

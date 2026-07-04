@@ -1036,6 +1036,7 @@ scripts/
   config_cli.py
   validation.py
   protocol_cli.py
+  dispatch_assets.py
   init_run.py
   create_task.py
   dispatch_claude.sh
@@ -1049,11 +1050,13 @@ scripts/
 
 `config.py` 是 operational defaults loader，读取 `.agent-collab/rdo.toml` 和环境变量。它不定义状态机、schema、event、blocker type 或 protocol version。
 
-`config_cli.py` 是配置检查和导出工具。第一阶段只用于 inspect/validate/export，不接管 dispatch 生命周期。
+`config_cli.py` 是配置检查和导出工具，也是 `dispatch_claude.sh` 的配置桥接层。dispatch 通过 `config_cli.py export-env --no-env --prefix CONFIG_` 读取 operational defaults，但 `config_cli.py` 不接管 dispatch lifecycle，也不做协议状态决策。
 
 `validation.py` 是共享协议校验规则层。在线 gate（例如 `protocol_cli.py validate-handoff`）和离线 audit（例如 `collect_status.py`）必须复用这里的规则，避免 handoff validation 漂移。
 
 `protocol_cli.py` 是 `dispatch_claude.sh` 的窄桥接层，只执行机械协议操作，例如 attempt 创建、running transition、event append、handoff validation 和 diagnostics 写入。它不得实现 approve、merge、auto-review、auto-recover 等 coordinator-only 决策。
+
+`dispatch_assets.py` 只渲染 attempt-local assets，例如 worker `prompt.md` 和 tmux `run-worker.sh`。它不修改 `STATUS.json`、`ATTEMPT.json`、`EVENTS.ndjson`、locks 或其他协议状态。
 
 `templates/` 是 scaffold 内容真源；`references/` 只保留协议说明、schema、rubric、workflow 和 memory 文档。
 
@@ -1294,6 +1297,7 @@ research-dev-orchestrator/
     config_cli.py
     validation.py
     protocol_cli.py
+    dispatch_assets.py
     init_run.py
     create_task.py
     dispatch_claude.sh
