@@ -38,10 +38,13 @@ def parse_exit_code(exit_code_raw: str) -> tuple[int | None, str | None]:
         return None, f"exit_code must be an integer, got {exit_code_raw!r}"
 
 
-def validate_status_schema(status: dict[str, Any], fsm: dict[str, Any], task_name: str) -> list[str]:
+def validate_status_schema(status: Any, fsm: dict[str, Any], task_name: str) -> list[str]:
     """Validate STATUS.json fields that do not require filesystem access."""
 
     violations: list[str] = []
+    if not isinstance(status, dict):
+        return [f"{task_name}: STATUS.json must be a JSON object"]
+
     missing = sorted(REQUIRED_STATUS_FIELDS - set(status))
     if missing:
         violations.append(f"{task_name}: missing STATUS fields: {', '.join(missing)}")
@@ -73,10 +76,13 @@ def validate_status_schema(status: dict[str, Any], fsm: dict[str, Any], task_nam
     return violations
 
 
-def validate_state_history(status: dict[str, Any], fsm: dict[str, Any], task_name: str) -> list[str]:
+def validate_state_history(status: Any, fsm: dict[str, Any], task_name: str) -> list[str]:
     """Validate FSM state_history legality and continuity."""
 
     violations: list[str] = []
+    if not isinstance(status, dict):
+        return []
+
     state = status.get("state")
     history = status.get("state_history")
     if not isinstance(history, list):
@@ -231,6 +237,9 @@ def validate_event(event: dict[str, Any], run_id: str, line_no: int) -> tuple[li
         violations.append(f"EVENTS.ndjson line {line_no}: run_id {event.get('run_id')!r} does not match {run_id!r}")
 
     event_name = event.get("event")
+    if not isinstance(event_name, str) or not event_name.strip():
+        violations.append(f"EVENTS.ndjson line {line_no}: event must be a non-empty string")
+        event_name = None
     if event_name and event_name not in CORE_EVENTS:
         warnings.append(f"EVENTS.ndjson line {line_no}: unknown event type {event_name!r}")
     if event_name in TASK_EVENTS and not event.get("task_id"):
@@ -244,7 +253,7 @@ def validate_event(event: dict[str, Any], run_id: str, line_no: int) -> tuple[li
 
 
 def validate_worker_handoff(
-    status: dict[str, Any],
+    status: Any,
     attempt_id: str,
     task_dir: Path,
     exit_code_raw: str,
@@ -260,6 +269,14 @@ def validate_worker_handoff(
     exit_code, exit_code_error = parse_exit_code(exit_code_raw)
     if exit_code_error:
         reasons.append(exit_code_error)
+
+    if not isinstance(status, dict):
+        return HandoffValidationResult(
+            valid=False,
+            handoff_state=None,
+            exit_code=exit_code,
+            reasons=[*reasons, "STATUS.json must be a JSON object"],
+        )
 
     state = status.get("state")
     if state not in {"review", "blocked"}:

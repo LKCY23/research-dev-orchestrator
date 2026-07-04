@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import sys
@@ -17,7 +18,7 @@ from protocol import (
     utc_now,
     write_json,
 )
-from validation import validate_worker_handoff
+from validation import HandoffValidationResult, validate_worker_handoff
 
 
 def add_common_event_args(parser: argparse.ArgumentParser) -> None:
@@ -132,10 +133,35 @@ def cmd_set_attempt_running(args: argparse.Namespace) -> int:
 def cmd_validate_handoff(args: argparse.Namespace) -> int:
     attempt_path = Path(args.attempt_path)
     task_dir = Path(args.task_dir)
-    status = load_json(Path(args.status_path))
+    status_error = None
+    try:
+        status = load_json(Path(args.status_path))
+    except json.JSONDecodeError as exc:
+        status = None
+        status_error = f"invalid STATUS.json: {exc}"
     result = validate_worker_handoff(status, args.attempt_id, task_dir, args.exit_code_raw)
+    if status_error:
+        result = HandoffValidationResult(
+            valid=False,
+            handoff_state=None,
+            exit_code=result.exit_code,
+            reasons=[status_error, *result.reasons],
+        )
 
-    attempt = load_json(attempt_path)
+    try:
+        attempt = load_json(attempt_path)
+    except json.JSONDecodeError as exc:
+        print("worker_exit_without_valid_status", file=sys.stderr)
+        print(f"- invalid ATTEMPT.json: {exc}", file=sys.stderr)
+        for reason in result.reasons:
+            print(f"- {reason}", file=sys.stderr)
+        return 4
+    if not isinstance(attempt, dict):
+        print("worker_exit_without_valid_status", file=sys.stderr)
+        print("- ATTEMPT.json must be a JSON object", file=sys.stderr)
+        for reason in result.reasons:
+            print(f"- {reason}", file=sys.stderr)
+        return 4
     attempt["ended_at"] = utc_now()
     attempt["exit_code"] = result.exit_code
 

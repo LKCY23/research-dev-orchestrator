@@ -84,6 +84,9 @@ def validate_attempt(
     except json.JSONDecodeError as exc:
         violations.append(f"{task_dir.name}: invalid ATTEMPT.json for {attempt_id}: {exc}")
         return violations, warnings, None
+    if not isinstance(attempt, dict):
+        violations.append(f"{task_dir.name}: ATTEMPT.json must be a JSON object")
+        return violations, warnings, None
 
     violations.extend(validate_attempt_schema(attempt, status, str(attempt_id), task_dir.name))
     runtime = attempt.get("runtime")
@@ -256,6 +259,26 @@ def collect(
         except json.JSONDecodeError as exc:
             invalid_status_files.append(str(status_path))
             violations.append(f"{task_dir.name}: invalid STATUS.json: {exc}")
+            continue
+        if not isinstance(status, dict):
+            invalid_status_files.append(str(status_path))
+            violations.append(f"{task_dir.name}: STATUS.json must be a JSON object")
+            tasks.append(
+                {
+                    "task_id": task_dir.name,
+                    "state": None,
+                    "owner": None,
+                    "branch": None,
+                    "worktree": None,
+                    "current_attempt_id": None,
+                    "needs_coordinator": None,
+                    "blocker_type": None,
+                    "blocking_reason": None,
+                    "summary": None,
+                    "lock": None,
+                    "dispatch_lock": None,
+                }
+            )
             continue
 
         status_violations, status_warnings = validate_status(
