@@ -113,6 +113,7 @@ ATTEMPT.state in [created, running]
 LOCK exists
 LOCK.attempt_id == current_attempt_id
 .dispatch-lock exists and matches current_attempt_id
+.dispatch-lock pid exists, is an integer, and is alive
 ```
 
 `STATUS.state = review` requires:
@@ -143,6 +144,8 @@ blocking_reason non-empty
 ```
 
 If `STATUS.state = running` and `ATTEMPT.state` is `completed` or `invalid_handoff`, report a protocol violation. Codex must inspect the attempt and decide whether to re-dispatch, request changes, mark blocked, or fail the task.
+
+For `runtime.backend = tmux`, if `attempts/<current_attempt_id>/exit_code` exists while `STATUS.state = running` and `ATTEMPT.state = running`, report a protocol violation. This means the tmux runner produced a completion artifact after dispatch supervision was lost or failed to update `ATTEMPT.json`; Codex must perform Lock Recovery Review.
 
 ## No Destructive Overwrite
 

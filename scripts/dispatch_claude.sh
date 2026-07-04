@@ -480,7 +480,14 @@ exit "${{PIPESTATUS[0]}}"
 Path(runner_path).write_text(content, encoding="utf-8")
 os.chmod(runner_path, 0o755)
 PY
-    tmux new-session -d -s "${TMUX_SESSION}" "${RUNNER_PATH}"
+    TMUX_COMMAND="$(python3 - "$RUNNER_PATH" <<'PY'
+import shlex
+import sys
+
+print("exec " + shlex.quote(sys.argv[1]))
+PY
+)"
+    tmux new-session -d -s "${TMUX_SESSION}" "${TMUX_COMMAND}"
     WAIT_START="$(date +%s)"
     while [[ ! -f "${EXIT_CODE_FILE}" ]]; do
       if [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" != "0" ]]; then

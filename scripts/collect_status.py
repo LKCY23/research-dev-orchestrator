@@ -292,6 +292,24 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
                 violations.append(f"{task_dir.name}: .dispatch-lock missing attempt_id")
             elif dispatch_attempt.read_text(encoding="utf-8", errors="replace").strip() != str(attempt_id):
                 violations.append(f"{task_dir.name}: .dispatch-lock attempt_id does not match STATUS current_attempt_id")
+            pid_path = dispatch_lock / "pid"
+            if not pid_path.exists():
+                violations.append(f"{task_dir.name}: .dispatch-lock missing pid while STATUS is running")
+            else:
+                pid_text = pid_path.read_text(encoding="utf-8", errors="replace").strip()
+                try:
+                    pid = int(pid_text)
+                except ValueError:
+                    violations.append(f"{task_dir.name}: .dispatch-lock pid is not an integer while STATUS is running: {pid_text!r}")
+                else:
+                    if not pid_is_alive(pid):
+                        violations.append(f"{task_dir.name}: .dispatch-lock pid is not alive while STATUS is running: {pid}")
+            if runtime.get("backend") == "tmux" and attempt_state == "running":
+                exit_code_path = attempt_path.parent / "exit_code"
+                if exit_code_path.exists():
+                    violations.append(
+                        f"{task_dir.name}: tmux exit_code file exists while STATUS and ATTEMPT still report running"
+                    )
     elif dispatch_lock.exists():
         violations.append(f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}")
     if state == "review":
@@ -456,16 +474,19 @@ def collect(run_id: str, stale_lock_hours: float, stale_created_minutes: float =
                 stale_dispatch_locks.append(str(dispatch_lock))
             pid_path = dispatch_lock / "pid"
             if not pid_path.exists():
-                warnings.append(f"{task_dir.name}: .dispatch-lock missing pid")
+                if status.get("state") != "running":
+                    warnings.append(f"{task_dir.name}: .dispatch-lock missing pid")
             else:
                 pid_text = pid_path.read_text(encoding="utf-8", errors="replace").strip()
                 try:
                     pid = int(pid_text)
                 except ValueError:
-                    warnings.append(f"{task_dir.name}: .dispatch-lock pid is not an integer: {pid_text!r}")
+                    if status.get("state") != "running":
+                        warnings.append(f"{task_dir.name}: .dispatch-lock pid is not an integer: {pid_text!r}")
                 else:
                     if not pid_is_alive(pid):
-                        warnings.append(f"{task_dir.name}: .dispatch-lock pid is not alive: {pid}")
+                        if status.get("state") != "running":
+                            warnings.append(f"{task_dir.name}: .dispatch-lock pid is not alive: {pid}")
 
         tasks.append(
             {
