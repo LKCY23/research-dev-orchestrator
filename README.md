@@ -54,63 +54,53 @@ The design is built around four rules:
 ## Architecture
 
 ```mermaid
-flowchart TB
-  subgraph Human["Human & Coordinator Layer"]
-    U["User"]
-    C["Coordinator Control Plane<br/>requirements, design, task split, review, merge decisions"]
-  end
-
-  subgraph Planning["Intent & Planning Layer"]
-    P["Research Intent<br/>requirements, design brief, ADRs, experiment plan"]
-    TC["Task Contract<br/>task, context, acceptance criteria"]
-  end
-
-  subgraph Execution["Execution Layer"]
-    ED["Execution Dispatcher<br/>lock, worktree, attempt, worker launch<br/>(dispatch_claude.sh)"]
-    RB["Runtime Backend<br/>plain or tmux"]
-    CW["CLI Worker<br/>implements one bounded task"]
-    GI["Git Isolation<br/>branch + worktree"]
-  end
-
-  subgraph Truth["Protocol Truth Layer"]
-    TS["Task State<br/>STATUS.json"]
-    AR["Attempt Record<br/>ATTEMPT.json"]
-    HE["Handoff Evidence<br/>EVIDENCE.md / HANDOFF.md"]
-    LM["Long-Term Memory<br/>EVENTS.ndjson / JOURNAL.md / RESULT_LEDGER.md"]
-  end
-
-  subgraph Validation["Validation & Recovery Layer"]
-    HG["Handoff Gate<br/>deterministic protocol validation<br/>(validation.py / protocol_cli.py)"]
-    MA["Monitor & Audit<br/>read-only status collection<br/>(collect_status.py)"]
-    DR["Derived Reports<br/>SUMMARY.md / diagnostics"]
-    RR["Recovery Review<br/>user-approved minimal mutation"]
-  end
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"}}}%%
+flowchart LR
+  U["User"]:::human
+  C["Coordinator Control Plane<br/>intent, design, task split, review"]:::coord
+  P["Planning Artifacts<br/>requirements, ADRs, experiment plan"]:::planning
+  T["Task Contract<br/>task, context, acceptance"]:::planning
+  D["Execution Dispatcher<br/>lock, worktree, attempt, launch"]:::exec
+  W["CLI Worker<br/>bounded implementation"]:::exec
+  G["Git Isolation<br/>branch + worktree"]:::exec
+  S["Task State<br/>STATUS.json"]:::truth
+  A["Attempt Record<br/>ATTEMPT.json"]:::truth
+  E["Evidence & Handoff<br/>EVIDENCE.md / HANDOFF.md"]:::truth
+  M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
+  V["Validation Gate<br/>deterministic protocol checks"]:::validate
+  O["Monitor & Audit<br/>read-only status collection"]:::validate
+  R["Recovery Review<br/>user-approved minimal mutation"]:::validate
 
   U --> C
   C --> P
-  C --> TC
-  TC --> ED
-  ED --> RB
-  RB --> CW
-  ED --> GI
+  P --> T
+  T --> D
+  D --> W
+  D --> G
+  W --> S
+  W --> E
+  D --> A
+  C --> M
+  D --> M
+  S --> V
+  A --> V
+  E --> V
+  V --> O
+  M --> O
+  O --> R
+  R --> M
 
-  CW --> TS
-  CW --> HE
-  ED --> AR
-  ED --> LM
-  C --> LM
-
-  TS --> HG
-  AR --> HG
-  HE --> HG
-  HG --> MA
-  LM --> MA
-  MA --> DR
-  MA --> RR
-  RR --> LM
+  classDef human fill:#eff6ff,stroke:#2563eb,color:#1e3a8a;
+  classDef coord fill:#eef2ff,stroke:#4f46e5,color:#312e81;
+  classDef planning fill:#f5f3ff,stroke:#7c3aed,color:#4c1d95;
+  classDef exec fill:#fffbeb,stroke:#d97706,color:#78350f;
+  classDef truth fill:#ecfdf5,stroke:#059669,color:#064e3b;
+  classDef validate fill:#fff1f2,stroke:#e11d48,color:#881337;
 ```
 
 The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs and produces derived monitoring artifacts without becoming a long-running service.
+
+Implementation scripts are intentionally secondary: `dispatch_claude.sh` supervises execution, `validation.py` and `protocol_cli.py` gate handoffs, and `collect_status.py` audits protocol health.
 
 ## Workflow
 
@@ -180,25 +170,32 @@ See [references/state-machine.md](references/state-machine.md), [references/stat
 A task is not the same thing as an attempt.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","clusterBkg":"#ffffff","clusterBorder":"#cbd5e1"}}}%%
 flowchart LR
   subgraph TaskFSM["Task FSM: project progress"]
-    P["pending"] --> R["running"]
-    R --> V["review"]
-    R --> B["blocked"]
-    V --> A["approved"]
-    V --> CR["changes_requested"]
-    A --> M["merged"]
+    P["pending"]:::task --> R["running"]:::task
+    R --> V["review"]:::task
+    R --> B["blocked"]:::warn
+    V --> A["approved"]:::ok
+    V --> CR["changes_requested"]:::warn
+    A --> M["merged"]:::ok
     CR --> R
     B --> R
-    B --> F["failed"]
+    B --> F["failed"]:::bad
     V --> F
   end
 
   subgraph AttemptLifecycle["Attempt lifecycle: worker execution"]
-    C["created"] --> AR["running"]
-    AR --> DONE["completed<br/>valid review/blocked handoff"]
-    AR --> BAD["invalid_handoff<br/>bad or missing protocol handoff"]
+    C["created"]:::attempt --> AR["running"]:::attempt
+    AR --> DONE["completed<br/>valid handoff"]:::ok
+    AR --> BAD["invalid_handoff<br/>bad or missing handoff"]:::bad
   end
+
+  classDef task fill:#eef2ff,stroke:#4f46e5,color:#312e81;
+  classDef attempt fill:#f8fafc,stroke:#475569,color:#0f172a;
+  classDef ok fill:#ecfdf5,stroke:#059669,color:#064e3b;
+  classDef warn fill:#fffbeb,stroke:#d97706,color:#78350f;
+  classDef bad fill:#fff1f2,stroke:#e11d48,color:#881337;
 ```
 
 Task state tracks project progress. Attempt state tracks one worker execution. This keeps the task FSM simple while preserving worker execution history. If a worker crashes, writes malformed protocol files, or exits without a valid handoff, the attempt can become `invalid_handoff` without inventing more task states.
