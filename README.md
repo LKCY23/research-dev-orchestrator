@@ -54,7 +54,7 @@ The design is built around four rules:
 ## Architecture
 
 ```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"}}}%%
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"},"flowchart":{"curve":"basis"}}}%%
 flowchart TB
   subgraph L1["Human & Coordinator Layer"]
     direction TB
@@ -71,7 +71,7 @@ flowchart TB
   end
 
   subgraph L3["Execution Layer"]
-    direction TB
+    direction LR
     D["Execution Dispatcher<br/>lock, attempt, worker launch"]:::exec
     G["Git Isolation<br/>branch + worktree"]:::exec
     B["Runtime Backend<br/>plain or tmux"]:::exec
@@ -83,14 +83,12 @@ flowchart TB
 
   subgraph L4["Protocol Truth Layer"]
     direction LR
-    S["Task State<br/>STATUS.json"]:::truth
-    A["Attempt Record<br/>ATTEMPT.json"]:::truth
-    H["Evidence & Handoff<br/>EVIDENCE.md / HANDOFF.md"]:::truth
+    Q["Handoff Truth Bundle<br/>STATUS / ATTEMPT / EVIDENCE / HANDOFF"]:::truth
     M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
   end
 
   subgraph L5["Validation & Recovery Layer"]
-    direction TB
+    direction LR
     V["Validation Gate<br/>deterministic protocol checks"]:::validate
     O["Monitor & Audit<br/>read-only status collection"]:::validate
     R["Recovery Review<br/>user-approved minimal mutation"]:::validate
@@ -99,16 +97,12 @@ flowchart TB
   end
 
   C --> P
-  C --> T
   T --> D
-  D --> A
-  D --> M
-  W --> S
-  W --> H
-  C --> M
-  S --> V
-  A --> V
-  H --> V
+  D -. "attempt metadata" .-> Q
+  W --> Q
+  C -. "session notes" .-> M
+  D -. "events" .-> M
+  Q --> V
   M --> O
   O -. "status, blockers, review evidence" .-> C
   R --> M
