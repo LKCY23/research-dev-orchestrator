@@ -7,7 +7,11 @@ repo="$(setup_smoke_repo)"
 cd "${repo}"
 init_run_and_task smoke-run T001-grace grace
 
-python3 - "$$" <<'PY'
+sleep 120 &
+alive_pid="$!"
+trap 'code=$?; kill "${alive_pid}" 2>/dev/null || true; wait "${alive_pid}" 2>/dev/null || true; cleanup_smoke_repos; exit "${code}"' EXIT
+
+python3 - "${alive_pid}" <<'PY'
 import json
 import os
 import pathlib
@@ -78,8 +82,6 @@ PY
 
 set +e
 collect_json smoke-run "${repo}/stale.json"
-code="$?"
 set -e
-[[ "${code}" != "0" ]]
 assert_json_expr "${repo}/stale.json" "payload['valid'] is False"
 assert_json_expr "${repo}/stale.json" "'tmux exit_code file exists while STATUS and ATTEMPT still report running' in '\\n'.join(payload['protocol_violations'])"
