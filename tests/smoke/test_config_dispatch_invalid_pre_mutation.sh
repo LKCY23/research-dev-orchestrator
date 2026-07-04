@@ -29,3 +29,39 @@ assert not (task / ".dispatch-lock").exists()
 assert not (task / "LOCK").exists()
 assert not any((task / "attempts").iterdir())
 PY
+
+cat > .agent-collab/rdo.toml <<'TOML'
+[runtime]
+backend = "plain"
+TOML
+
+python3 "${RDO_ROOT}/scripts/init_run.py" \
+  --run-id smoke-run-bool \
+  --project-slug smoke \
+  --objective smoke \
+  --target-branch main >/dev/null
+python3 "${RDO_ROOT}/scripts/create_task.py" \
+  --run-id smoke-run-bool \
+  --task-id T001-invalid-bool \
+  --goal invalid-bool \
+  --allowed-paths file.txt >/dev/null
+
+set +e
+RDO_TMUX_KEEP_SESSION=maybe \
+"${RDO_ROOT}/scripts/dispatch_claude.sh" smoke-run-bool T001-invalid-bool > "${repo}/dispatch-bool.out" 2> "${repo}/dispatch-bool.err"
+bool_code="$?"
+set -e
+
+[[ "${bool_code}" != "0" ]]
+
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+task = Path(".agent-collab/runs/smoke-run-bool/tasks/T001-invalid-bool")
+status = json.load(open(task / "STATUS.json", encoding="utf-8"))
+assert status["state"] == "pending", status
+assert not (task / ".dispatch-lock").exists()
+assert not (task / "LOCK").exists()
+assert not any((task / "attempts").iterdir())
+PY

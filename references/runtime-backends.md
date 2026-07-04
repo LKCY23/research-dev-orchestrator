@@ -55,8 +55,10 @@ RDO_TMUX_SESSION_PREFIX
   Prefix for generated tmux session names.
 
 RDO_TMUX_KEEP_SESSION
-  0: dispatch may kill/cleanup the tmux session after worker completion.
-  1: runner keeps the tmux session open after worker completion for human review.
+  false values: 0, false, no, off.
+  true values: 1, true, yes, on.
+  When false, dispatch may kill/cleanup the tmux session after worker completion.
+  When true, runner keeps the tmux session open after worker completion for human review.
 
 RDO_TMUX_WAIT_TIMEOUT_SECONDS
   0: no timeout.

@@ -30,6 +30,20 @@ sanitize_name() {
   LC_ALL=C tr -c 'A-Za-z0-9_.-' '-' | sed 's/^-*//; s/-*$//'
 }
 
+normalize_bool() {
+  case "$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on)
+      printf "1"
+      ;;
+    0|false|no|off)
+      printf "0"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 write_tmux_timeout_diagnostics() {
   python3 "${PROTOCOL_CLI}" write-tmux-timeout-diagnostics \
     --run-dir "${RUN_DIR}" \
@@ -131,6 +145,11 @@ eval "${CONFIG_ENV}"
 : "${RDO_TMUX_SESSION_PREFIX:=${CONFIG_RDO_TMUX_SESSION_PREFIX}}"
 : "${RDO_TMUX_KEEP_SESSION:=${CONFIG_RDO_TMUX_KEEP_SESSION}}"
 : "${RDO_TMUX_WAIT_TIMEOUT_SECONDS:=${CONFIG_RDO_TMUX_WAIT_TIMEOUT_SECONDS}}"
+
+if ! RDO_TMUX_KEEP_SESSION="$(normalize_bool "${RDO_TMUX_KEEP_SESSION}")"; then
+  echo "RDO_TMUX_KEEP_SESSION must be boolean: 1/0/true/false/yes/no/on/off" >&2
+  exit 2
+fi
 
 case "${RDO_WORKER_BACKEND}" in
   plain|tmux) ;;

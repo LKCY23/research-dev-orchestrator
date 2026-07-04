@@ -79,6 +79,8 @@ RDO_TASK_BRANCH_PREFIX
 RDO_WORKTREE_ROOT
 ```
 
+Boolean env values use the same parser as TOML booleans where applicable: `1/0`, `true/false`, `yes/no`, and `on/off`.
+
 `worker.command` and `CLAUDE_CODE_CMD` are interpreted by the dispatch shell. Do not put secrets in them; prefer environment variables for credentials.
 
 If the command path contains spaces, quote it inside TOML as a shell command string, for example:
