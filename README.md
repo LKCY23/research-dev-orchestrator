@@ -56,41 +56,60 @@ The design is built around four rules:
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"}}}%%
 flowchart TB
-  U["User"]:::human
-  C["Coordinator Control Plane<br/>intent, design, task split, review decisions"]:::coord
-  P["Planning Artifacts<br/>requirements, ADRs, experiment plan"]:::planning
-  T["Task Contract<br/>task, context, acceptance"]:::planning
-  D["Execution Dispatcher<br/>lock, attempt, worker launch"]:::exec
-  G["Git Isolation<br/>branch + worktree"]:::exec
-  B["Runtime Backend<br/>plain or tmux"]:::exec
-  W["CLI Worker<br/>bounded implementation"]:::exec
-  S["Task State<br/>STATUS.json"]:::truth
-  A["Attempt Record<br/>ATTEMPT.json"]:::truth
-  H["Evidence & Handoff<br/>EVIDENCE.md / HANDOFF.md"]:::truth
-  M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
-  V["Validation Gate<br/>deterministic protocol checks"]:::validate
-  O["Monitor & Audit<br/>read-only status collection"]:::validate
-  R["Recovery Review<br/>user-approved minimal mutation"]:::validate
+  subgraph L1["Human & Coordinator Layer"]
+    direction TB
+    U["User"]:::human
+    C["Coordinator Control Plane<br/>intent, design, task split, review decisions"]:::coord
+    U --> C
+  end
 
-  U --> C
+  subgraph L2["Intent & Planning Layer"]
+    direction LR
+    P["Planning Artifacts<br/>requirements, ADRs, experiment plan"]:::planning
+    T["Task Contract<br/>task, context, acceptance"]:::planning
+    P --> T
+  end
+
+  subgraph L3["Execution Layer"]
+    direction TB
+    D["Execution Dispatcher<br/>lock, attempt, worker launch"]:::exec
+    G["Git Isolation<br/>branch + worktree"]:::exec
+    B["Runtime Backend<br/>plain or tmux"]:::exec
+    W["CLI Worker<br/>bounded implementation"]:::exec
+    D --> G
+    D --> B
+    B --> W
+  end
+
+  subgraph L4["Protocol Truth Layer"]
+    direction LR
+    S["Task State<br/>STATUS.json"]:::truth
+    A["Attempt Record<br/>ATTEMPT.json"]:::truth
+    H["Evidence & Handoff<br/>EVIDENCE.md / HANDOFF.md"]:::truth
+    M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
+  end
+
+  subgraph L5["Validation & Recovery Layer"]
+    direction TB
+    V["Validation Gate<br/>deterministic protocol checks"]:::validate
+    O["Monitor & Audit<br/>read-only status collection"]:::validate
+    R["Recovery Review<br/>user-approved minimal mutation"]:::validate
+    V --> O
+    O --> R
+  end
+
   C --> P
   C --> T
-  P --> T
   T --> D
-  D --> G
-  D --> B
-  B --> W
   D --> A
+  D --> M
   W --> S
   W --> H
   C --> M
-  D --> M
   S --> V
   A --> V
   H --> V
-  V --> O
   M --> O
-  O --> R
   O -. "status, blockers, review evidence" .-> C
   R --> M
 
@@ -100,6 +119,12 @@ flowchart TB
   classDef exec fill:#fffbeb,stroke:#d97706,color:#78350f;
   classDef truth fill:#ecfdf5,stroke:#059669,color:#064e3b;
   classDef validate fill:#fff1f2,stroke:#e11d48,color:#881337;
+
+  style L1 fill:#f8fbff,stroke:#bfdbfe,stroke-width:1px,color:#1e3a8a;
+  style L2 fill:#fbfaff,stroke:#ddd6fe,stroke-width:1px,color:#4c1d95;
+  style L3 fill:#fffdf5,stroke:#fde68a,stroke-width:1px,color:#78350f;
+  style L4 fill:#f7fefb,stroke:#bbf7d0,stroke-width:1px,color:#064e3b;
+  style L5 fill:#fff8f9,stroke:#fecdd3,stroke-width:1px,color:#881337;
 ```
 
 The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs and produces derived monitoring artifacts without becoming a long-running service.
