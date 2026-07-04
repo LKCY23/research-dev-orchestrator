@@ -752,6 +752,7 @@ Proposed mutation
 ```text
 Will:
   snapshot tasks/<task>/.dispatch-lock -> diagnostics/
+  write recovery-operation.json in the snapshot
   remove tasks/<task>/.dispatch-lock
   append dispatch_lock_removed to EVENTS.ndjson
 
@@ -768,9 +769,12 @@ Will not:
 
 ```text
 1. snapshot .dispatch-lock
-2. rm -rf .dispatch-lock
-3. append dispatch_lock_removed event
+2. write recovery-operation.json in the snapshot
+3. rm -rf .dispatch-lock
+4. append dispatch_lock_removed event
 ```
+
+如果删除后 append event 失败，脚本必须在 snapshot 中写 `recovery-event-append-failed.json` 并返回非零。snapshot 必须足以作为 emergency audit fallback。
 
 脚本不判断 active/stale，只执行用户批准后的机械清理。
 
@@ -1141,8 +1145,10 @@ Never repair protocol violations automatically.
 2. 默认 dry-run；没有 --confirmed 不修改文件。
 3. 读取 STATUS.current_attempt_id 作为 attempt_id。
 4. snapshot tasks/<task>/.dispatch-lock 到 diagnostics/dispatch-lock-removed-<task>-<timestamp>/。
-5. 删除 tasks/<task>/.dispatch-lock。
-6. 删除成功后追加 dispatch_lock_removed event。
+5. 在 snapshot 中写 recovery-operation.json。
+6. 删除 tasks/<task>/.dispatch-lock。
+7. 删除成功后追加 dispatch_lock_removed event。
+8. 如果 event append 失败，写 recovery-event-append-failed.json 并返回非零。
 ```
 
 限制：

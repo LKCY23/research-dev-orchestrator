@@ -87,6 +87,7 @@ Proposed mutation
 ```text
 Will:
   snapshot tasks/<task>/.dispatch-lock -> diagnostics/
+  write recovery-operation.json in the snapshot
   remove tasks/<task>/.dispatch-lock
   append dispatch_lock_removed to EVENTS.ndjson
 
@@ -118,8 +119,11 @@ The script must:
 ```text
 read STATUS.current_attempt_id
 snapshot .dispatch-lock to diagnostics/dispatch-lock-removed-<task>-<timestamp>/
+write recovery-operation.json in the snapshot before removal
 remove .dispatch-lock
 append dispatch_lock_removed event after removal succeeds
 ```
+
+If appending `dispatch_lock_removed` fails after removal, write `recovery-event-append-failed.json` in the snapshot and exit nonzero. The snapshot must contain enough information to audit the mutation even when the timeline append failed.
 
 The script must not decide whether a lock is stale.

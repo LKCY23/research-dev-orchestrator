@@ -304,9 +304,6 @@ def validate_status(task_dir: Path, status: dict[str, Any], fsm: dict[str, Any],
     missing = sorted(REQUIRED_STATUS_FIELDS - set(status))
     if missing:
         violations.append(f"{task_dir.name}: missing STATUS fields: {', '.join(missing)}")
-    if "needs_codex" in status:
-        warnings.append(f"{task_dir.name}: legacy STATUS.needs_codex is deprecated; use needs_coordinator")
-
     state = status.get("state")
     states = set(fsm.get("states", []))
     if state not in states:

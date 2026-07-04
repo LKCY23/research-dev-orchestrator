@@ -41,6 +41,10 @@ def append_event(run_dir: Path, event: dict[str, Any]) -> None:
         handle.write(json.dumps(event, sort_keys=True) + "\n")
 
 
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def unique_snapshot_dir(diagnostics_dir: Path, task_id: str, stamp: str) -> Path:
     base = diagnostics_dir / f"dispatch-lock-removed-{task_id}-{stamp}"
     if not base.exists():
@@ -100,6 +104,26 @@ def main() -> int:
 
     diagnostics_dir.mkdir(exist_ok=True)
     shutil.copytree(dispatch_lock, snapshot_dir)
+    operation = {
+        "at": utc_now(),
+        "actor": "coordinator",
+        "operation": "remove_dispatch_lock",
+        "run_id": args.run_id,
+        "task_id": args.task_id,
+        "attempt_id": attempt_id,
+        "reason": args.reason,
+        "target": str(dispatch_lock),
+        "snapshot": str(rel_snapshot),
+        "will_not_modify": [
+            "STATUS.json",
+            "ATTEMPT.json",
+            "LOCK",
+            "HANDOFF.md",
+            "EVIDENCE.md",
+            "FSM state",
+        ],
+    }
+    write_json(snapshot_dir / "recovery-operation.json", operation)
     shutil.rmtree(dispatch_lock)
 
     event: dict[str, Any] = {
@@ -113,7 +137,23 @@ def main() -> int:
     }
     if attempt_id:
         event["attempt_id"] = attempt_id
-    append_event(run_dir, event)
+    try:
+        append_event(run_dir, event)
+    except Exception as exc:
+        failure = {
+            "at": utc_now(),
+            "operation": "append_dispatch_lock_removed_event",
+            "run_id": args.run_id,
+            "task_id": args.task_id,
+            "attempt_id": attempt_id,
+            "event": event,
+            "error": repr(exc),
+            "status": "failed_after_dispatch_lock_removed",
+        }
+        write_json(snapshot_dir / "recovery-event-append-failed.json", failure)
+        print("Removed .dispatch-lock, but failed to append dispatch_lock_removed event.", flush=True)
+        print(f"Emergency audit record: {snapshot_dir / 'recovery-event-append-failed.json'}", flush=True)
+        return 2
 
     print("Removed .dispatch-lock and appended dispatch_lock_removed event.")
     return 0
