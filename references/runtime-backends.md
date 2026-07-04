@@ -94,6 +94,8 @@ For `tmux`:
 
 `runtime.backend`, `runtime.cli`, `runtime.command`, and `runtime.cwd` are required. `runtime.tmux_session` and `runtime.attach_command` are required only when `backend = tmux`.
 
+Generated tmux session names must be sanitized to avoid tmux target separators such as `:`.
+
 ## Tmux Completion Truth
 
 Do not rely only on `tmux wait-for`. It can miss fast signals if dispatch starts waiting after the runner signals completion.
@@ -118,6 +120,8 @@ wait until exit_code file exists
 read exit_code file
 validate handoff
 ```
+
+During normal completion there is a short window where `exit_code` exists while dispatch is still validating handoff. `collect_status.py` should treat this as a warning only when the dispatch pid is alive and the `exit_code` file is younger than the grace period. It is a protocol violation when the dispatch pid is not alive or the file is older than the grace period while `STATUS` and `ATTEMPT` still report `running`.
 
 If `exit_code` exists but is empty or non-integer:
 
@@ -165,4 +169,3 @@ Timeout diagnostics should record:
 ## Tmux Missing
 
 If `RDO_WORKER_BACKEND=tmux` and `tmux` is unavailable, dispatch must fail before creating an attempt, writing `LOCK`, acquiring `.dispatch-lock`, or moving `STATUS.json` to `running`.
-

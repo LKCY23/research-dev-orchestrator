@@ -34,6 +34,7 @@ BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "ir
 ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
 HANDOFF_STATES = {"review", "blocked", None}
 RUNTIME_BACKENDS = {"plain", "tmux"}
+TMUX_EXIT_CODE_GRACE_SECONDS = 60
 CORE_EVENTS = {
     "run_created",
     "requirements_updated",
@@ -280,6 +281,7 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
     lock = task_dir / "LOCK"
     dispatch_lock = task_dir / ".dispatch-lock"
     if state == "running":
+        dispatch_pid_alive: bool | None = None
         if attempt_state not in {"created", "running"}:
             violations.append(f"{task_dir.name}: STATUS running requires ATTEMPT.state created or running, got {attempt_state!r}")
         if not lock.exists():
@@ -302,14 +304,22 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
                 except ValueError:
                     violations.append(f"{task_dir.name}: .dispatch-lock pid is not an integer while STATUS is running: {pid_text!r}")
                 else:
-                    if not pid_is_alive(pid):
+                    dispatch_pid_alive = pid_is_alive(pid)
+                    if not dispatch_pid_alive:
                         violations.append(f"{task_dir.name}: .dispatch-lock pid is not alive while STATUS is running: {pid}")
             if runtime.get("backend") == "tmux" and attempt_state == "running":
                 exit_code_path = attempt_path.parent / "exit_code"
                 if exit_code_path.exists():
-                    violations.append(
-                        f"{task_dir.name}: tmux exit_code file exists while STATUS and ATTEMPT still report running"
-                    )
+                    exit_code_age = (datetime.now(timezone.utc).timestamp() - exit_code_path.stat().st_mtime)
+                    if dispatch_pid_alive is True and exit_code_age <= TMUX_EXIT_CODE_GRACE_SECONDS:
+                        warnings.append(
+                            f"{task_dir.name}: tmux exit_code file exists while dispatch appears alive; "
+                            f"handoff validation may be in progress ({exit_code_age:.1f}s old)"
+                        )
+                    else:
+                        violations.append(
+                            f"{task_dir.name}: tmux exit_code file exists while STATUS and ATTEMPT still report running"
+                        )
     elif dispatch_lock.exists():
         violations.append(f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}")
     if state == "review":

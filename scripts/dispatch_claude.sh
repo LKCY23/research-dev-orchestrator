@@ -32,7 +32,7 @@ DISPATCH_LOCK_ACQUIRED=0
 KEEP_DISPATCH_LOCK_ON_EXIT=0
 
 sanitize_name() {
-  LC_ALL=C tr -c 'A-Za-z0-9_.:-' '-' | sed 's/^-*//; s/-*$//'
+  LC_ALL=C tr -c 'A-Za-z0-9_.-' '-' | sed 's/^-*//; s/-*$//'
 }
 
 write_tmux_timeout_diagnostics() {
