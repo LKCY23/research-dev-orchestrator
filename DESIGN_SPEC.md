@@ -531,6 +531,7 @@ tasks/T001-name/
   "ended_at": "2026-07-03T12:20:00Z",
   "exit_code": 0,
   "runtime": {
+    "backend": "plain",
     "model": null,
     "cli": "claude",
     "command": "claude ...",
@@ -552,12 +553,15 @@ session_id: string; may be empty only if runtime cannot provide one
 state: created|running|completed|invalid_handoff
 started_at: non-empty valid ISO timestamp
 ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff
-exit_code: null for created/running; integer for completed/invalid_handoff
+exit_code: null for created/running; integer for completed; integer or null for invalid_handoff
 runtime: object
+runtime.backend: plain|tmux
 runtime.cli: non-empty string
 runtime.command: non-empty string
 runtime.cwd: non-empty string
 runtime.model: optional/null
+runtime.tmux_session: required when runtime.backend = tmux
+runtime.attach_command: required when runtime.backend = tmux
 ```
 
 Attempt state 是 worker execution lifecycle，不是 task progress：
@@ -574,6 +578,46 @@ completed
 
 invalid_handoff
   Worker exited but did not produce legal STATUS/EVIDENCE/HANDOFF.
+```
+
+Runtime backend:
+
+```text
+plain
+  Default. dispatch_claude.sh runs the worker CLI directly.
+
+tmux
+  Optional attachable execution for long-running workers.
+  It is synchronous from dispatch's protocol perspective.
+  It is not detached orchestration, a watcher, daemon, RPC, or truth source.
+```
+
+tmux completion and timeout rules:
+
+```text
+Completion truth:
+  attempts/<attempt-id>/exit_code
+
+Do not rely only on tmux wait-for:
+  wait-for can miss fast signals; dispatch must wait for the exit_code file.
+
+Timeout before exit_code exists:
+  dispatch exits 5
+  do not validate handoff
+  do not release .dispatch-lock
+  leave ATTEMPT.state = running
+  leave ATTEMPT.ended_at = null
+  leave ATTEMPT.exit_code = null
+  write diagnostics with dispatch_exit_code=5, worker_exit_code=null, dispatch_lock_retained=true
+  require Lock Recovery Review
+
+Invalid exit_code file:
+  file exists but is empty or non-integer
+  mark ATTEMPT.state = invalid_handoff
+  set ATTEMPT.ended_at = now
+  set ATTEMPT.exit_code = null
+  append worker_exit_without_valid_status
+  release .dispatch-lock after diagnostics
 ```
 
 Task state invariants:
@@ -1052,7 +1096,7 @@ Only creates pending task.
 4. 创建 branch/worktree。
 5. 创建 attempt 目录。
 6. 拼接 prompt.md，并显式写入 TASK_DIR、STATUS_PATH、EVIDENCE_PATH、HANDOFF_PATH、ATTEMPT_DIR 等绝对协议路径。
-7. 调用配置化 Claude Code CLI。
+7. 调用配置化 Claude Code CLI；默认 plain backend，可选 tmux backend 用于 attachable execution。
 8. 保存 transcript.log / result.md。
 9. 检查 worker 是否写出合法交付状态；review 必须 exit_code = 0，blocked 可为非零。
 10. 维护 ATTEMPT.json state / ended_at / exit_code / handoff_valid / handoff_state。
@@ -1067,6 +1111,8 @@ Do not auto-mark review.
 Do not synthesize review/blocked on behalf of the worker.
 Do not merge.
 Do not approve.
+Do not treat tmux as a protocol source of truth.
+Do not release .dispatch-lock on tmux timeout before exit_code appears.
 ```
 
 dispatch 后必须检查：
@@ -1086,6 +1132,16 @@ attempt transcript/result exists
 ```text
 worker_exit_without_valid_status
 ```
+
+tmux backend:
+
+```text
+RDO_WORKER_BACKEND=tmux
+RDO_TMUX_KEEP_SESSION=0|1
+RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
+```
+
+`tmux` backend creates an attempt-local runner script. The runner writes `attempts/<attempt-id>/exit_code` from an EXIT trap. Dispatch waits for that file, not just `tmux wait-for`. `RDO_TMUX_KEEP_SESSION=1` may keep the tmux session open for human review after the exit_code file is written; it must not affect ATTEMPT/EVENTS semantics.
 
 但不自动标成功。
 

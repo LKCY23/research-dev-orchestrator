@@ -40,6 +40,7 @@ If `.dispatch-lock` exists while `STATUS.state` is not `running`, report a proto
   "ended_at": "2026-07-03T12:20:00Z",
   "exit_code": 0,
   "runtime": {
+    "backend": "plain",
     "model": null,
     "cli": "claude",
     "command": "claude ...",
@@ -59,12 +60,15 @@ session_id: string; may be empty only if runtime cannot provide one
 state: created|running|completed|invalid_handoff
 started_at: non-empty valid ISO timestamp
 ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff
-exit_code: null for created/running; integer for completed/invalid_handoff
+exit_code: null for created/running; integer for completed; integer or null for invalid_handoff
 runtime: object
+runtime.backend: plain|tmux
 runtime.cli: non-empty string
 runtime.command: non-empty string
 runtime.cwd: non-empty string
 runtime.model: optional/null
+runtime.tmux_session: required when runtime.backend = tmux
+runtime.attach_command: required when runtime.backend = tmux
 ```
 
 ## Attempt States
@@ -73,6 +77,10 @@ runtime.model: optional/null
 - `running`: the worker process is executing.
 - `completed`: the worker exited and made a valid protocol handoff to `review` or `blocked`.
 - `invalid_handoff`: the worker exited but did not produce a legal status/evidence/handoff.
+
+If a tmux runner writes an empty or non-integer `exit_code` file, classify the attempt as `invalid_handoff`, set `ended_at`, leave `exit_code = null`, append `worker_exit_without_valid_status`, and release `.dispatch-lock` after diagnostics.
+
+If tmux dispatch times out before the `exit_code` file exists, do not mark the attempt ended. Leave `ATTEMPT.state = running`, `ended_at = null`, and `exit_code = null`; keep `.dispatch-lock` and require Lock Recovery Review.
 
 Do not use attempt state to represent task success. `completed` means the attempt completed protocol handoff, not that the task is approved or merged.
 

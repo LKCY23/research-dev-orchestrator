@@ -12,6 +12,10 @@ CLAUDE_CODE_CMD="${CLAUDE_CODE_CMD:-claude}"
 CLAUDE_AGENT_NAME="${CLAUDE_AGENT_NAME:-claude-worker}"
 CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}"
 DISPATCH_DRY_RUN="${DISPATCH_DRY_RUN:-0}"
+RDO_WORKER_BACKEND="${RDO_WORKER_BACKEND:-plain}"
+RDO_TMUX_SESSION_PREFIX="${RDO_TMUX_SESSION_PREFIX:-rdo}"
+RDO_TMUX_KEEP_SESSION="${RDO_TMUX_KEEP_SESSION:-0}"
+RDO_TMUX_WAIT_TIMEOUT_SECONDS="${RDO_TMUX_WAIT_TIMEOUT_SECONDS:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -25,6 +29,72 @@ DISPATCH_LOCK_DIR="${TASK_DIR}/.dispatch-lock"
 DIAGNOSTICS_DIR="${RUN_DIR}/diagnostics"
 STATUS_UPDATED=0
 DISPATCH_LOCK_ACQUIRED=0
+KEEP_DISPATCH_LOCK_ON_EXIT=0
+
+sanitize_name() {
+  LC_ALL=C tr -c 'A-Za-z0-9_.:-' '-' | sed 's/^-*//; s/-*$//'
+}
+
+write_tmux_timeout_diagnostics() {
+  mkdir -p "${DIAGNOSTICS_DIR}"
+  local stamp
+  stamp="$(date -u +"%Y%m%dT%H%M%SZ")"
+  local json_path="${DIAGNOSTICS_DIR}/tmux-wait-timeout-${TASK_ID}-${stamp}.json"
+  local md_path="${DIAGNOSTICS_DIR}/tmux-wait-timeout-${TASK_ID}-${stamp}.md"
+  python3 - "$json_path" "$RUN_ID" "$TASK_ID" "${ATTEMPT_ID:-}" "${TMUX_SESSION:-}" "${TMUX_ATTACH_COMMAND:-}" "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" "${DISPATCH_LOCK_DIR}" "${ATTEMPT_DIR:-}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+(
+    path,
+    run_id,
+    task_id,
+    attempt_id,
+    tmux_session,
+    attach_command,
+    timeout_seconds,
+    dispatch_lock_dir,
+    attempt_dir,
+) = sys.argv[1:10]
+payload = {
+    "at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "reason": "tmux_wait_timeout",
+    "run_id": run_id,
+    "task_id": task_id,
+    "attempt_id": attempt_id,
+    "tmux_session": tmux_session,
+    "attach_command": attach_command,
+    "timeout_seconds": int(timeout_seconds),
+    "dispatch_exit_code": 5,
+    "worker_exit_code": None,
+    "dispatch_lock_retained": True,
+    "dispatch_lock_dir": dispatch_lock_dir,
+    "attempt_dir": attempt_dir,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+  {
+    echo "# Tmux Wait Timeout"
+    echo
+    echo "- run_id: ${RUN_ID}"
+    echo "- task_id: ${TASK_ID}"
+    echo "- attempt_id: ${ATTEMPT_ID:-}"
+    echo "- reason: tmux_wait_timeout"
+    echo "- dispatch_exit_code: 5"
+    echo "- worker_exit_code: null"
+    echo "- dispatch_lock_retained: true"
+    echo "- tmux_session: ${TMUX_SESSION:-}"
+    echo "- attach_command: ${TMUX_ATTACH_COMMAND:-}"
+    echo "- timeout_seconds: ${RDO_TMUX_WAIT_TIMEOUT_SECONDS}"
+    echo "- time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo
+    echo "Dispatch lost supervision before the attempt-local exit_code file appeared."
+    echo "Do not assume the worker stopped. Use Lock Recovery Review before removing .dispatch-lock."
+  } > "${md_path}"
+}
 
 append_event() {
   local event_name="$1"
@@ -102,7 +172,9 @@ on_exit() {
   if [[ "${STATUS_UPDATED}" == "0" ]] && lock_file_matches_current_attempt; then
     rm -f "${LOCK_PATH}"
   fi
-  release_dispatch_lock
+  if [[ "${KEEP_DISPATCH_LOCK_ON_EXIT}" != "1" ]]; then
+    release_dispatch_lock
+  fi
   return 0
 }
 
@@ -118,6 +190,24 @@ if [[ ! -f "${STATUS_PATH}" ]]; then
   exit 2
 fi
 
+case "${RDO_WORKER_BACKEND}" in
+  plain|tmux) ;;
+  *)
+    echo "invalid RDO_WORKER_BACKEND: ${RDO_WORKER_BACKEND} (expected plain or tmux)" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "${RDO_WORKER_BACKEND}" == "tmux" ]] && ! command -v tmux >/dev/null 2>&1; then
+  echo "RDO_WORKER_BACKEND=tmux requires tmux, but tmux was not found" >&2
+  exit 2
+fi
+
+if ! [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]]; then
+  echo "RDO_TMUX_WAIT_TIMEOUT_SECONDS must be a non-negative integer" >&2
+  exit 2
+fi
+
 ATTEMPT_SEQ="$(find "${TASK_DIR}/attempts" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
 ATTEMPT_NUM="$(printf "%03d" "$((ATTEMPT_SEQ + 1))")"
 ATTEMPT_ID="A${ATTEMPT_NUM}-claude-$(python3 - <<'PY'
@@ -126,6 +216,11 @@ print(secrets.token_hex(3))
 PY
 )"
 ATTEMPT_DIR="${TASK_DIR}/attempts/${ATTEMPT_ID}"
+RUN_SHORT="$(printf "%s" "${RUN_ID}" | sanitize_name | cut -c1-18)"
+TASK_SHORT="$(printf "%s" "${TASK_ID}" | sanitize_name | cut -c1-32)"
+ATTEMPT_SHORT="$(printf "%s" "${ATTEMPT_ID}" | sanitize_name | cut -c1-18)"
+TMUX_SESSION="$(printf "%s-%s-%s-%s" "${RDO_TMUX_SESSION_PREFIX}" "${RUN_SHORT:-run}" "${TASK_SHORT:-task}" "${ATTEMPT_SHORT:-attempt}" | sanitize_name | cut -c1-100)"
+TMUX_ATTACH_COMMAND="tmux attach -t ${TMUX_SESSION}"
 
 if ! mkdir "${DISPATCH_LOCK_DIR}" 2>/dev/null; then
   echo "task already has active dispatch lock: ${DISPATCH_LOCK_DIR}" >&2
@@ -138,9 +233,14 @@ DISPATCH_LOCK_ACQUIRED=1
   echo "created_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   echo "command: $0 $RUN_ID $TASK_ID"
   echo "attempt_id: ${ATTEMPT_ID}"
+  echo "backend: ${RDO_WORKER_BACKEND}"
 } > "${DISPATCH_LOCK_DIR}/owner"
 printf "%s\n" "${ATTEMPT_ID}" > "${DISPATCH_LOCK_DIR}/attempt_id"
 printf "%s\n" "$$" > "${DISPATCH_LOCK_DIR}/pid"
+if [[ "${RDO_WORKER_BACKEND}" == "tmux" ]]; then
+  printf "%s\n" "${TMUX_SESSION}" > "${DISPATCH_LOCK_DIR}/tmux_session"
+  printf "%s\n" "${TMUX_ATTACH_COMMAND}" > "${DISPATCH_LOCK_DIR}/attach_command"
+fi
 
 python3 - "$STATUS_PATH" "$FSM_PATH" <<'PY'
 import json
@@ -179,6 +279,7 @@ mkdir -p "${ATTEMPT_DIR}"
   echo "created_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   echo "command: $0 $RUN_ID $TASK_ID"
   echo "attempt_id: ${ATTEMPT_ID}"
+  echo "backend: ${RDO_WORKER_BACKEND}"
 } > "${LOCK_PATH}"
 
 if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
@@ -191,13 +292,23 @@ if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
   fi
 fi
 
-python3 - "$ATTEMPT_DIR/ATTEMPT.json" "$ATTEMPT_ID" "$TASK_ID" "$CLAUDE_AGENT_NAME" "$CLAUDE_SESSION_ID" "$CLAUDE_CODE_CMD" "$WORKTREE_PATH" <<'PY'
+python3 - "$ATTEMPT_DIR/ATTEMPT.json" "$ATTEMPT_ID" "$TASK_ID" "$CLAUDE_AGENT_NAME" "$CLAUDE_SESSION_ID" "$CLAUDE_CODE_CMD" "$WORKTREE_PATH" "$RDO_WORKER_BACKEND" "$TMUX_SESSION" "$TMUX_ATTACH_COMMAND" <<'PY'
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
-path, attempt_id, task_id, agent_name, session_id, command, cwd = sys.argv[1:8]
+path, attempt_id, task_id, agent_name, session_id, command, cwd, backend, tmux_session, attach_command = sys.argv[1:11]
+runtime = {
+    "backend": backend,
+    "model": os.environ.get("CLAUDE_MODEL"),
+    "cli": command.split()[0] if command.split() else command,
+    "command": command,
+    "cwd": cwd,
+}
+if backend == "tmux":
+    runtime["tmux_session"] = tmux_session
+    runtime["attach_command"] = attach_command
 payload = {
     "attempt_id": attempt_id,
     "task_id": task_id,
@@ -210,12 +321,7 @@ payload = {
     "started_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "ended_at": None,
     "exit_code": None,
-    "runtime": {
-        "model": os.environ.get("CLAUDE_MODEL"),
-        "cli": command.split()[0] if command.split() else command,
-        "command": command,
-        "cwd": cwd,
-    },
+    "runtime": runtime,
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(payload, handle, indent=2)
@@ -319,21 +425,93 @@ if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
   echo "dry run: prompt written to ${ATTEMPT_DIR}/prompt.md" | tee "${ATTEMPT_DIR}/result.md"
   touch "${ATTEMPT_DIR}/transcript.log"
   EXIT_CODE=0
+  EXIT_CODE_RAW="0"
 else
-  set +e
-  (cd "${WORKTREE_PATH}" && ${CLAUDE_CODE_CMD} < "${ATTEMPT_DIR}/prompt.md") \
-    > "${ATTEMPT_DIR}/transcript.log" 2>&1
-  EXIT_CODE=$?
-  set -e
+  if [[ "${RDO_WORKER_BACKEND}" == "plain" ]]; then
+    set +e
+    (cd "${WORKTREE_PATH}" && ${CLAUDE_CODE_CMD} < "${ATTEMPT_DIR}/prompt.md") \
+      > "${ATTEMPT_DIR}/transcript.log" 2>&1
+    EXIT_CODE=$?
+    set -e
+    EXIT_CODE_RAW="${EXIT_CODE}"
+  else
+    EXIT_CODE_FILE="${ATTEMPT_DIR}/exit_code"
+    RUNNER_PATH="${ATTEMPT_DIR}/run-worker.sh"
+    DONE_SIGNAL="rdo-done-${TMUX_SESSION}"
+    rm -f "${EXIT_CODE_FILE}" "${EXIT_CODE_FILE}.tmp"
+    python3 - "$RUNNER_PATH" "$WORKTREE_PATH" "$CLAUDE_CODE_CMD" "$ATTEMPT_DIR/prompt.md" "$ATTEMPT_DIR/transcript.log" "$EXIT_CODE_FILE" "$DONE_SIGNAL" "$RDO_TMUX_KEEP_SESSION" <<'PY'
+import os
+import shlex
+import sys
+from pathlib import Path
+
+runner_path, worktree_path, command, prompt_path, transcript_path, exit_code_file, done_signal, keep_session = sys.argv[1:9]
+content = f"""#!/usr/bin/env bash
+set +e
+WORKTREE_PATH={shlex.quote(worktree_path)}
+CLAUDE_CODE_CMD={shlex.quote(command)}
+PROMPT_PATH={shlex.quote(prompt_path)}
+TRANSCRIPT_PATH={shlex.quote(transcript_path)}
+EXIT_CODE_FILE={shlex.quote(exit_code_file)}
+DONE_SIGNAL={shlex.quote(done_signal)}
+KEEP_SESSION={shlex.quote(keep_session)}
+
+finish() {{
+  local rc="$?"
+  local tmp="${{EXIT_CODE_FILE}}.tmp"
+  echo "${{rc}}" > "${{tmp}}"
+  mv "${{tmp}}" "${{EXIT_CODE_FILE}}"
+  tmux wait-for -S "${{DONE_SIGNAL}}" 2>/dev/null || true
+  if [[ "${{KEEP_SESSION}}" == "1" ]]; then
+    echo
+    echo "Worker finished with exit code ${{rc}}."
+    echo "Press Ctrl-D or run exit to close this tmux session."
+    exec bash -l
+  fi
+  exit "${{rc}}"
+}}
+trap finish EXIT
+
+cd "${{WORKTREE_PATH}}" || exit 127
+set -o pipefail
+eval "${{CLAUDE_CODE_CMD}}" < "${{PROMPT_PATH}}" 2>&1 | tee "${{TRANSCRIPT_PATH}}"
+exit "${{PIPESTATUS[0]}}"
+"""
+Path(runner_path).write_text(content, encoding="utf-8")
+os.chmod(runner_path, 0o755)
+PY
+    tmux new-session -d -s "${TMUX_SESSION}" "${RUNNER_PATH}"
+    WAIT_START="$(date +%s)"
+    while [[ ! -f "${EXIT_CODE_FILE}" ]]; do
+      if [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" != "0" ]]; then
+        NOW="$(date +%s)"
+        if (( NOW - WAIT_START >= RDO_TMUX_WAIT_TIMEOUT_SECONDS )); then
+          KEEP_DISPATCH_LOCK_ON_EXIT=1
+          write_tmux_timeout_diagnostics
+          exit 5
+        fi
+      fi
+      sleep 1
+    done
+    EXIT_CODE_RAW="$(cat "${EXIT_CODE_FILE}" 2>/dev/null || true)"
+    if [[ "${RDO_TMUX_KEEP_SESSION}" != "1" ]]; then
+      tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+    fi
+    if [[ "${EXIT_CODE_RAW}" =~ ^[0-9]+$ ]]; then
+      EXIT_CODE="${EXIT_CODE_RAW}"
+    else
+      EXIT_CODE=0
+    fi
+  fi
   {
     echo "# Worker Result"
     echo
-    echo "exit_code: ${EXIT_CODE}"
+    echo "exit_code: ${EXIT_CODE_RAW}"
   } > "${ATTEMPT_DIR}/result.md"
 fi
 
 set +e
-python3 - "$STATUS_PATH" "$ATTEMPT_ID" "$TASK_DIR" "$ATTEMPT_DIR/ATTEMPT.json" "$EXIT_CODE" <<'PY'
+python3 - "$STATUS_PATH" "$ATTEMPT_ID" "$TASK_DIR" "$ATTEMPT_DIR/ATTEMPT.json" "$EXIT_CODE_RAW" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -362,8 +540,13 @@ def parse_iso(value):
     except ValueError:
         return None
 
-status_path, attempt_id, task_dir, attempt_path, exit_code = sys.argv[1:6]
-exit_code = int(exit_code)
+status_path, attempt_id, task_dir, attempt_path, exit_code_raw = sys.argv[1:6]
+try:
+    exit_code = int(exit_code_raw)
+    exit_code_valid = True
+except (TypeError, ValueError):
+    exit_code = None
+    exit_code_valid = False
 status = json.load(open(status_path, encoding="utf-8"))
 state = status.get("state")
 valid_state = state in {"review", "blocked"}
@@ -382,10 +565,10 @@ handoff_ok = substantive(Path(task_dir, "HANDOFF.md"))
 evidence_ok = substantive(Path(task_dir, "EVIDENCE.md"))
 if state == "review":
     artifacts_ok = handoff_ok and evidence_ok
-    exit_ok = exit_code == 0
+    exit_ok = exit_code_valid and exit_code == 0
 elif state == "blocked":
     artifacts_ok = handoff_ok and status.get("blocker_type") in BLOCKER_TYPES and bool(status.get("blocking_reason"))
-    exit_ok = True
+    exit_ok = exit_code_valid
 else:
     artifacts_ok = False
     exit_ok = False
@@ -394,7 +577,7 @@ attempt = json.load(open(attempt_path, encoding="utf-8"))
 attempt["ended_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 attempt["exit_code"] = exit_code
 
-if not (valid_state and valid_attempt and valid_previous and valid_history and artifacts_ok and exit_ok):
+if not (exit_code_valid and valid_state and valid_attempt and valid_previous and valid_history and artifacts_ok and exit_ok):
     attempt["state"] = "invalid_handoff"
     attempt["handoff_valid"] = False
     attempt["handoff_state"] = None
@@ -403,7 +586,7 @@ if not (valid_state and valid_attempt and valid_previous and valid_history and a
         handle.write("\n")
     print("worker_exit_without_valid_status", file=sys.stderr)
     print(f"state={state!r} current_attempt_id={status.get('current_attempt_id')!r}", file=sys.stderr)
-    print(f"exit_code={exit_code!r} exit_ok={exit_ok!r}", file=sys.stderr)
+    print(f"exit_code_raw={exit_code_raw!r} exit_code={exit_code!r} exit_code_valid={exit_code_valid!r} exit_ok={exit_ok!r}", file=sys.stderr)
     print(f"valid_previous={valid_previous!r}", file=sys.stderr)
     print(f"valid_history={valid_history!r}", file=sys.stderr)
     raise SystemExit(4)

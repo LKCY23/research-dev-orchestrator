@@ -33,6 +33,7 @@ REQUIRED_STATUS_FIELDS = {
 BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "irrecoverable"}
 ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
 HANDOFF_STATES = {"review", "blocked", None}
+RUNTIME_BACKENDS = {"plain", "tmux"}
 CORE_EVENTS = {
     "run_created",
     "requirements_updated",
@@ -237,13 +238,24 @@ def validate_attempt(task_dir: Path, status: dict[str, Any], stale_created_minut
             violations.append(f"{task_dir.name}: ATTEMPT.runtime.{field} must be a non-empty string")
         elif field not in runtime:
             violations.append(f"{task_dir.name}: ATTEMPT.runtime missing field: {field}")
+    backend = runtime.get("backend")
+    if backend not in RUNTIME_BACKENDS:
+        violations.append(f"{task_dir.name}: ATTEMPT.runtime.backend must be plain or tmux")
+    if backend == "tmux":
+        for field in ("tmux_session", "attach_command"):
+            if not is_non_empty_string(runtime.get(field)):
+                violations.append(f"{task_dir.name}: ATTEMPT.runtime.{field} is required for tmux backend")
 
     attempt_state = attempt.get("state")
     if attempt_state in {"completed", "invalid_handoff"}:
         if not attempt.get("ended_at"):
             violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires ended_at")
+    if attempt_state == "completed":
         if not is_int_not_bool(attempt.get("exit_code")):
-            violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires exit_code")
+            violations.append(f"{task_dir.name}: completed ATTEMPT requires integer exit_code")
+    if attempt_state == "invalid_handoff":
+        if attempt.get("exit_code") is not None and not is_int_not_bool(attempt.get("exit_code")):
+            violations.append(f"{task_dir.name}: invalid_handoff ATTEMPT requires exit_code integer or null")
     if attempt_state in {"created", "running"}:
         if attempt.get("ended_at") is not None:
             violations.append(f"{task_dir.name}: ATTEMPT.state {attempt_state} requires ended_at=null")

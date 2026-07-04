@@ -10,6 +10,7 @@ The skill runtime entrypoint is [`SKILL.md`](SKILL.md). The detailed design base
 - Creates repo-local orchestration runs under `.agent-collab/runs/<run-id>/`.
 - Decomposes work into task packets with explicit allowed paths, acceptance criteria, evidence, and handoff files.
 - Dispatches CLI coding agents through a filesystem protocol and Git worktree isolation.
+- Supports `plain` worker execution by default and optional attachable `tmux` execution for long-running workers.
 - Enforces a finite state machine through `references/state-machine.json`.
 - Keeps worker/process lifecycle in `ATTEMPT.json` instead of expanding the task FSM.
 - Provides human, machine, and diagnostic monitoring through `SUMMARY.md`, `collect_status.py --json`, and `diagnostics/`.
@@ -17,6 +18,22 @@ The skill runtime entrypoint is [`SKILL.md`](SKILL.md). The detailed design base
 - Prevents destructive overwrites of audit-bearing artifacts; use a new run, new attempt, or revision task.
 - Uses `collect_status.py` as an invariant checker across `STATUS.json`, `ATTEMPT.json`, `LOCK`, `.dispatch-lock`, `EVENTS.ndjson`, `EVIDENCE.md`, and `HANDOFF.md`.
 - Provides an explicit stale dispatch-lock recovery workflow: detect with `collect_status.py`, review with the coordinator, confirm with the user, then remove only `.dispatch-lock` with an audited snapshot/event.
+
+## Worker Backends
+
+Default dispatch is direct and synchronous:
+
+```bash
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> <task-id>
+```
+
+For attachable long-running workers, use tmux:
+
+```bash
+RDO_WORKER_BACKEND=tmux "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> <task-id>
+```
+
+The tmux backend is still synchronous from dispatch's protocol perspective. The completion source of truth is the attempt-local `exit_code` file, not a tmux signal. If dispatch times out before that file appears, it exits `5`, keeps `.dispatch-lock`, leaves `ATTEMPT.state=running`, writes diagnostics, and requires Lock Recovery Review.
 
 ## Repository Layout
 

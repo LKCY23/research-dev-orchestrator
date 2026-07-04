@@ -95,6 +95,8 @@ Template-only `EVIDENCE.md` or `HANDOFF.md` files with `RDO_TEMPLATE` markers ar
 
 `STATUS.state = running` requires matching `LOCK` metadata, an active `.dispatch-lock`, and an attempt whose state is `created` or `running`.
 
+For tmux dispatch timeout before the attempt-local `exit_code` file appears, `STATUS.state` remains `running`, `ATTEMPT.state` remains `running`, and `.dispatch-lock` remains in place until Lock Recovery Review.
+
 `STATUS.state = review` requires `previous_state = running`, a completed attempt with `handoff_valid = true`, `handoff_state = review`, worker `exit_code = 0`, and substantive `EVIDENCE.md` and `HANDOFF.md`.
 
 `STATUS.state = blocked` requires `previous_state = running`, a completed attempt with `handoff_valid = true`, `handoff_state = blocked`, substantive `HANDOFF.md`, valid `blocker_type`, and non-empty `blocking_reason`. Blocked handoff may have a zero or nonzero worker `exit_code`.

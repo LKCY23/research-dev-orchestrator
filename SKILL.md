@@ -19,6 +19,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - `SUMMARY.md` and `diagnostics/` are derived monitor artifacts, not sources of truth.
 - `EVENTS.ndjson` and `JOURNAL.md` are required long-term memory artifacts. Use them to preserve cross-session history without adding a heavier decision database.
 - Task FSM stays about task progress only. `ATTEMPT.json` owns worker execution lifecycle. `collect_status.py` validates invariants across status, attempt, lock, events, evidence, and handoff files.
+- Worker runtime backend is an execution detail. Default to `plain`; use `tmux` only when the user wants attachable long-running worker observation. Backend choice must not change protocol truth sources.
 - Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
 
 ## Standard Workflow
@@ -52,6 +53,8 @@ Read references only when they are needed:
 - `references/state-machine.json`: use as the authoritative machine-readable FSM.
 - `references/status-schema.md`: use before writing or reviewing `STATUS.json`.
 - `references/attempt-lifecycle.md`: use before dispatching workers or auditing running/review/blocked invariants.
+- `references/runtime-backends.md`: use before enabling `RDO_WORKER_BACKEND=tmux` or auditing backend-specific attempt metadata.
+- `references/protocol-constants.md`: use when changing script constants, exit codes, blocker types, or event types.
 - `references/lock-recovery.md`: use when `.dispatch-lock` is stale, mismatched, or present outside `running`.
 - `references/review-rubric.md`: use before Codex review and merge decisions.
 - `references/summary-template.md`: use when updating or auditing `SUMMARY.md`.
@@ -67,6 +70,7 @@ export RESEARCH_DEV_ORCHESTRATOR_HOME=/absolute/path/to/research-dev-orchestrato
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/init_run.py" --project-slug <slug> --objective "<objective>" --target-branch <branch>
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" --run-id <run-id> --task-id T001-name --goal "<goal>" --allowed-paths path1 path2
 "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> <task-id>
+RDO_WORKER_BACKEND=tmux "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> <task-id>
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
@@ -80,6 +84,16 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-
 `create_task.py` creates `pending` tasks only. It must not overwrite existing tasks, dispatch, create locks, or merge.
 
 `dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and must not synthesize `review` or `blocked` for the worker. A `review` handoff requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid.
+
+Worker backend configuration:
+
+```bash
+RDO_WORKER_BACKEND=plain|tmux
+RDO_TMUX_KEEP_SESSION=0|1
+RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
+```
+
+`tmux` backend is attachable execution, not detached orchestration. Dispatch still waits for the attempt-local `exit_code` file and validates handoff. If tmux wait times out before `exit_code` appears, dispatch exits `5`, keeps `.dispatch-lock`, leaves `ATTEMPT.state=running`, writes diagnostics, and requires Lock Recovery Review.
 
 `collect_status.py` is read-only by default. It must not modify `STATUS.json`, delete locks, change FSM state, or repair violations. `--write-summary` may update only `SUMMARY.md`; `--write-diagnostics` may write only diagnostics files.
 
