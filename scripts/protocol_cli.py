@@ -13,8 +13,8 @@ from typing import Any
 
 from protocol import (
     BLOCKER_TYPES,
-    TEMPLATE_MARKERS,
     append_event as append_event_line,
+    has_substantive_content,
     load_json,
     parse_iso,
     utc_now,
@@ -27,16 +27,6 @@ def add_common_event_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--attempt-id", required=True)
-
-
-def substantive(path: Path) -> bool:
-    if not path.exists():
-        return False
-    text = path.read_text(encoding="utf-8").strip()
-    if not text:
-        return False
-    marker = TEMPLATE_MARKERS.get(path.name)
-    return not (marker and marker in text)
 
 
 def cmd_check_dispatch_transition(args: argparse.Namespace) -> int:
@@ -166,8 +156,8 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
         and last_transition.get("actor") == "claude-code"
         and parse_iso(last_transition.get("at")) is not None
     )
-    handoff_ok = substantive(task_dir / "HANDOFF.md")
-    evidence_ok = substantive(task_dir / "EVIDENCE.md")
+    handoff_ok = has_substantive_content(task_dir / "HANDOFF.md")
+    evidence_ok = has_substantive_content(task_dir / "EVIDENCE.md")
     if state == "review":
         artifacts_ok = handoff_ok and evidence_ok
         exit_ok = exit_code_valid and exit_code == 0

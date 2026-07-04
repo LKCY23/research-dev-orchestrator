@@ -59,6 +59,8 @@ bash -n scripts/dispatch_claude.sh
 scripts/run_smoke_tests.sh
 ```
 
+Smoke tests keep temporary repositories by default for debugging. Use `RDO_KEEP_SMOKE_REPOS=0 scripts/run_smoke_tests.sh` to remove them automatically.
+
 When using the skill from another target repository, keep the current working directory at that target repository root and call this repository's scripts by absolute path, or set:
 
 ```bash

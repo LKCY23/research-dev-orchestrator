@@ -3,6 +3,24 @@
 set -euo pipefail
 
 RDO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RDO_KEEP_SMOKE_REPOS="${RDO_KEEP_SMOKE_REPOS:-1}"
+RDO_SMOKE_REGISTRY="${RDO_SMOKE_REGISTRY:-$(mktemp -t rdo-smoke-repos.XXXXXX)}"
+export RDO_KEEP_SMOKE_REPOS
+export RDO_SMOKE_REGISTRY
+
+cleanup_smoke_repos() {
+  if [[ "${RDO_KEEP_SMOKE_REPOS}" != "0" || ! -f "${RDO_SMOKE_REGISTRY}" ]]; then
+    return 0
+  fi
+  while IFS= read -r repo; do
+    if [[ -n "${repo}" && -d "${repo}" ]]; then
+      rm -rf "${repo}"
+    fi
+  done < "${RDO_SMOKE_REGISTRY}"
+  rm -f "${RDO_SMOKE_REGISTRY}"
+}
+
+trap 'code=$?; cleanup_smoke_repos; exit "${code}"' EXIT
 
 setup_smoke_repo() {
   local base="${1:-}"
@@ -11,6 +29,7 @@ setup_smoke_repo() {
   else
     mkdir -p "${base}"
   fi
+  printf '%s\n' "${base}" >> "${RDO_SMOKE_REGISTRY}"
   cd "${base}"
   git init -b main >/dev/null
   git config user.email smoke@example.com
