@@ -98,6 +98,14 @@ create_task.py
 
 `dispatch_claude.sh` continues to use explicit environment variables in this phase. Use `scripts/config_cli.py export-env` to inspect resolved values before dispatch integration.
 
+When dispatch integration is added, do not use unchecked command substitution:
+
+```bash
+eval "$(python scripts/config_cli.py export-env)"
+```
+
+Capture output and exit status first, then `eval` only on success. Config errors must stop dispatch before locks, attempts, worktrees, or `STATUS -> running` mutations.
+
 ## Diagnostics
 
 Unknown TOML sections or keys are warnings. Invalid values are errors.

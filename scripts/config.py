@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
@@ -114,14 +115,10 @@ def coerce_value(value: Any, kind: str) -> tuple[Any, str | None]:
             return parsed, None
         return None, "must be a boolean"
     if kind == "int_nonnegative":
-        if isinstance(value, bool):
-            return None, "must be a non-negative integer"
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            return None, "must be a non-negative integer"
-        if parsed >= 0:
-            return parsed, None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value, None
+        if isinstance(value, str) and re.match(r"^[0-9]+$", value):
+            return int(value), None
         return None, "must be a non-negative integer"
     if kind == "float_nonnegative":
         if isinstance(value, bool):

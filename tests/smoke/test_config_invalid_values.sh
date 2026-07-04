@@ -16,6 +16,7 @@ backend = "daemon"
 
 [tmux]
 wait_timeout_seconds = -1
+exit_code_grace_seconds = 1.5
 
 [unknown]
 value = true
@@ -31,4 +32,5 @@ set -e
 [[ "${validate_code}" != "0" ]]
 [[ "${collect_code}" != "0" ]]
 assert_json_expr "${repo}/status.json" "'config: [runtime].backend must be one of' in '\\n'.join(payload['protocol_violations'])"
+assert_json_expr "${repo}/status.json" "'config: [tmux].exit_code_grace_seconds must be a non-negative integer' in '\\n'.join(payload['protocol_violations'])"
 assert_json_expr "${repo}/status.json" "'config: unknown section [unknown]' in '\\n'.join(payload['protocol_warnings'])"
