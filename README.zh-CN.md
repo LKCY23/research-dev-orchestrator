@@ -283,16 +283,53 @@ tmux backend 从 dispatch 的协议视角看仍然是同步的。它不是 daemo
 
 目标是几周后用户或 Codex 仍然能回答：发生了什么、为什么变化、什么失败过、有什么证据、还有什么 blocker。
 
+## Installation
+
+把这个仓库作为 Codex coordinator 侧的 skill 安装：
+
+```bash
+mkdir -p ~/.codex/skills
+git clone https://github.com/LKCY23/research-dev-orchestrator.git \
+  ~/.codex/skills/research-dev-orchestrator
+```
+
+只有 coordinator 需要安装这个 skill。Claude Code 或其他 CLI worker 不需要安装 skill；dispatch 会把 task packet 路径和 protocol instructions 传给 worker。Worker 只需要可用的 CLI command，例如：
+
+```bash
+export CLAUDE_CODE_CMD=claude
+```
+
+如果要打包成更干净的最终 skill package，请保留 `SKILL.md`、`references/`、`scripts/`、`templates/` 和 `agents/openai.yaml`；`README.md`、`README.zh-CN.md`、`DESIGN_SPEC.md`、`.github/` 和 `tests/` 是开发 artifact。
+
 ## Quick Start
 
-目前还没有 package-manager install flow。Clone 这个仓库，然后从目标仓库中用绝对路径调用 scripts。
+在目标仓库中，让 Codex 使用这个 skill：
+
+```text
+Use $research-dev-orchestrator to initialize a run for a reproducible RAG benchmark pipeline.
+```
+
+然后 Codex 应该：
+
+1. 和你澄清需求与实验细节；
+2. 在 `.agent-collab/runs/<run-id>/` 下创建 run；
+3. 创建带验收标准的 task packet；
+4. 在 task 准备好后派发 CLI worker；
+5. 收集状态并 review worker evidence；
+6. 在 session closeout 时更新 `SUMMARY.md`、`JOURNAL.md` 和相关 run artifacts。
+
+Worker 侧仍然是 CLI-based。你可以通过 `.agent-collab/rdo.toml` 或环境变量配置默认值，例如 `CLAUDE_CODE_CMD`、`RDO_WORKER_BACKEND` 和 `RDO_TMUX_KEEP_SESSION`。
+
+### Direct script usage
+
+如果是在开发、调试，或者不依赖 Codex skill discovery，可以 clone 这个仓库，然后从目标仓库中用绝对路径调用 scripts：
 
 ```bash
 git clone https://github.com/LKCY23/research-dev-orchestrator.git
 export RESEARCH_DEV_ORCHESTRATOR_HOME=/path/to/research-dev-orchestrator
 ```
 
-在目标仓库 root 下初始化 run：
+初始化 run：
 
 ```bash
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/init_run.py" \
@@ -344,6 +381,24 @@ RDO_WORKER_BACKEND=tmux \
 Operational defaults 位于 `.agent-collab/rdo.toml`，但 protocol truth 不可配置。Config 可以选择 backend、worker command、stale thresholds、task path prefixes 等默认值。它不能改变 FSM states、blocker types、event types、protocol version 或 review semantics。
 
 见 [references/configuration.md](references/configuration.md)。
+
+## Monitoring
+
+项目提供三层 monitor：
+
+- Human-readable monitor：`.agent-collab/runs/<run-id>/SUMMARY.md`。
+- Interactive monitor：`python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>`。
+- Machine-readable monitor：`python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json`。
+
+用下面的命令重新生成人类可读 summary：
+
+```bash
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" \
+  --run-id <run-id> \
+  --write-summary
+```
+
+`SUMMARY.md` 是 derived dashboard，不是 protocol truth。真源仍然是 `RUN.json`、task `STATUS.json`、attempt `ATTEMPT.json`、`EVENTS.ndjson`、`EVIDENCE.md`、`HANDOFF.md` 和 `RESULT_LEDGER.md`。Protocol warnings 和 recovery snapshots 会写到 `diagnostics/`。
 
 ## Validation and CI
 

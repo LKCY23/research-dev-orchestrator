@@ -283,16 +283,53 @@ Long-running research work needs explicit memory:
 
 The goal is that a user or Codex can resume weeks later and answer: what changed, why it changed, what failed, what evidence exists, and what remains blocked.
 
+## Installation
+
+Install this repository as a Codex skill for the coordinator:
+
+```bash
+mkdir -p ~/.codex/skills
+git clone https://github.com/LKCY23/research-dev-orchestrator.git \
+  ~/.codex/skills/research-dev-orchestrator
+```
+
+Only the coordinator needs the skill installed. Claude Code or other CLI workers do not need to install this skill; they are launched by dispatch with task-packet paths and protocol instructions. A worker only needs the configured CLI command available, for example:
+
+```bash
+export CLAUDE_CODE_CMD=claude
+```
+
+For a cleaner final skill package, keep `SKILL.md`, `references/`, `scripts/`, `templates/`, and `agents/openai.yaml`; `README.md`, `DESIGN_SPEC.md`, `.github/`, and `tests/` are development artifacts.
+
 ## Quick Start
 
-There is no package-manager install flow yet. Clone this repository and call scripts by absolute path from your target repository.
+From a target repository, ask Codex to use the skill:
+
+```text
+Use $research-dev-orchestrator to initialize a run for a reproducible RAG benchmark pipeline.
+```
+
+Codex should then:
+
+1. clarify requirements and experiment details with you;
+2. create a run under `.agent-collab/runs/<run-id>/`;
+3. create task packets with acceptance criteria;
+4. dispatch CLI workers when a task is ready;
+5. collect status and review worker evidence;
+6. update `SUMMARY.md`, `JOURNAL.md`, and related run artifacts at session closeout.
+
+The worker side remains CLI-based. Configure defaults in `.agent-collab/rdo.toml` or with environment variables such as `CLAUDE_CODE_CMD`, `RDO_WORKER_BACKEND`, and `RDO_TMUX_KEEP_SESSION`.
+
+### Direct script usage
+
+For development, debugging, or running without Codex skill discovery, clone this repository and call scripts by absolute path from the target repository:
 
 ```bash
 git clone https://github.com/LKCY23/research-dev-orchestrator.git
 export RESEARCH_DEV_ORCHESTRATOR_HOME=/path/to/research-dev-orchestrator
 ```
 
-From the target repository root:
+Initialize a run:
 
 ```bash
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/init_run.py" \
@@ -344,6 +381,24 @@ RDO_WORKER_BACKEND=tmux \
 Operational defaults live in `.agent-collab/rdo.toml`, but protocol truth is not configurable. Config may choose defaults such as backend, worker command, stale thresholds, and task path prefixes. It cannot change FSM states, blocker types, event types, protocol version, or review semantics.
 
 See [references/configuration.md](references/configuration.md).
+
+## Monitoring
+
+The project has three monitor surfaces:
+
+- Human-readable monitor: `.agent-collab/runs/<run-id>/SUMMARY.md`.
+- Interactive monitor: `python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>`.
+- Machine-readable monitor: `python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json`.
+
+Regenerate the human-readable summary with:
+
+```bash
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" \
+  --run-id <run-id> \
+  --write-summary
+```
+
+`SUMMARY.md` is a derived dashboard, not protocol truth. The source of truth remains `RUN.json`, task `STATUS.json`, attempt `ATTEMPT.json`, `EVENTS.ndjson`, `EVIDENCE.md`, `HANDOFF.md`, and `RESULT_LEDGER.md`. Protocol warnings and recovery snapshots are written under `diagnostics/`.
 
 ## Validation and CI
 
