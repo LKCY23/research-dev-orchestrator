@@ -59,54 +59,47 @@ flowchart TB
   subgraph L1["Coordinator Layer"]
     direction TB
     U["User"]:::human
-    C["Coordinator<br/>intent, design, task split, review decisions"]:::coord
+    C["Coordinator (Codex)"]:::coord
     U --> C
   end
 
-  subgraph L2["Intent & Planning Layer"]
-    direction LR
-    P["Planning Artifacts<br/>requirements, ADRs, experiment plan"]:::planning
-    T["Task Contract<br/>task, context, acceptance"]:::planning
+  subgraph L2["Planning Layer"]
+    direction TB
+    P["Planning"]:::planning
+    T["Task Contract"]:::planning
     P --> T
   end
 
   subgraph L3["Execution Layer"]
-    direction LR
-    D["Execution Dispatcher<br/>lock, attempt, worker launch"]:::exec
-    G["Git Isolation<br/>branch + worktree"]:::exec
-    B["Runtime Backend<br/>plain or tmux"]:::exec
-    W["CLI Worker<br/>bounded implementation"]:::exec
-    D --> G
-    D --> B
-    G -. "worktree cwd" .-> W
-    B --> W
+    direction TB
+    D["Dispatcher"]:::exec
+    W["Worker<br/>isolated worktree + backend"]:::exec
+    D -- "launch" --> W
   end
 
   subgraph L4["Protocol Layer"]
-    direction LR
-    Q["Protocol State & Evidence<br/>STATUS / ATTEMPT / EVIDENCE / HANDOFF"]:::truth
-    M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
+    direction TB
+    S["Protocol Store<br/>state · evidence · timeline · memory"]:::truth
   end
 
   subgraph L5["Validation & Recovery Layer"]
-    direction LR
-    V["Validation Gate<br/>deterministic protocol checks"]:::validate
-    O["Monitor & Audit<br/>read-only status collection"]:::validate
-    R["Recovery Review<br/>user-approved minimal mutation"]:::validate
+    direction TB
+    V["Validate"]:::validate
+    O["Monitor"]:::validate
+    R["Recover"]:::validate
     V --> O
     O --> R
   end
 
   C --> P
   T --> D
-  D -. "attempt metadata" .-> Q
-  W --> Q
-  C -. "session notes" .-> M
-  D -. "events" .-> M
-  Q --> V
-  M --> O
-  O -. "status, blockers, review evidence" .-> C
-  R --> M
+  W -- "handoff" --> S
+  S --> V
+
+  D -. "attempt metadata" .-> S
+  C -. "notes, review decisions" .-> S
+  O -. "status, blockers" .-> C
+  R -- "approved repair" --> S
 
   classDef human fill:#eff6ff,stroke:#2563eb,color:#1e3a8a;
   classDef coord fill:#eef2ff,stroke:#4f46e5,color:#312e81;
@@ -122,14 +115,14 @@ flowchart TB
   style L5 fill:#fff8f9,stroke:#fecdd3,stroke-width:1px,color:#881337;
 ```
 
-The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs; monitoring scripts produce derived artifacts without becoming a long-running service.
+The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs; monitoring scripts produce derived artifacts without becoming a long-running service. Monitor output informs coordinator review, and recovery writes only user-approved minimal mutations back into the protocol store.
 
 Implementation details are intentionally secondary in the diagram:
 
 | Layer | Responsibility | Main implementation |
 | --- | --- | --- |
 | Coordinator | Requirements, design, task split, review, merge decisions | `SKILL.md`, `/rdo` command surface |
-| Intent & planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
+| Planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
 | Execution | Locking, worktree isolation, worker launch, attempt supervision | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends |
 | Protocol | Current state, attempt records, evidence, handoff, timeline, memory | `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md` |
 | Validation & recovery | Deterministic gates, read-only audit, derived reports, user-approved recovery | `validation.py`, `protocol_cli.py`, `collect_status.py`, `SUMMARY.md`, `diagnostics/` |
