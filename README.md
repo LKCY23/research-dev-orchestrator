@@ -77,9 +77,9 @@ flowchart TB
     D -- "launch" --> W
   end
 
-  subgraph L4["Protocol Layer"]
+  subgraph L4["Run Store"]
     direction TB
-    S["Protocol Store<br/>state · evidence · timeline · memory"]:::truth
+    S["Repo-local system of record<br/>state · evidence · events · memory"]:::truth
   end
 
   subgraph L5["Validation & Recovery Layer"]
@@ -115,16 +115,16 @@ flowchart TB
   style L5 fill:#fff8f9,stroke:#fecdd3,stroke-width:1px,color:#881337;
 ```
 
-The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs; monitoring scripts produce derived artifacts without becoming a long-running service. Monitor output informs coordinator review, and recovery writes only user-approved minimal mutations back into the protocol store.
+The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. Git isolates implementation changes. The Run Store is the repo-local system of record for task state, attempt lifecycle, handoff evidence, events, memory, results, and recovery context. Validation gates worker handoffs; monitoring scripts produce derived artifacts without becoming a long-running service. Monitor output informs coordinator review, and recovery writes only user-approved minimal mutations back into the Run Store.
 
 Implementation details are intentionally secondary in the diagram:
 
-| Layer | Responsibility | Main implementation |
+| Plane | Responsibility | Main implementation |
 | --- | --- | --- |
 | Coordinator | Requirements, design, task split, review, merge decisions | `SKILL.md`, `/rdo` command surface |
 | Planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
-| Execution | Locking, worktree isolation, worker launch, attempt supervision | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends |
-| Protocol | Current state, attempt records, evidence, handoff, timeline, memory | `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md` |
+| Execution | Worker dispatch, attempt supervision, Git-isolated execution | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends, Git worktree |
+| Run Store | Repo-local system of record for task state, attempt lifecycle, handoff evidence, event timeline, memory, results, and recovery context | `.agent-collab/runs/<run-id>/`, `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md`, `RESULT_LEDGER.md` |
 | Validation & recovery | Deterministic gates, read-only audit, derived reports, user-approved recovery | `validation.py`, `protocol_cli.py`, `collect_status.py`, `SUMMARY.md`, `diagnostics/` |
 
 ## Workflow
