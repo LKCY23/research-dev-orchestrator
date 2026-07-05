@@ -78,12 +78,13 @@ flowchart TB
     W["CLI Worker<br/>bounded implementation"]:::exec
     D --> G
     D --> B
+    G -. "worktree cwd" .-> W
     B --> W
   end
 
   subgraph L4["Protocol Layer"]
     direction LR
-    Q["Handoff Truth Bundle<br/>STATUS / ATTEMPT / EVIDENCE / HANDOFF"]:::truth
+    Q["Protocol State & Evidence<br/>STATUS / ATTEMPT / EVIDENCE / HANDOFF"]:::truth
     M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
   end
 
@@ -121,7 +122,7 @@ flowchart TB
   style L5 fill:#fff8f9,stroke:#fecdd3,stroke-width:1px,color:#881337;
 ```
 
-The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs and produces derived monitoring artifacts without becoming a long-running service.
+The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. The filesystem stores protocol truth. Git isolates implementation changes. Validation gates worker handoffs; monitoring scripts produce derived artifacts without becoming a long-running service.
 
 Implementation details are intentionally secondary in the diagram:
 
