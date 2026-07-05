@@ -56,10 +56,10 @@ The design is built around four rules:
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"},"flowchart":{"curve":"basis"}}}%%
 flowchart TB
-  subgraph L1["Human & Coordinator Layer"]
+  subgraph L1["Coordinator Layer"]
     direction TB
     U["User"]:::human
-    C["Coordinator Control Plane<br/>intent, design, task split, review decisions"]:::coord
+    C["Coordinator<br/>intent, design, task split, review decisions"]:::coord
     U --> C
   end
 
@@ -81,7 +81,7 @@ flowchart TB
     B --> W
   end
 
-  subgraph L4["Protocol Truth Layer"]
+  subgraph L4["Protocol Layer"]
     direction LR
     Q["Handoff Truth Bundle<br/>STATUS / ATTEMPT / EVIDENCE / HANDOFF"]:::truth
     M["Long-Term Memory<br/>EVENTS / JOURNAL / RESULT_LEDGER"]:::truth
@@ -127,10 +127,10 @@ Implementation details are intentionally secondary in the diagram:
 
 | Layer | Responsibility | Main implementation |
 | --- | --- | --- |
-| Coordinator control plane | Requirements, design, task split, review, merge decisions | `SKILL.md`, `/rdo` command surface |
+| Coordinator | Requirements, design, task split, review, merge decisions | `SKILL.md`, `/rdo` command surface |
 | Intent & planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
 | Execution | Locking, worktree isolation, worker launch, attempt supervision | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends |
-| Protocol truth | Current state, attempt records, evidence, handoff, timeline, memory | `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md` |
+| Protocol | Current state, attempt records, evidence, handoff, timeline, memory | `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md` |
 | Validation & recovery | Deterministic gates, read-only audit, derived reports, user-approved recovery | `validation.py`, `protocol_cli.py`, `collect_status.py`, `SUMMARY.md`, `diagnostics/` |
 
 ## Workflow
