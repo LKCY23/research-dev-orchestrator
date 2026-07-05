@@ -123,7 +123,7 @@ flowchart TB
 
 | Plane | Responsibility | Main implementation |
 | --- | --- | --- |
-| Coordinator | 需求、设计、任务拆分、review、merge 决策 | `SKILL.md`, `/rdo` command surface |
+| Coordinator | 需求、设计、任务拆分、review、merge 决策 | `SKILL.md`, `$research-dev-orchestrator` intent surface |
 | Planning | 持久化研究意图和任务契约 | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
 | Execution | Worker 派发、attempt supervision、Git 隔离执行 | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends, Git worktree |
 | Run Store | task state、attempt lifecycle、handoff evidence、event timeline、memory、results、recovery context 的 repo-local system of record | `.agent-collab/runs/<run-id>/`, `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md`, `RESULT_LEDGER.md` |
@@ -306,8 +306,10 @@ export CLAUDE_CODE_CMD=claude
 在目标仓库中，让 Codex 使用这个 skill：
 
 ```text
-Use $research-dev-orchestrator to initialize a run for a reproducible RAG benchmark pipeline.
+使用 $research-dev-orchestrator，为一个可复现的 RAG benchmark pipeline 初始化 run。
 ```
+
+你也可以用 Codex 内置的 `/skills` picker 选择这个 skill，然后用自然语言提出同样的请求。这里的示例是 skill invocation 和 intent phrase，不是这个 skill 注册出来的自定义 slash command。
 
 然后 Codex 应该：
 

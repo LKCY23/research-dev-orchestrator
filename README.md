@@ -123,7 +123,7 @@ Implementation details are intentionally secondary in the diagram:
 
 | Plane | Responsibility | Main implementation |
 | --- | --- | --- |
-| Coordinator | Requirements, design, task split, review, merge decisions | `SKILL.md`, `/rdo` command surface |
+| Coordinator | Requirements, design, task split, review, merge decisions | `SKILL.md`, `$research-dev-orchestrator` intent surface |
 | Planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
 | Execution | Worker dispatch, attempt supervision, Git-isolated execution | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends, Git worktree |
 | Run Store | Repo-local system of record for task state, attempt lifecycle, handoff evidence, event timeline, memory, results, and recovery context | `.agent-collab/runs/<run-id>/`, `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md`, `RESULT_LEDGER.md` |
@@ -308,6 +308,8 @@ From a target repository, ask Codex to use the skill:
 ```text
 Use $research-dev-orchestrator to initialize a run for a reproducible RAG benchmark pipeline.
 ```
+
+You can also select the skill with Codex's built-in `/skills` picker, then ask for the same action in natural language. The examples here are skill invocations and intent phrases, not custom slash commands registered by the skill.
 
 Codex should then:
 

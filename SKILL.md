@@ -22,7 +22,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - `scripts/protocol.py` is the script-internal source for protocol constants and low-level helpers. `scripts/validation.py` owns shared protocol validation rules used by online dispatch gates and offline status audit. Neither file is a user interface or public SDK.
 - `.agent-collab/rdo.toml` and `scripts/config.py` own operational defaults only. They must not configure protocol states, schema fields, events, blocker types, or protocol version.
 - Worker runtime backend is an execution detail. Default to `plain`; use `tmux` only when the user wants attachable long-running worker observation. Backend choice must not change protocol truth sources.
-- `/rdo ...` commands are Codex-facing intent grammar for human control. They are not executable shell slash commands and must still follow all protocol invariants.
+- Coordinator intents are structured natural-language requests for human control. They are not Codex slash commands and must still follow all protocol invariants.
 - Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
 
 ## Standard Workflow
@@ -59,7 +59,7 @@ Read references only when they are needed:
 - `references/configuration.md`: use when changing `.agent-collab/rdo.toml`, config defaults, env overrides, stale thresholds, or task branch/worktree defaults.
 - `references/runtime-backends.md`: use before enabling `RDO_WORKER_BACKEND=tmux` or auditing backend-specific attempt metadata.
 - `references/protocol-constants.md`: use when changing script constants, exit codes, blocker types, or event types.
-- `references/command-surface.md`: use when the user invokes `/rdo ...` command-like intents.
+- `references/command-surface.md`: use when the user invokes coordinator intent phrases such as `$research-dev-orchestrator dispatch ...`.
 - `references/lock-recovery.md`: use when `.dispatch-lock` is stale, mismatched, or present outside `running`.
 - `references/review-rubric.md`: use before Codex review and merge decisions.
 - `references/summary-template.md`: use when updating or auditing `SUMMARY.md`.
@@ -86,22 +86,22 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-
 "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/run_smoke_tests.sh"
 ```
 
-## Command Surface
+## Coordinator Intent Surface
 
-Users may invoke command-like intents. Treat these as structured natural language for Codex, not shell commands:
+Users may invoke the skill explicitly with `$research-dev-orchestrator` or select it through `/skills`, then provide structured intent text. Treat these as natural-language intents for Codex, not shell commands or registered slash commands:
 
 ```text
-/rdo init project=<slug> objective="<text>" [target=<branch>]
-/rdo plan run=<run-id> [scope=requirements|design|experiment|all]
-/rdo create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>]
-/rdo dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
-/rdo status run=<run-id> [json] [summary] [diagnostics]
-/rdo review run=<run-id> task=<task-id>
-/rdo recover-lock run=<run-id> task=<task-id>
-/rdo close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
+$research-dev-orchestrator init project=<slug> objective="<text>" [target=<branch>]
+$research-dev-orchestrator plan run=<run-id> [scope=requirements|design|experiment|all]
+$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>]
+$research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
+$research-dev-orchestrator status run=<run-id> [json] [summary] [diagnostics]
+$research-dev-orchestrator review run=<run-id> task=<task-id>
+$research-dev-orchestrator recover-lock run=<run-id> task=<task-id>
+$research-dev-orchestrator close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
 ```
 
-Read `references/command-surface.md` before acting on `/rdo ...`. `/rdo review` does not automatically approve; it produces findings and recommendations, and mutates state only with explicit user instruction and valid review gates.
+Read `references/command-surface.md` before acting on these intents. `review` does not automatically approve; it produces findings and recommendations, and mutates state only with explicit user instruction and valid review gates.
 
 `init_run.py` scaffolds only. It must not make substantive research, design, or architecture decisions.
 
@@ -111,7 +111,7 @@ Read `references/command-surface.md` before acting on `/rdo ...`. `/rdo review` 
 
 `validation.py` contains shared protocol validation rules, starting with worker handoff validation. `protocol_cli.py validate-handoff` and `collect_status.py` must reuse it so online gate checks and offline audit do not drift.
 
-`config.py` loads operational defaults from `.agent-collab/rdo.toml` and environment variables. It must not define or mutate protocol truth. CLI flags, `/rdo` one-off arguments, and explicit env vars still override config.
+`config.py` loads operational defaults from `.agent-collab/rdo.toml` and environment variables. It must not define or mutate protocol truth. CLI flags, explicit coordinator intent arguments, and explicit env vars still override config.
 
 `protocol_cli.py` is a narrow internal bridge for `dispatch_claude.sh`. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
 

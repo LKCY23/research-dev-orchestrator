@@ -17,7 +17,7 @@ operational defaults:
   scripts/config.py
 
 one-off overrides:
-  /rdo args
+  coordinator intent arguments
   CLI flags
   environment variables
 ```
@@ -25,7 +25,7 @@ one-off overrides:
 Precedence:
 
 ```text
-CLI flag or /rdo one-off argument
+CLI flag or coordinator intent argument
 > environment variable
 > .agent-collab/rdo.toml
 > built-in defaults

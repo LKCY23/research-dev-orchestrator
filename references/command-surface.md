@@ -1,6 +1,21 @@
-# Command Surface
+# Coordinator Intent Surface
 
-`/rdo` commands are structured natural-language intents for Codex. They are not executable shell slash commands and do not bypass the skill protocol.
+Coordinator intents are structured natural-language requests for Codex. They are not executable shell commands, and they are not registered Codex slash commands.
+
+Use them in either of these forms:
+
+```text
+$research-dev-orchestrator init project=<slug> objective="<text>"
+$research-dev-orchestrator dispatch run=<run-id> task=<task-id> backend=tmux
+```
+
+Or select the skill through `/skills`, then write the same intent in natural language:
+
+```text
+Initialize a run for this repository.
+Dispatch task T001 with the tmux backend.
+Collect status and write SUMMARY.md.
+```
 
 Codex must still obey:
 
@@ -15,12 +30,12 @@ review and merge gates
 
 If required arguments are missing, infer only from clear current run context. Otherwise ask one concise clarification.
 
-## Commands
+## Intents
 
-### /rdo init
+### init
 
 ```text
-/rdo init project=<slug> objective="<text>" [target=<branch>]
+$research-dev-orchestrator init project=<slug> objective="<text>" [target=<branch>]
 ```
 
 Purpose: create a new run scaffold.
@@ -29,10 +44,10 @@ Action: run `scripts/init_run.py`.
 
 Outputs: `RUN.json`, required run artifacts, `EVENTS.ndjson`, `JOURNAL.md`, `SUMMARY.md`.
 
-### /rdo plan
+### plan
 
 ```text
-/rdo plan run=<run-id> [scope=requirements|design|experiment|all]
+$research-dev-orchestrator plan run=<run-id> [scope=requirements|design|experiment|all]
 ```
 
 Purpose: enter planning flow and update planning artifacts.
@@ -50,20 +65,20 @@ REPRODUCIBILITY.md
 
 Do not invent durable design decisions without user confirmation when the choice is material.
 
-### /rdo create-task
+### create-task
 
 ```text
-/rdo create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>]
+$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>]
 ```
 
 Purpose: create a task packet from the current plan/design.
 
 Action: run `scripts/create_task.py`, then fill task context and acceptance details when needed.
 
-### /rdo dispatch
+### dispatch
 
 ```text
-/rdo dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
+$research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
 ```
 
 Purpose: dispatch one task to the configured worker CLI.
@@ -79,12 +94,12 @@ timeout=<secs>   -> RDO_TMUX_WAIT_TIMEOUT_SECONDS=<secs>
 
 Default backend is `plain`. Use `tmux` only when attachable observation is useful.
 
-`.agent-collab/rdo.toml` may define project defaults, but explicit `/rdo dispatch` arguments are one-off overrides and must not rewrite the config file.
+`.agent-collab/rdo.toml` may define project defaults, but explicit dispatch intent arguments are one-off overrides and must not rewrite the config file.
 
-### /rdo status
+### status
 
 ```text
-/rdo status run=<run-id> [json] [summary] [diagnostics]
+$research-dev-orchestrator status run=<run-id> [json] [summary] [diagnostics]
 ```
 
 Purpose: inspect current run state.
@@ -101,10 +116,10 @@ diagnostics  -> --write-diagnostics
 
 `collect_status.py` is read-only except for derived `SUMMARY.md` and diagnostics outputs.
 
-### /rdo review
+### review
 
 ```text
-/rdo review run=<run-id> task=<task-id>
+$research-dev-orchestrator review run=<run-id> task=<task-id>
 ```
 
 Purpose: review a task that is ready for Codex/coordinator review.
@@ -120,14 +135,14 @@ produce findings and recommendation
 Important boundary:
 
 ```text
-/rdo review does not automatically approve.
+review does not automatically approve.
 Only mutate review -> approved, review -> changes_requested, or review -> failed when the user explicitly asks and review gates support it.
 ```
 
-### /rdo recover-lock
+### recover-lock
 
 ```text
-/rdo recover-lock run=<run-id> task=<task-id>
+$research-dev-orchestrator recover-lock run=<run-id> task=<task-id>
 ```
 
 Purpose: handle stale or ambiguous `.dispatch-lock`.
@@ -143,10 +158,10 @@ ask for explicit user confirmation before removing .dispatch-lock
 
 Only after confirmation, run `scripts/remove_dispatch_lock.py --confirmed`.
 
-### /rdo close
+### close
 
 ```text
-/rdo close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
+$research-dev-orchestrator close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
 ```
 
 Purpose: close the current work session and update long-term memory.
