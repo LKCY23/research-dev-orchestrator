@@ -190,14 +190,46 @@ Key files:
 
 See [references/state-machine.md](references/state-machine.md), [references/status-schema.md](references/status-schema.md), [references/attempt-lifecycle.md](references/attempt-lifecycle.md), and [references/events-schema.md](references/events-schema.md) for protocol details.
 
-## Task vs Attempt
+## Execution State Model: Tasks and Attempts
 
-A task is not the same thing as an attempt.
+The execution state model separates work progress from worker execution.
+
+A task is the durable work item: intent, constraints, acceptance criteria, and coordinator-owned progress. An attempt is one bounded worker execution trajectory for that task, materialized as an attempt directory with prompt, runtime metadata, transcript, result, evidence, and handoff.
+
+Coordinator review is the boundary between them: an attempt can provide evidence, but only review can advance task state.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"},"flowchart":{"curve":"basis"}}}%%
+flowchart TB
+  T["Task<br/>intent + acceptance"]:::task
+  TS["Task State<br/>coordinator-owned progress"]:::task
+  A["Attempt<br/>filesystem execution trajectory"]:::attempt
+  E["Evidence + Handoff<br/>tests, logs, outputs"]:::artifact
+  R["Coordinator Review<br/>advance / revise / block / fail"]:::review
+  RS["Run Store<br/>state, attempts, evidence, events"]:::store
+
+  T --> TS
+  TS -- "dispatch / retry" --> A
+  A --> E
+  E --> R
+  R -- "state transition" --> TS
+
+  TS --> RS
+  A --> RS
+  E --> RS
+  R --> RS
+
+  classDef task fill:#eef2ff,stroke:#4f46e5,color:#312e81;
+  classDef attempt fill:#fffbeb,stroke:#d97706,color:#78350f;
+  classDef artifact fill:#ecfdf5,stroke:#059669,color:#064e3b;
+  classDef review fill:#fff1f2,stroke:#e11d48,color:#881337;
+  classDef store fill:#f8fafc,stroke:#475569,color:#0f172a;
+```
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","clusterBkg":"#ffffff","clusterBorder":"#cbd5e1"}}}%%
 flowchart LR
-  subgraph TaskFSM["Task FSM: project progress"]
+  subgraph TaskFSM["Task FSM: work progress"]
     P["pending"]:::task --> R["running"]:::task
     R --> V["review"]:::task
     R --> B["blocked"]:::warn
@@ -210,7 +242,7 @@ flowchart LR
     V --> F
   end
 
-  subgraph AttemptLifecycle["Attempt lifecycle: worker execution"]
+  subgraph AttemptLifecycle["Attempt lifecycle: worker execution trajectory"]
     C["created"]:::attempt --> AR["running"]:::attempt
     AR --> DONE["completed<br/>valid handoff"]:::ok
     AR --> BAD["invalid_handoff<br/>bad or missing handoff"]:::bad
@@ -223,7 +255,7 @@ flowchart LR
   classDef bad fill:#fff1f2,stroke:#e11d48,color:#881337;
 ```
 
-Task state tracks project progress. Attempt state tracks one worker execution. This keeps the task FSM simple while preserving worker execution history. If a worker crashes, writes malformed protocol files, or exits without a valid handoff, the attempt can become `invalid_handoff` without inventing more task states.
+Worker failure affects an attempt first, not the task directly. A completed attempt is review-ready evidence, not automatic task completion. This lets the system retry, inspect, compare, and recover worker executions without losing the task's intent or history.
 
 ## Runtime Backends
 
