@@ -10,7 +10,7 @@ import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
-from protocol import PROTOCOL_VERSION, append_event, render_template, repo_root, run_git, utc_now
+from protocol import PACKAGE_VERSION, PROTOCOL_VERSION, append_event, render_template, repo_root, run_git, utc_now
 
 
 def slugify(value: str) -> str:
@@ -63,6 +63,7 @@ def main() -> int:
     session_id = args.coordinator_session_id or f"codex-{secrets.token_hex(3)}"
     run_json = {
         "run_id": run_id,
+        "package_version": PACKAGE_VERSION,
         "protocol_version": PROTOCOL_VERSION,
         "created_at": created_at,
         "project_slug": project_slug,

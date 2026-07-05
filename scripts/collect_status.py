@@ -12,6 +12,7 @@ from typing import Any
 
 from config import load_config
 from protocol import (  # noqa: E402
+    PACKAGE_VERSION,
     PROTOCOL_VERSION,
     has_substantive_content,
     load_json,
@@ -238,6 +239,13 @@ def collect(
         except json.JSONDecodeError as exc:
             violations.append(f"run: invalid RUN.json: {exc}")
         else:
+            recorded_package = run_json.get("package_version")
+            if not recorded_package:
+                warnings.append("run: RUN.json package_version missing; run may have been created by an older package")
+            elif recorded_package != PACKAGE_VERSION:
+                warnings.append(
+                    f"run: RUN.json package_version {recorded_package!r} differs from installed package version {PACKAGE_VERSION!r}"
+                )
             recorded_protocol = run_json.get("protocol_version")
             if recorded_protocol != PROTOCOL_VERSION:
                 warnings.append(

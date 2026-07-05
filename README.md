@@ -400,6 +400,15 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" \
 
 `SUMMARY.md` is a derived dashboard, not protocol truth. The source of truth remains `RUN.json`, task `STATUS.json`, attempt `ATTEMPT.json`, `EVENTS.ndjson`, `EVIDENCE.md`, `HANDOFF.md`, and `RESULT_LEDGER.md`. Protocol warnings and recovery snapshots are written under `diagnostics/`.
 
+## Versioning
+
+This project tracks two versions in [VERSION](VERSION):
+
+- `PACKAGE_VERSION`: the installable skill/repository release version.
+- `PROTOCOL_VERSION`: the Run Store file protocol version written to `RUN.json`.
+
+A package release declares the protocol version it implements, but patch releases may keep the same protocol version. Protocol version changes only when Run Store schemas, FSM transitions, event formats, or directory layout change.
+
 ## Validation and CI
 
 CI runs automatically on pushes to `main` and on pull requests. It does not require secrets and does not call real model-backed workers.
@@ -431,6 +440,8 @@ SKILL.md                 # Codex skill runtime entrypoint
 README.zh-CN.md          # Simplified Chinese README
 DESIGN_SPEC.md           # Full design baseline and protocol rationale
 LICENSE                  # MIT license
+VERSION                  # Package and Run Store protocol versions
+CHANGELOG.md             # Release history
 references/              # FSM, schemas, review rubric, workflow and memory docs
 scripts/                 # protocol, config, validation, dispatch, collect, close_session
 templates/               # Scaffold source for run and task files

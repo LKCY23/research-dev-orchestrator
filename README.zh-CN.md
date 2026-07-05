@@ -400,6 +400,15 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" \
 
 `SUMMARY.md` 是 derived dashboard，不是 protocol truth。真源仍然是 `RUN.json`、task `STATUS.json`、attempt `ATTEMPT.json`、`EVENTS.ndjson`、`EVIDENCE.md`、`HANDOFF.md` 和 `RESULT_LEDGER.md`。Protocol warnings 和 recovery snapshots 会写到 `diagnostics/`。
 
+## Versioning
+
+本项目在 [VERSION](VERSION) 中记录两类版本：
+
+- `PACKAGE_VERSION`：可安装 skill / repo 的发布版本。
+- `PROTOCOL_VERSION`：写入 `RUN.json` 的 Run Store 文件协议版本。
+
+Package release 会声明它实现的 protocol version，但 patch release 可以保持同一个 protocol version。只有 Run Store schema、FSM transitions、event format 或目录结构变化时，才需要升级 protocol version。
+
 ## Validation and CI
 
 CI 会在 push 到 `main` 和 pull request 时自动运行。它不需要 secrets，也不会调用真实 model-backed workers。
@@ -431,6 +440,8 @@ SKILL.md                 # Codex skill runtime entrypoint
 README.zh-CN.md          # Simplified Chinese README
 DESIGN_SPEC.md           # Full design baseline and protocol rationale
 LICENSE                  # MIT license
+VERSION                  # Package and Run Store protocol versions
+CHANGELOG.md             # Release history
 references/              # FSM, schemas, review rubric, workflow and memory docs
 scripts/                 # protocol, config, validation, dispatch, collect, close_session
 templates/               # Scaffold source for run and task files

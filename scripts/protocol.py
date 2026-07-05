@@ -10,9 +10,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-PROTOCOL_VERSION = "research-dev-orchestrator/v0.1"
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_DIR = SKILL_ROOT / "templates"
+
+
+def load_versions() -> dict[str, str]:
+    versions: dict[str, str] = {}
+    version_path = SKILL_ROOT / "VERSION"
+
+    for raw_line in version_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise RuntimeError(f"Invalid VERSION line: {raw_line!r}")
+        key, value = line.split("=", 1)
+        versions[key.strip()] = value.strip()
+
+    for key in ("PACKAGE_VERSION", "PROTOCOL_VERSION"):
+        if not versions.get(key):
+            raise RuntimeError(f"VERSION missing {key}")
+
+    return versions
+
+
+_VERSIONS = load_versions()
+PACKAGE_VERSION = _VERSIONS["PACKAGE_VERSION"]
+PROTOCOL_VERSION = _VERSIONS["PROTOCOL_VERSION"]
 
 REQUIRED_STATUS_FIELDS = {
     "task_id",

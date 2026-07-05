@@ -60,7 +60,7 @@ worktree_root = ".agent-worktrees"
 
 Do not add `session_id` to this file. Session id is runtime identity and should be passed with `CLAUDE_SESSION_ID` when available.
 
-Do not add `protocol_version`. Protocol version is defined by the installed package in `scripts/protocol.py`, written to `RUN.json`, and audited by `collect_status.py`.
+Do not add `protocol_version` or `package_version`. Versions are defined by the installed package in the top-level `VERSION` file, written to `RUN.json`, and audited by `collect_status.py`.
 
 ## Environment Overrides
 
