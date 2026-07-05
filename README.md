@@ -2,6 +2,8 @@
 
 [![Smoke Tests](https://github.com/LKCY23/research-dev-orchestrator/actions/workflows/smoke.yml/badge.svg)](https://github.com/LKCY23/research-dev-orchestrator/actions/workflows/smoke.yml)
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 A repo-local orchestration protocol for turning research ideas into reproducible experiment code with Codex as the coordinator and CLI coding agents as workers.
 
 Research code often evolves over weeks: requirements shift, baselines change, experiments fail, agents lose context, and results become hard to audit. `research-dev-orchestrator` gives Codex a lightweight way to manage that lifecycle without a server, database, queue, or daemon.
@@ -371,7 +373,9 @@ For local debugging, omit `RDO_KEEP_SMOKE_REPOS=0` to keep temporary smoke-test 
 
 ```text
 SKILL.md                 # Codex skill runtime entrypoint
+README.zh-CN.md          # Simplified Chinese README
 DESIGN_SPEC.md           # Full design baseline and protocol rationale
+LICENSE                  # MIT license
 references/              # FSM, schemas, review rubric, workflow and memory docs
 scripts/                 # protocol, config, validation, dispatch, collect, close_session
 templates/               # Scaffold source for run and task files
@@ -420,4 +424,4 @@ Please do not add a server, daemon, RPC layer, queue, or automatic protocol repa
 
 ## License
 
-TBD.
+MIT. See [LICENSE](LICENSE).
