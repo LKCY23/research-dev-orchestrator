@@ -42,6 +42,8 @@ session_closed
 
 Do not record every small edit. Record events needed to reconstruct the history of requirements, design, dispatch, review, merge, experiments, blockers, and session closeout.
 
+`worker_review_ready`, `worker_blocked`, and `worker_exit_without_valid_status` describe the worker outcome, but the event actor is `dispatch` because dispatch validates the worker's handoff request and applies the terminal task transition. Workers do not write terminal `STATUS.json` transitions directly.
+
 `dispatch_lock_removed` records a user-approved recovery action that removed a stale `.dispatch-lock`. It must include `task_id`, should include `attempt_id` when known, and should include `reason` plus a diagnostics `snapshot` path.
 
 ## Validation

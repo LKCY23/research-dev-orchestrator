@@ -21,6 +21,67 @@ from protocol import (
 from validation import HandoffValidationResult, validate_worker_handoff
 
 
+def reset_status_to_running(status: dict[str, Any]) -> None:
+    """Discard worker-written terminal state and restore dispatch-owned running state."""
+
+    history = status.get("state_history")
+    if not isinstance(history, list):
+        status["state_history"] = []
+        status["state"] = "running"
+        status["previous_state"] = None
+        return
+    running_index = None
+    for idx in range(len(history) - 1, -1, -1):
+        item = history[idx]
+        if isinstance(item, dict) and item.get("to") == "running" and item.get("actor") == "dispatch":
+            running_index = idx
+            break
+    if running_index is not None:
+        del history[running_index + 1 :]
+        item = history[running_index]
+        status["previous_state"] = item.get("from")
+    status["state"] = "running"
+
+
+def apply_dispatch_terminal_transition(
+    status_path: Path,
+    *,
+    target_state: str,
+    actor: str = "dispatch",
+    summary: str = "",
+    needs_coordinator: bool = False,
+    blocker_type: str = "",
+    blocking_reason: str = "",
+    commands_run: list[Any] | None = None,
+) -> None:
+    status = load_json(status_path)
+    if not isinstance(status, dict):
+        raise ValueError("STATUS.json must be a JSON object")
+    reset_status_to_running(status)
+    now = utc_now()
+    status["previous_state"] = "running"
+    status["state"] = target_state
+    status["updated_at"] = now
+    status["owner"] = "claude-code"
+    status["summary"] = summary or status.get("summary", "")
+    status["needs_coordinator"] = needs_coordinator
+    status["blocker_type"] = blocker_type
+    status["blocking_reason"] = blocking_reason
+    evidence = status.get("evidence")
+    if not isinstance(evidence, dict):
+        evidence = {"commands_run": [], "logs": [], "passed": None}
+    if commands_run is not None:
+        evidence["commands_run"] = [str(command) for command in commands_run]
+    status["evidence"] = evidence
+    status.setdefault("state_history", []).append({
+        "from": "running",
+        "to": target_state,
+        "actor": actor,
+        "at": now,
+    })
+    write_json(status_path, status)
+
+
 def add_common_event_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--run-id", required=True)
@@ -39,9 +100,10 @@ def cmd_check_dispatch_transition(args: argparse.Namespace) -> int:
 
 
 def cmd_append_event(args: argparse.Namespace) -> int:
+    dispatch_events = {"task_dispatched", "worker_exit_without_valid_status", "worker_blocked", "worker_review_ready"}
     payload: dict[str, Any] = {
         "at": utc_now(),
-        "actor": "dispatch" if args.event_name in {"task_dispatched", "worker_exit_without_valid_status"} else "claude-code",
+        "actor": "dispatch" if args.event_name in dispatch_events else "claude-code",
         "event": args.event_name,
         "run_id": args.run_id,
         "task_id": args.task_id,
@@ -170,6 +232,17 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
         attempt["handoff_valid"] = False
         attempt["handoff_state"] = None
         write_json(attempt_path, attempt)
+        try:
+            apply_dispatch_terminal_transition(
+                Path(args.status_path),
+                target_state="blocked",
+                summary="Invalid worker handoff",
+                needs_coordinator=True,
+                blocker_type="needs_coordinator",
+                blocking_reason="invalid worker handoff: " + "; ".join(result.reasons[:3]),
+            )
+        except Exception as exc:
+            print(f"- failed to mark task blocked after invalid handoff: {exc}", file=sys.stderr)
         print("worker_exit_without_valid_status", file=sys.stderr)
         for reason in result.reasons:
             print(f"- {reason}", file=sys.stderr)
@@ -179,6 +252,25 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
     attempt["handoff_valid"] = True
     attempt["handoff_state"] = result.handoff_state
     write_json(attempt_path, attempt)
+    request = result.request or {}
+    if result.handoff_state == "blocked":
+        blocker_type = str(request.get("blocker_type") or "")
+        blocking_reason = str(request.get("blocking_reason") or "")
+        needs_coordinator = bool(request.get("needs_coordinator", True))
+    else:
+        blocker_type = ""
+        blocking_reason = ""
+        needs_coordinator = bool(request.get("needs_coordinator", False))
+    commands_run = request.get("commands_run") if isinstance(request.get("commands_run"), list) else None
+    apply_dispatch_terminal_transition(
+        Path(args.status_path),
+        target_state=str(result.handoff_state),
+        summary=str(request.get("summary") or ""),
+        needs_coordinator=needs_coordinator,
+        blocker_type=blocker_type,
+        blocking_reason=blocking_reason,
+        commands_run=commands_run,
+    )
     return 0
 
 

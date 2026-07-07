@@ -86,9 +86,9 @@ Suggested next action
 
 ## HANDOFF.json
 
-`HANDOFF.json` is an optional machine-readable summary index. It does not replace `HANDOFF.md` and must not become the source of truth for review.
+`HANDOFF.json` is the machine-readable transition request. It does not replace `HANDOFF.md`, but it is required for worker terminal handoff in protocol v0.2.
 
-If a worker updates it, set `_template` to `false` and keep fields concise:
+Workers must set `_template` to `false`, choose `requested_state = review|blocked`, and keep fields concise:
 
 ```json
 {
@@ -104,7 +104,7 @@ If a worker updates it, set `_template` to `false` and keep fields concise:
 }
 ```
 
-`collect_status.py` may display this index for dashboards and summaries. Invalid or missing `HANDOFF.json` must not invalidate a handoff by itself; `HANDOFF.md`, `EVIDENCE.md`, `STATUS.json`, and `ATTEMPT.json` remain the required protocol files.
+Dispatch validates this request and applies `STATUS.json` terminal transitions. Workers must not edit `STATUS.json` directly. `collect_status.py` may also display this index for dashboards and summaries.
 
 ## Fix Routing
 

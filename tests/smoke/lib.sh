@@ -63,7 +63,6 @@ make_review_worker() {
 set -euo pipefail
 prompt="$(mktemp)"
 cat > "${prompt}"
-STATUS_PATH="$(awk -F': ' '/^- STATUS_PATH:/ {print $2}' "${prompt}")"
 EVIDENCE_PATH="$(awk -F': ' '/^- EVIDENCE_PATH:/ {print $2}' "${prompt}")"
 HANDOFF_PATH="$(awk -F': ' '/^- HANDOFF_PATH:/ {print $2}' "${prompt}")"
 HANDOFF_JSON_PATH="$(awk -F': ' '/^- HANDOFF_JSON_PATH:/ {print $2}' "${prompt}")"
@@ -84,24 +83,37 @@ if [[ -n "${HANDOFF_JSON_PATH}" ]]; then
 }
 JSON
 fi
-python3 - "${STATUS_PATH}" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
+SH
+  chmod +x "${path}"
+}
 
-path = sys.argv[1]
-status = json.load(open(path, encoding="utf-8"))
-now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-old = status["state"]
-status["previous_state"] = old
-status["state"] = "review"
-status["updated_at"] = now
-status["owner"] = "claude-code"
-status.setdefault("state_history", []).append({"from": old, "to": "review", "actor": "claude-code", "at": now})
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(status, handle, indent=2)
-    handle.write("\n")
-PY
+make_blocked_worker() {
+  local path="$1"
+  local blocker_type="${2:-needs_coordinator}"
+  local reason="${3:-smoke blocker}"
+  cat > "${path}" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+prompt="\$(mktemp)"
+cat > "\${prompt}"
+EVIDENCE_PATH="\$(awk -F': ' '/^- EVIDENCE_PATH:/ {print \$2}' "\${prompt}")"
+HANDOFF_PATH="\$(awk -F': ' '/^- HANDOFF_PATH:/ {print \$2}' "\${prompt}")"
+HANDOFF_JSON_PATH="\$(awk -F': ' '/^- HANDOFF_JSON_PATH:/ {print \$2}' "\${prompt}")"
+printf '# Evidence\n\n## Commands Run\n- smoke blocked\n\n## Tests Passed\n- no\n' > "\${EVIDENCE_PATH}"
+printf '# Handoff\n\n## What Failed\n- ${reason}\n\n## Decision Needed\n- coordinator triage\n' > "\${HANDOFF_PATH}"
+cat > "\${HANDOFF_JSON_PATH}" <<'JSON'
+{
+  "_template": false,
+  "requested_state": "blocked",
+  "summary": "smoke worker blocked",
+  "commands_run": ["smoke blocked"],
+  "files_changed": [],
+  "known_limitations": ["blocked"],
+  "needs_coordinator": true,
+  "blocker_type": "${blocker_type}",
+  "blocking_reason": "${reason}"
+}
+JSON
 SH
   chmod +x "${path}"
 }

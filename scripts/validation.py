@@ -19,6 +19,7 @@ from protocol import (
     has_substantive_content,
     is_int_not_bool,
     is_non_empty_string,
+    load_json,
     parse_iso,
 )
 
@@ -29,6 +30,7 @@ class HandoffValidationResult:
     handoff_state: str | None
     exit_code: int | None
     reasons: list[str]
+    request: dict[str, Any] | None = None
 
 
 def parse_exit_code(exit_code_raw: str) -> tuple[int | None, str | None]:
@@ -36,6 +38,33 @@ def parse_exit_code(exit_code_raw: str) -> tuple[int | None, str | None]:
         return int(exit_code_raw), None
     except (TypeError, ValueError):
         return None, f"exit_code must be an integer, got {exit_code_raw!r}"
+
+
+def load_handoff_request(task_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """Load and validate the worker's HANDOFF.json transition request."""
+
+    path = task_dir / "HANDOFF.json"
+    if not path.exists():
+        return None, ["HANDOFF.json is required for terminal worker handoff"]
+    try:
+        request = load_json(path)
+    except Exception as exc:
+        return None, [f"HANDOFF.json is not valid JSON: {exc}"]
+    if not isinstance(request, dict):
+        return None, ["HANDOFF.json must be a JSON object"]
+    if request.get("_template") is True:
+        return None, ["HANDOFF.json still has _template=true"]
+
+    reasons: list[str] = []
+    requested_state = request.get("requested_state")
+    if requested_state not in {"review", "blocked"}:
+        reasons.append(f"HANDOFF.json requested_state must be review or blocked, got {requested_state!r}")
+    for field in ("commands_run", "files_changed", "known_limitations"):
+        if field in request and not isinstance(request.get(field), list):
+            reasons.append(f"HANDOFF.json {field} must be a list")
+    if "needs_coordinator" in request and not isinstance(request.get("needs_coordinator"), bool):
+        reasons.append("HANDOFF.json needs_coordinator must be boolean")
+    return request, reasons
 
 
 def validate_status_schema(status: Any, fsm: dict[str, Any], task_name: str) -> list[str]:
@@ -258,17 +287,20 @@ def validate_worker_handoff(
     task_dir: Path,
     exit_code_raw: str,
 ) -> HandoffValidationResult:
-    """Validate the worker's running -> review|blocked handoff.
+    """Validate the worker's requested running -> review|blocked handoff.
 
     This is the shared rule set for dispatch-time handoff gating and
-    collect_status review/blocked audit checks. It does not mutate protocol
-    files.
+    terminal audit checks. It does not mutate protocol files. Workers request
+    terminal state through HANDOFF.json; dispatch applies STATUS transitions.
     """
 
     reasons: list[str] = []
     exit_code, exit_code_error = parse_exit_code(exit_code_raw)
     if exit_code_error:
         reasons.append(exit_code_error)
+    request, request_reasons = load_handoff_request(task_dir)
+    reasons.extend(request_reasons)
+    requested_state = request.get("requested_state") if isinstance(request, dict) else None
 
     if not isinstance(status, dict):
         return HandoffValidationResult(
@@ -276,54 +308,53 @@ def validate_worker_handoff(
             handoff_state=None,
             exit_code=exit_code,
             reasons=[*reasons, "STATUS.json must be a JSON object"],
+            request=request,
         )
 
     state = status.get("state")
-    if state not in {"review", "blocked"}:
-        reasons.append(f"STATUS.state must be review or blocked, got {state!r}")
+    if state != "running":
+        reasons.append(f"STATUS.state must remain running until dispatch applies handoff, got {state!r}")
 
     if status.get("current_attempt_id") != attempt_id:
         reasons.append(
             f"STATUS.current_attempt_id {status.get('current_attempt_id')!r} does not match attempt_id {attempt_id!r}"
         )
 
-    if status.get("previous_state") != "running":
-        reasons.append(f"STATUS.previous_state must be running, got {status.get('previous_state')!r}")
-
     history = status.get("state_history") if isinstance(status.get("state_history"), list) else []
     last_transition = history[-1] if history else {}
     valid_history = (
         isinstance(last_transition, dict)
-        and last_transition.get("from") == "running"
-        and last_transition.get("to") == state
-        and last_transition.get("actor") == "claude-code"
+        and last_transition.get("to") == "running"
+        and last_transition.get("actor") == "dispatch"
         and parse_iso(last_transition.get("at")) is not None
     )
     if not valid_history:
-        reasons.append("state_history must end with running -> review|blocked by actor claude-code with valid timestamp")
+        reasons.append("state_history must show dispatch moved the task into running before worker handoff")
 
     handoff_ok = has_substantive_content(task_dir / "HANDOFF.md")
     evidence_ok = has_substantive_content(task_dir / "EVIDENCE.md")
 
-    if state == "review":
+    if requested_state == "review":
         if exit_code != 0:
             reasons.append(f"review handoff requires exit_code 0, got {exit_code!r}")
         if not handoff_ok:
             reasons.append("review handoff requires substantive HANDOFF.md")
         if not evidence_ok:
             reasons.append("review handoff requires substantive EVIDENCE.md")
-    elif state == "blocked":
+    elif requested_state == "blocked":
         if not handoff_ok:
             reasons.append("blocked handoff requires substantive HANDOFF.md")
-        blocker_type = status.get("blocker_type")
+        blocker_type = request.get("blocker_type") if isinstance(request, dict) else None
         if blocker_type not in BLOCKER_TYPES:
             reasons.append(f"blocked handoff requires blocker_type in {sorted(BLOCKER_TYPES)}, got {blocker_type!r}")
-        if not status.get("blocking_reason"):
+        blocking_reason = request.get("blocking_reason") if isinstance(request, dict) else None
+        if not blocking_reason:
             reasons.append("blocked handoff requires non-empty blocking_reason")
 
     return HandoffValidationResult(
         valid=not reasons,
-        handoff_state=state if state in {"review", "blocked"} else None,
+        handoff_state=requested_state if requested_state in {"review", "blocked"} else None,
         exit_code=exit_code,
         reasons=reasons,
+        request=request,
     )

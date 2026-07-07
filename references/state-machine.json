@@ -15,8 +15,8 @@
       "running": ["dispatch"]
     },
     "running": {
-      "review": ["claude-code"],
-      "blocked": ["claude-code"]
+      "review": ["dispatch"],
+      "blocked": ["dispatch"]
     },
     "blocked": {
       "running": ["dispatch"],

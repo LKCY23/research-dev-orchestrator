@@ -22,11 +22,11 @@ from protocol import (  # noqa: E402
     utc_now,
 )
 from validation import (
+    load_handoff_request,
     validate_attempt_schema,
     validate_event,
     validate_state_history,
     validate_status_schema,
-    validate_worker_handoff,
 )
 
 
@@ -56,7 +56,7 @@ def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[
 
 
 def load_handoff_index(task_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
-    """Load optional HANDOFF.json as a non-authoritative summary index."""
+    """Load HANDOFF.json for summaries; terminal-state validation is stricter."""
 
     path = task_dir / "HANDOFF.json"
     if not path.exists():
@@ -183,13 +183,34 @@ def validate_attempt(
                         )
     elif dispatch_lock.exists():
         violations.append(f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}")
-    if state in {"review", "blocked"}:
-        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != state:
-            violations.append(f"{task_dir.name}: STATUS {state} requires completed attempt with handoff_state={state}")
-        exit_code_raw = "" if attempt.get("exit_code") is None else str(attempt.get("exit_code"))
-        handoff_result = validate_worker_handoff(status, str(attempt_id), task_dir, exit_code_raw)
-        for reason in handoff_result.reasons:
-            violations.append(f"{task_dir.name}: handoff validation failed: {reason}")
+    if state == "review":
+        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "review":
+            violations.append(f"{task_dir.name}: STATUS review requires completed attempt with handoff_state=review")
+        if attempt.get("exit_code") != 0:
+            violations.append(f"{task_dir.name}: STATUS review requires worker exit_code=0")
+        if not has_substantive_content(task_dir / "HANDOFF.md"):
+            violations.append(f"{task_dir.name}: STATUS review requires substantive HANDOFF.md")
+        if not has_substantive_content(task_dir / "EVIDENCE.md"):
+            violations.append(f"{task_dir.name}: STATUS review requires substantive EVIDENCE.md")
+        request, request_reasons = load_handoff_request(task_dir)
+        for reason in request_reasons:
+            violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
+        if isinstance(request, dict) and request.get("requested_state") != "review":
+            violations.append(f"{task_dir.name}: STATUS review requires HANDOFF.json requested_state=review")
+    elif state == "blocked":
+        if attempt_state == "completed":
+            if attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "blocked":
+                violations.append(f"{task_dir.name}: completed blocked task requires handoff_state=blocked")
+            request, request_reasons = load_handoff_request(task_dir)
+            for reason in request_reasons:
+                violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
+            if isinstance(request, dict) and request.get("requested_state") != "blocked":
+                violations.append(f"{task_dir.name}: STATUS blocked requires HANDOFF.json requested_state=blocked")
+        elif attempt_state == "invalid_handoff":
+            if status.get("blocker_type") != "needs_coordinator":
+                violations.append(f"{task_dir.name}: invalid_handoff blocked task requires blocker_type=needs_coordinator")
+        else:
+            violations.append(f"{task_dir.name}: STATUS blocked requires completed or invalid_handoff attempt")
 
     return violations, warnings, attempt
 

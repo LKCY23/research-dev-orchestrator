@@ -12,7 +12,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 ## Core Rules
 
 - Codex owns intent: requirements, experiment design, architecture decisions, task decomposition, acceptance criteria, review, and merge decisions.
-- Workers own execution: implement only assigned task packets, write evidence, and transition tasks only from `running` to `review` or `blocked`.
+- Workers own execution: implement only assigned task packets and write evidence plus a `HANDOFF.json` transition request. Workers must not edit `STATUS.json` terminal state.
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.
@@ -118,7 +118,7 @@ Read `references/command-surface.md` before acting on these intents. `review` do
 
 `dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; `dispatch_claude.sh` remains responsible for locks, worktrees, process supervision, and handoff validation.
 
-`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid terminal handoff state. It loads operational defaults from config before any protocol mutation, but explicit env vars still win. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and must not synthesize `review` or `blocked` for the worker. A `review` handoff requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid.
+`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid `HANDOFF.json` terminal request. It loads operational defaults from config before any protocol mutation, but explicit env vars still win. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and applies validated `running -> review|blocked` terminal transitions. A `review` request requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
 
 Worker backend configuration:
 
@@ -153,7 +153,7 @@ Use these files to recover context after days or weeks:
 - `reviews/*`: Codex review records.
 - `tasks/*/attempts/*`: worker execution records.
 
-`HANDOFF.json` is an optional machine-readable index for worker handoff summaries. It does not replace `HANDOFF.md`; invalid or missing `HANDOFF.json` should not by itself invalidate a task handoff.
+`HANDOFF.json` is the machine-readable worker handoff request. It does not replace `HANDOFF.md`; dispatch validates it and applies terminal task state transitions.
 
 Do not force a separate `DECISIONS.md` in the first version. Put non-architecture session decisions and tradeoffs in `JOURNAL.md`; add ADRs only when a decision should be durable architecture/design record.
 

@@ -45,7 +45,7 @@
    需求、实验设计、任务拆分、验收标准、review 和 merge 决策都由 coordinator 负责。
 
 2. **Workers own execution**
-   Worker 接收一个 task packet，在一个 branch/worktree 中工作，并写入 evidence 和 handoff。
+   Worker 接收一个 task packet，在一个 branch/worktree 中工作，并写入 evidence 和 handoff request。最终的 `STATUS.json` 终态 transition 由 dispatch 负责。
 
 3. **Filesystem is the protocol**
    Agent 之间通过 repo-local 文件通信，例如 `STATUS.json`、`ATTEMPT.json`、`EVENTS.ndjson` 和 `JOURNAL.md`。
@@ -192,7 +192,7 @@ requirements
 - `dashboard.html`：由 `render_dashboard.py` 生成的人类可读 derived monitor。
 - `EVIDENCE.md`：commands、tests、metrics、outputs 和 logs。
 - `HANDOFF.md`：worker handoff summary 和 known limitations。
-- `HANDOFF.json`：可选的机器可读 handoff summary index。
+- `HANDOFF.json`：worker 请求进入 `review` 或 `blocked` 的机器可读 handoff request。
 
 协议细节见 [references/state-machine.md](references/state-machine.md)、[references/status-schema.md](references/status-schema.md)、[references/attempt-lifecycle.md](references/attempt-lifecycle.md) 和 [references/events-schema.md](references/events-schema.md)。
 
@@ -200,9 +200,9 @@ requirements
 
 执行状态模型把 work progress 和 worker execution 分开。
 
-Task 是持久化工作项：intent、constraints、acceptance criteria，以及 coordinator-owned progress。Attempt 是某个 task 下的一次有边界 worker execution trajectory，以 attempt directory 的形式物化，包含 prompt、runtime metadata、transcript、result、evidence 和 handoff。
+Task 是持久化工作项：intent、constraints、acceptance criteria，以及 coordinator-owned progress。Attempt 是某个 task 下的一次有边界 worker execution trajectory，以 attempt directory 的形式物化，包含 prompt、runtime metadata、transcript、result、evidence 和 handoff request。
 
-Coordinator review 是两者之间的边界：attempt 可以提供 evidence，但只有 review 可以推进 task state。
+Dispatch 是 worker execution 和 task state 之间的边界：attempt 可以请求进入 `review` 或 `blocked`，但必须由 dispatch 校验后才能修改 `STATUS.json`。Coordinator review 则是后续 `review -> approved|changes_requested|failed` 的边界。
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"},"flowchart":{"curve":"basis"}}}%%
@@ -410,7 +410,7 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" \
   --write-summary
 ```
 
-`dashboard.html` 和 `SUMMARY.md` 是 derived monitors，不是 protocol truth。真源仍然是 `RUN.json`、task `STATUS.json`、attempt `ATTEMPT.json`、`EVENTS.ndjson`、`EVIDENCE.md`、`HANDOFF.md` 和 `RESULT_LEDGER.md`。可选的 `HANDOFF.json` 只是 summary/dashboard 使用的非权威索引。Protocol warnings 和 recovery snapshots 会写到 `diagnostics/`。
+`dashboard.html` 和 `SUMMARY.md` 是 derived monitors，不是 protocol truth。真源仍然是 `RUN.json`、task `STATUS.json`、attempt `ATTEMPT.json`、`EVENTS.ndjson`、`EVIDENCE.md`、`HANDOFF.md`、`HANDOFF.json` 和 `RESULT_LEDGER.md`。Protocol warnings 和 recovery snapshots 会写到 `diagnostics/`。
 
 ## Versioning
 

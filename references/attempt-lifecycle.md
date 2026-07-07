@@ -75,8 +75,8 @@ runtime.attach_command: required when runtime.backend = tmux
 
 - `created`: `ATTEMPT.json` exists, but the worker has not been launched yet. This should be brief; stale `created` attempts should be reported as warnings.
 - `running`: the worker process is executing.
-- `completed`: the worker exited and made a valid protocol handoff to `review` or `blocked`.
-- `invalid_handoff`: the worker exited but did not produce a legal status/evidence/handoff.
+- `completed`: the worker exited, wrote a valid `HANDOFF.json` request, and dispatch applied the requested terminal task state.
+- `invalid_handoff`: the worker exited but did not produce a legal handoff request, evidence bundle, or process result.
 
 If a tmux runner writes an empty or non-integer `exit_code` file, classify the attempt as `invalid_handoff`, set `ended_at`, leave `exit_code = null`, append `worker_exit_without_valid_status`, and release `.dispatch-lock` after diagnostics.
 
@@ -89,7 +89,7 @@ Do not use attempt state to represent task success. `completed` means the attemp
 `handoff_valid` must be:
 
 ```text
-true   when the worker legally moved STATUS.state to review or blocked and wrote required artifacts
+true   when dispatch validated HANDOFF.json and applied STATUS.state to review or blocked
 false  when the worker exited without a legal handoff
 null   before handoff validation
 ```
@@ -122,7 +122,8 @@ LOCK.attempt_id == current_attempt_id
 ATTEMPT.state = completed
 ATTEMPT.handoff_valid = true
 ATTEMPT.handoff_state = review
-STATUS.state_history ends with running -> review by actor claude-code
+HANDOFF.json exists with _template=false and requested_state=review
+STATUS.state_history ends with running -> review by actor dispatch
 STATUS.previous_state = running
 worker exit_code = 0
 EVIDENCE.md has substantive content
@@ -132,18 +133,27 @@ HANDOFF.md has substantive content
 `STATUS.state = blocked` requires:
 
 ```text
-ATTEMPT.state = completed
-ATTEMPT.handoff_valid = true
-ATTEMPT.handoff_state = blocked
-STATUS.state_history ends with running -> blocked by actor claude-code
+Either:
+  ATTEMPT.state = completed
+  ATTEMPT.handoff_valid = true
+  ATTEMPT.handoff_state = blocked
+  HANDOFF.json exists with _template=false and requested_state=blocked
+  HANDOFF.md has substantive content
+  worker exit_code may be zero or nonzero
+or:
+  ATTEMPT.state = invalid_handoff
+  ATTEMPT.handoff_valid = false
+  blocker_type = needs_coordinator
+  blocking_reason explains the invalid handoff
+STATUS.state_history ends with running -> blocked by actor dispatch
 STATUS.previous_state = running
-worker exit_code may be zero or nonzero
-HANDOFF.md has substantive content
 blocker_type in [needs_coordinator, needs_user, environment, budget, irrecoverable]
 blocking_reason non-empty
 ```
 
-If `STATUS.state = running` and `ATTEMPT.state` is `completed` or `invalid_handoff`, report a protocol violation. Codex must inspect the attempt and decide whether to re-dispatch, request changes, mark blocked, or fail the task.
+If a worker mutates `STATUS.json` directly, dispatch must not trust that terminal state. It should mark the attempt `invalid_handoff`, move the task to `blocked` with `blocker_type = needs_coordinator`, and leave evidence for coordinator triage.
+
+If `STATUS.state = running` and `ATTEMPT.state` is `completed` or `invalid_handoff`, report a protocol violation. Dispatch normally moves terminal attempts to `review` or `blocked`; a running task with a terminal attempt means supervision or protocol mutation failed.
 
 For `runtime.backend = tmux`, if `attempts/<current_attempt_id>/exit_code` exists while `STATUS.state = running` and `ATTEMPT.state = running`, classify it by supervision evidence:
 

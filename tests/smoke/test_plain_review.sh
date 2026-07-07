@@ -13,3 +13,14 @@ CLAUDE_CODE_CMD="${worker}" "${RDO_ROOT}/scripts/dispatch_claude.sh" smoke-run T
 collect_json smoke-run "${repo}/status.json"
 assert_json_expr "${repo}/status.json" "payload['valid'] is True"
 assert_json_expr "${repo}/status.json" "payload['tasks'][0]['state'] == 'review'"
+assert_json_expr "${repo}/status.json" "payload['tasks'][0]['handoff_index']['requested_state'] == 'review'"
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+task = Path(".agent-collab/runs/smoke-run/tasks/T001-plain")
+status = json.load(open(task / "STATUS.json", encoding="utf-8"))
+assert status["state_history"][-1]["from"] == "running"
+assert status["state_history"][-1]["to"] == "review"
+assert status["state_history"][-1]["actor"] == "dispatch"
+PY
