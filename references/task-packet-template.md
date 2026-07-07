@@ -10,6 +10,7 @@ CONTEXT.md
 ACCEPTANCE.md
 STATUS.json
 HANDOFF.md
+HANDOFF.json
 EVIDENCE.md
 logs/
 attempts/
@@ -50,11 +51,14 @@ Include:
 ```text
 Required commands
 Expected outputs
+Smoke tests
 Metrics or thresholds
-Smoke test
-Failure handoff condition
+Merge preconditions
+Failure handoff conditions
 Post-merge smoke test, if required
 ```
+
+Treat this file as the review gate recipe. It should answer what the worker must run, what artifacts must exist, what thresholds matter, and what Codex must verify before approval or merge.
 
 ## EVIDENCE.md
 
@@ -79,6 +83,28 @@ Evidence
 Decision needed
 Suggested next action
 ```
+
+## HANDOFF.json
+
+`HANDOFF.json` is an optional machine-readable summary index. It does not replace `HANDOFF.md` and must not become the source of truth for review.
+
+If a worker updates it, set `_template` to `false` and keep fields concise:
+
+```json
+{
+  "_template": false,
+  "requested_state": "review",
+  "summary": "Implemented loader and added tests.",
+  "commands_run": ["pytest -q tests/test_loader.py"],
+  "files_changed": ["src/loader.py", "tests/test_loader.py"],
+  "known_limitations": [],
+  "needs_coordinator": false,
+  "blocker_type": "",
+  "blocking_reason": ""
+}
+```
+
+`collect_status.py` may display this index for dashboards and summaries. Invalid or missing `HANDOFF.json` must not invalidate a handoff by itself; `HANDOFF.md`, `EVIDENCE.md`, `STATUS.json`, and `ATTEMPT.json` remain the required protocol files.
 
 ## Fix Routing
 

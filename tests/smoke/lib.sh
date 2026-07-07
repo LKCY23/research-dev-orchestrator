@@ -66,8 +66,24 @@ cat > "${prompt}"
 STATUS_PATH="$(awk -F': ' '/^- STATUS_PATH:/ {print $2}' "${prompt}")"
 EVIDENCE_PATH="$(awk -F': ' '/^- EVIDENCE_PATH:/ {print $2}' "${prompt}")"
 HANDOFF_PATH="$(awk -F': ' '/^- HANDOFF_PATH:/ {print $2}' "${prompt}")"
+HANDOFF_JSON_PATH="$(awk -F': ' '/^- HANDOFF_JSON_PATH:/ {print $2}' "${prompt}")"
 printf '# Evidence\n\n## Commands Run\n- smoke\n\n## Tests Passed\n- yes\n' > "${EVIDENCE_PATH}"
 printf '# Handoff\n\n## What Changed\n- smoke worker completed\n' > "${HANDOFF_PATH}"
+if [[ -n "${HANDOFF_JSON_PATH}" ]]; then
+  cat > "${HANDOFF_JSON_PATH}" <<'JSON'
+{
+  "_template": false,
+  "requested_state": "review",
+  "summary": "smoke worker completed",
+  "commands_run": ["smoke"],
+  "files_changed": ["file.txt"],
+  "known_limitations": [],
+  "needs_coordinator": false,
+  "blocker_type": "",
+  "blocking_reason": ""
+}
+JSON
+fi
 python3 - "${STATUS_PATH}" <<'PY'
 import json
 import sys

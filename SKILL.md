@@ -16,7 +16,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.
-- `SUMMARY.md` and `diagnostics/` are derived monitor artifacts, not sources of truth.
+- `SUMMARY.md`, `dashboard.html`, and `diagnostics/` are derived monitor artifacts, not sources of truth.
 - `EVENTS.ndjson` and `JOURNAL.md` are required long-term memory artifacts. Use them to preserve cross-session history without adding a heavier decision database.
 - Task FSM stays about task progress only. `ATTEMPT.json` owns worker execution lifecycle. `collect_status.py` validates invariants across status, attempt, lock, events, evidence, and handoff files.
 - `scripts/protocol.py` is the script-internal source for protocol constants and low-level helpers. `scripts/validation.py` owns shared protocol validation rules used by online dispatch gates and offline status audit. Neither file is a user interface or public SDK.
@@ -34,7 +34,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 5. Create a run with `scripts/init_run.py` if no run exists.
 6. Create tasks with `scripts/create_task.py`.
 7. Dispatch worker tasks with `scripts/dispatch_claude.sh` only when task states allow dispatch.
-8. Collect state with `scripts/collect_status.py`; use `--json` for machine consumers and `--write-summary` for `SUMMARY.md`.
+8. Collect state with `scripts/collect_status.py`; use `--json` for machine consumers and `--write-summary` for `SUMMARY.md`. Use `scripts/render_dashboard.py` when the user wants a visual run monitor.
 9. Review tasks manually using `references/review-rubric.md`.
 10. Only mark `approved` after diff review, evidence review, mergeability verification, and required integration smoke tests pass.
 11. Merge only approved tasks, then record post-merge smoke results when required by `ACCEPTANCE.md`.
@@ -80,6 +80,7 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-diagnostics
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/render_dashboard.py" --run-id <run-id>
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/config_cli.py" validate
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/remove_dispatch_lock.py" --run-id <run-id> --task-id <task-id> --reason "<approved reason>" --confirmed
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-id> --summary "<session summary>" --changed "<change>" --next-action "<next>"
@@ -95,7 +96,7 @@ $research-dev-orchestrator init project=<slug> objective="<text>" [target=<branc
 $research-dev-orchestrator plan run=<run-id> [scope=requirements|design|experiment|all]
 $research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>]
 $research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
-$research-dev-orchestrator status run=<run-id> [json] [summary] [diagnostics]
+$research-dev-orchestrator status run=<run-id> [json] [summary] [dashboard] [diagnostics]
 $research-dev-orchestrator review run=<run-id> task=<task-id>
 $research-dev-orchestrator recover-lock run=<run-id> task=<task-id>
 $research-dev-orchestrator close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
@@ -131,6 +132,8 @@ RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
 
 `collect_status.py` is read-only by default. It must not modify `STATUS.json`, delete locks, change FSM state, or repair violations. `--write-summary` may update only `SUMMARY.md`; `--write-diagnostics` may write only diagnostics files.
 
+`render_dashboard.py` writes only derived `dashboard.html` by reading the same status report as `collect_status.py`. It must not mutate protocol truth.
+
 `remove_dispatch_lock.py` is a user-approved mechanical recovery tool. Use it only after a Lock Recovery Review and explicit user confirmation. It snapshots `.dispatch-lock`, removes only `.dispatch-lock`, and appends `dispatch_lock_removed`; it must not modify `STATUS.json`, `ATTEMPT.json`, `LOCK`, `HANDOFF.md`, `EVIDENCE.md`, or FSM state.
 
 `close_session.py` is the standard session closeout command. It updates derived `SUMMARY.md`, appends a human-readable `JOURNAL.md` entry, and appends a `session_closed` event to `EVENTS.ndjson`.
@@ -142,12 +145,15 @@ RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
 Use these files to recover context after days or weeks:
 
 - `SUMMARY.md`: current dashboard; derived and regenerable.
+- `dashboard.html`: visual run monitor; derived and regenerable.
 - `EVENTS.ndjson`: append-only machine-readable timeline; required.
 - `JOURNAL.md`: append-only human-readable session memory; required.
 - `RESULT_LEDGER.md`: experiment results and claim support.
 - `ADR/*`: durable architecture/design decisions only.
 - `reviews/*`: Codex review records.
 - `tasks/*/attempts/*`: worker execution records.
+
+`HANDOFF.json` is an optional machine-readable index for worker handoff summaries. It does not replace `HANDOFF.md`; invalid or missing `HANDOFF.json` should not by itself invalidate a task handoff.
 
 Do not force a separate `DECISIONS.md` in the first version. Put non-architecture session decisions and tradeoffs in `JOURNAL.md`; add ADRs only when a decision should be durable architecture/design record.
 
@@ -158,6 +164,7 @@ Before changing `review -> approved`, verify all of the following:
 - The diff stays within `allowed_paths` and avoids `forbidden_paths`.
 - `EVIDENCE.md`, logs, and `STATUS.json.evidence` are consistent enough to support `ACCEPTANCE.md`.
 - Required commands and metrics passed, or failures are explicitly scoped and acceptable.
+- `ACCEPTANCE.md` lists review gate recipes: required commands, smoke tests, expected outputs, metrics or thresholds, merge preconditions, and failure handoff conditions.
 - The task branch is mergeable into the target branch, preferably with a dry-run or temporary integration worktree.
 - Required integration smoke tests pass.
 - No unresolved blocker, stale lock ambiguity, or protocol violation remains.

@@ -93,7 +93,7 @@ def main() -> int:
         "WORKTREE": worktree,
     }
     (task_dir / "TASK.md").write_text(render_template("task/TASK.md", task_values), encoding="utf-8")
-    for filename in ["CONTEXT.md", "ACCEPTANCE.md", "HANDOFF.md", "EVIDENCE.md"]:
+    for filename in ["CONTEXT.md", "ACCEPTANCE.md", "HANDOFF.md", "HANDOFF.json", "EVIDENCE.md"]:
         (task_dir / filename).write_text(render_template(f"task/{filename}"), encoding="utf-8")
     append_event(
         run_dir,

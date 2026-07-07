@@ -159,6 +159,7 @@ requirements
     <run-id>/
       RUN.json
       SUMMARY.md
+      dashboard.html
       EVENTS.ndjson
       JOURNAL.md
       EXPERIMENT_PLAN.md
@@ -172,6 +173,7 @@ requirements
           STATUS.json
           EVIDENCE.md
           HANDOFF.md
+          HANDOFF.json
           attempts/
             <attempt-id>/
               ATTEMPT.json
@@ -187,8 +189,10 @@ requirements
 - `EVENTS.ndjson`：append-only 的机器可读 timeline。
 - `JOURNAL.md`：人类可读的 session memory。
 - `SUMMARY.md`：由 `collect_status.py` 生成的 derived dashboard。
+- `dashboard.html`：由 `render_dashboard.py` 生成的人类可读 derived monitor。
 - `EVIDENCE.md`：commands、tests、metrics、outputs 和 logs。
 - `HANDOFF.md`：worker handoff summary 和 known limitations。
+- `HANDOFF.json`：可选的机器可读 handoff summary index。
 
 协议细节见 [references/state-machine.md](references/state-machine.md)、[references/status-schema.md](references/status-schema.md)、[references/attempt-lifecycle.md](references/attempt-lifecycle.md) 和 [references/events-schema.md](references/events-schema.md)。
 
@@ -386,13 +390,19 @@ Operational defaults 位于 `.agent-collab/rdo.toml`，但 protocol truth 不可
 
 ## Monitoring
 
-项目提供三层 monitor：
+项目提供四层 monitor：
 
-- Human-readable monitor：`.agent-collab/runs/<run-id>/SUMMARY.md`。
+- Visual monitor：`.agent-collab/runs/<run-id>/dashboard.html`。
+- Human-readable summary：`.agent-collab/runs/<run-id>/SUMMARY.md`。
 - Interactive monitor：`python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>`。
 - Machine-readable monitor：`python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json`。
 
-用下面的命令重新生成人类可读 summary：
+用下面的命令重新生成 visual dashboard 和人类可读 summary：
+
+```bash
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/render_dashboard.py" \
+  --run-id <run-id>
+```
 
 ```bash
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" \
@@ -400,7 +410,7 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" \
   --write-summary
 ```
 
-`SUMMARY.md` 是 derived dashboard，不是 protocol truth。真源仍然是 `RUN.json`、task `STATUS.json`、attempt `ATTEMPT.json`、`EVENTS.ndjson`、`EVIDENCE.md`、`HANDOFF.md` 和 `RESULT_LEDGER.md`。Protocol warnings 和 recovery snapshots 会写到 `diagnostics/`。
+`dashboard.html` 和 `SUMMARY.md` 是 derived monitors，不是 protocol truth。真源仍然是 `RUN.json`、task `STATUS.json`、attempt `ATTEMPT.json`、`EVENTS.ndjson`、`EVIDENCE.md`、`HANDOFF.md` 和 `RESULT_LEDGER.md`。可选的 `HANDOFF.json` 只是 summary/dashboard 使用的非权威索引。Protocol warnings 和 recovery snapshots 会写到 `diagnostics/`。
 
 ## Versioning
 

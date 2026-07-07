@@ -99,7 +99,7 @@ Default backend is `plain`. Use `tmux` only when attachable observation is usefu
 ### status
 
 ```text
-$research-dev-orchestrator status run=<run-id> [json] [summary] [diagnostics]
+$research-dev-orchestrator status run=<run-id> [json] [summary] [dashboard] [diagnostics]
 ```
 
 Purpose: inspect current run state.
@@ -111,10 +111,12 @@ Mapping:
 ```text
 json         -> --json
 summary      -> --write-summary
+dashboard    -> scripts/render_dashboard.py --run-id <run-id>
 diagnostics  -> --write-diagnostics
 ```
 
 `collect_status.py` is read-only except for derived `SUMMARY.md` and diagnostics outputs.
+`render_dashboard.py` writes only derived `dashboard.html`.
 
 ### review
 

@@ -55,6 +55,43 @@ def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[
     return events, violations, warnings
 
 
+def load_handoff_index(task_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    """Load optional HANDOFF.json as a non-authoritative summary index."""
+
+    path = task_dir / "HANDOFF.json"
+    if not path.exists():
+        return None, []
+    try:
+        payload = load_json(path)
+    except json.JSONDecodeError as exc:
+        return None, [f"{task_dir.name}: HANDOFF.json malformed JSON: {exc}"]
+    if not isinstance(payload, dict):
+        return None, [f"{task_dir.name}: HANDOFF.json must be a JSON object when present"]
+    if payload.get("_template") is True:
+        return {"template": True}, []
+
+    warnings: list[str] = []
+    requested_state = payload.get("requested_state")
+    if requested_state not in {"", None, "review", "blocked"}:
+        warnings.append(f"{task_dir.name}: HANDOFF.json requested_state should be review or blocked")
+    for field in ("commands_run", "files_changed", "known_limitations"):
+        if field in payload and not isinstance(payload.get(field), list):
+            warnings.append(f"{task_dir.name}: HANDOFF.json {field} must be a list")
+    if "needs_coordinator" in payload and not isinstance(payload.get("needs_coordinator"), bool):
+        warnings.append(f"{task_dir.name}: HANDOFF.json needs_coordinator must be boolean")
+    return {
+        "template": False,
+        "requested_state": requested_state,
+        "summary": payload.get("summary", ""),
+        "commands_run": payload.get("commands_run", []),
+        "files_changed": payload.get("files_changed", []),
+        "known_limitations": payload.get("known_limitations", []),
+        "needs_coordinator": payload.get("needs_coordinator", False),
+        "blocker_type": payload.get("blocker_type", ""),
+        "blocking_reason": payload.get("blocking_reason", ""),
+    }, warnings
+
+
 def skill_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -285,6 +322,7 @@ def collect(
                     "summary": None,
                     "lock": None,
                     "dispatch_lock": None,
+                    "handoff_index": None,
                 }
             )
             continue
@@ -329,6 +367,9 @@ def collect(
                         if status.get("state") != "running":
                             warnings.append(f"{task_dir.name}: .dispatch-lock pid is not alive: {pid}")
 
+        handoff_index, handoff_warnings = load_handoff_index(task_dir)
+        warnings.extend(handoff_warnings)
+
         tasks.append(
             {
                 "task_id": status.get("task_id", task_dir.name),
@@ -341,6 +382,7 @@ def collect(
                 "blocker_type": status.get("blocker_type"),
                 "blocking_reason": status.get("blocking_reason"),
                 "summary": status.get("summary"),
+                "handoff_index": handoff_index,
                 "lock": lock_info,
                 "dispatch_lock": dispatch_lock_info,
             }
@@ -383,9 +425,15 @@ def render_human(report: dict[str, Any]) -> str:
     lines.append("Tasks:")
     for task in report["tasks"]:
         blocker = f" blocker={task['blocker_type']}" if task.get("blocker_type") else ""
+        handoff = ""
+        if isinstance(task.get("handoff_index"), dict) and not task["handoff_index"].get("template"):
+            handoff = " handoff_json=yes"
         lock = " lock=yes" if task.get("lock") else ""
         dispatch_lock = " dispatch_lock=yes" if task.get("dispatch_lock") else ""
-        lines.append(f"  {task['task_id']}: {task['state']} attempt={task.get('current_attempt_id')}{blocker}{lock}{dispatch_lock}")
+        lines.append(
+            f"  {task['task_id']}: {task['state']} attempt={task.get('current_attempt_id')}"
+            f"{blocker}{handoff}{lock}{dispatch_lock}"
+        )
 
     if report["protocol_violations"]:
         lines.append("")
@@ -419,12 +467,15 @@ def render_human(report: dict[str, Any]) -> str:
 
 
 def render_summary(report: dict[str, Any]) -> str:
-    rows = ["| Task | State | Owner | Attempt | Blocker | Review |", "|---|---|---|---|---|---|"]
+    rows = ["| Task | State | Owner | Attempt | Handoff | Blocker | Review |", "|---|---|---|---|---|---|---|"]
     for task in report["tasks"]:
         review = "ready" if task["state"] == "review" else ""
+        handoff_summary = ""
+        if isinstance(task.get("handoff_index"), dict) and not task["handoff_index"].get("template"):
+            handoff_summary = str(task["handoff_index"].get("summary") or "")[:80]
         rows.append(
             f"| {task['task_id']} | {task['state']} | {task.get('owner') or ''} | "
-            f"{task.get('current_attempt_id') or ''} | {task.get('blocker_type') or ''} | {review} |"
+            f"{task.get('current_attempt_id') or ''} | {handoff_summary} | {task.get('blocker_type') or ''} | {review} |"
         )
 
     blockers = ["| Task | Type | Reason |", "|---|---|---|"]
