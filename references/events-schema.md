@@ -9,7 +9,7 @@ Each line is one JSON object. Do not rewrite old lines during normal operation.
 ```json
 {
   "at": "2026-07-03T12:00:00Z",
-  "actor": "codex",
+  "actor": "coordinator",
   "event": "task_created",
   "run_id": "20260703T120405Z-rag-benchmark-a7f3c2"
 }
@@ -30,6 +30,7 @@ worker_blocked
 worker_review_ready
 worker_exit_without_valid_status
 dispatch_lock_removed
+coordinator_reviewed
 codex_reviewed
 changes_requested
 task_approved

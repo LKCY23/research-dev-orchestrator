@@ -1,0 +1,33 @@
+id = "kimi-code"
+display_name = "Kimi Code"
+roles = ["worker"]
+
+[prompt]
+machine_transport = "arg"
+human_transport = "tmux_send_keys"
+max_arg_bytes = 100000
+submit_key = "C-m"
+post_paste_delay_ms = 1000
+
+[session]
+handling = "manual"
+
+[permission_modes.default]
+supported = true
+args = []
+
+[permission_modes.auto]
+supported = true
+args = ["--auto"]
+
+[permission_modes.yolo]
+supported = true
+args = ["--yolo"]
+
+[commands.machine]
+command = "kimi"
+args = ["-p", "{prompt}", "--output-format", "stream-json"]
+
+[commands.human]
+command = "kimi"
+args = ["{permission_args}"]

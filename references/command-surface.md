@@ -78,21 +78,24 @@ Action: run `scripts/create_task.py`, then fill task context and acceptance deta
 ### dispatch
 
 ```text
-$research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
+$research-dev-orchestrator dispatch run=<run-id> task=<task-id> [worker=claude-code|codex|opencode|kimi-code] [runtime=plain|tmux] [io=machine|human] [permission=default|auto|yolo] [timeout=<seconds>]
 ```
 
 Purpose: dispatch one task to the configured worker CLI.
 
-Action: run `scripts/dispatch_claude.sh`.
+Action: run `scripts/dispatch_agent.sh`.
 
 Mapping:
 
 ```text
-backend=tmux     -> RDO_WORKER_BACKEND=tmux
+worker=<id>      -> RDO_WORKER_BACKEND=<id>
+runtime=tmux     -> RDO_RUNTIME_BACKEND=tmux
+io=human         -> RDO_IO_MODE=human
+permission=yolo  -> RDO_PERMISSION_MODE=yolo
 timeout=<secs>   -> RDO_TMUX_WAIT_TIMEOUT_SECONDS=<secs>
 ```
 
-Default backend is `plain`. Use `tmux` only when attachable observation is useful.
+Default runtime is `plain` with `machine` IO. Use `tmux` with `human` IO only when attachable observation is useful.
 
 `.agent-collab/rdo.toml` may define project defaults, but explicit dispatch intent arguments are one-off overrides and must not rewrite the config file.
 

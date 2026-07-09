@@ -15,6 +15,7 @@ SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROTOCOL_CLI="${SCRIPT_DIR}/protocol_cli.py"
 CONFIG_CLI="${SCRIPT_DIR}/config_cli.py"
 DISPATCH_ASSETS="${SCRIPT_DIR}/dispatch_assets.py"
+AGENT_BACKEND_CLI="${SCRIPT_DIR}/agent_backend_cli.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -66,7 +67,8 @@ append_event() {
     --task-id "${TASK_ID}" \
     --attempt-id "${ATTEMPT_ID}" \
     --event-name "${event_name}" \
-    --agent-name "${CLAUDE_AGENT_NAME}" \
+    --agent-name "${RDO_WORKER_AGENT_NAME}" \
+    --worker-backend "${RDO_WORKER_BACKEND}" \
     --status-path "${STATUS_PATH}"
 }
 
@@ -139,10 +141,13 @@ if [[ "${CONFIG_STATUS}" -ne 0 ]]; then
 fi
 eval "${CONFIG_ENV}"
 
-: "${CLAUDE_CODE_CMD:=${CONFIG_CLAUDE_CODE_CMD}}"
-: "${CLAUDE_AGENT_NAME:=${CONFIG_CLAUDE_AGENT_NAME}}"
-: "${CLAUDE_SESSION_ID:=${CONFIG_CLAUDE_SESSION_ID}}"
+: "${RDO_WORKER_COMMAND:=${CLAUDE_CODE_CMD:-${CONFIG_RDO_WORKER_COMMAND}}}"
+: "${RDO_WORKER_AGENT_NAME:=${CLAUDE_AGENT_NAME:-${CONFIG_RDO_WORKER_AGENT_NAME}}}"
+: "${RDO_BACKEND_SESSION_ID:=${CLAUDE_SESSION_ID:-${CONFIG_RDO_BACKEND_SESSION_ID}}}"
 : "${RDO_WORKER_BACKEND:=${CONFIG_RDO_WORKER_BACKEND}}"
+: "${RDO_PERMISSION_MODE:=${CONFIG_RDO_PERMISSION_MODE}}"
+: "${RDO_RUNTIME_BACKEND:=${CONFIG_RDO_RUNTIME_BACKEND}}"
+: "${RDO_IO_MODE:=${CONFIG_RDO_IO_MODE}}"
 : "${RDO_TMUX_SESSION_PREFIX:=${CONFIG_RDO_TMUX_SESSION_PREFIX}}"
 : "${RDO_TMUX_KEEP_SESSION:=${CONFIG_RDO_TMUX_KEEP_SESSION}}"
 : "${RDO_TMUX_WAIT_TIMEOUT_SECONDS:=${CONFIG_RDO_TMUX_WAIT_TIMEOUT_SECONDS}}"
@@ -152,16 +157,59 @@ if ! RDO_TMUX_KEEP_SESSION="$(normalize_bool "${RDO_TMUX_KEEP_SESSION}")"; then
   exit 2
 fi
 
+# Compatibility: v0.2 used RDO_WORKER_BACKEND=plain|tmux for runtime selection.
+if [[ "${RDO_WORKER_BACKEND}" == "plain" || "${RDO_WORKER_BACKEND}" == "tmux" ]]; then
+  RDO_RUNTIME_BACKEND="${RDO_WORKER_BACKEND}"
+  RDO_WORKER_BACKEND="claude-code"
+fi
+
+if [[ "${RDO_RUNTIME_BACKEND}" == "tmux" && "${RDO_IO_MODE}" == "machine" ]]; then
+  RDO_IO_MODE="human"
+fi
+
 case "${RDO_WORKER_BACKEND}" in
-  plain|tmux) ;;
+  claude-code|codex|opencode|kimi-code) ;;
   *)
-    echo "invalid RDO_WORKER_BACKEND: ${RDO_WORKER_BACKEND} (expected plain or tmux)" >&2
+    echo "invalid RDO_WORKER_BACKEND: ${RDO_WORKER_BACKEND} (expected claude-code, codex, opencode, kimi-code)" >&2
     exit 2
     ;;
 esac
 
-if [[ "${RDO_WORKER_BACKEND}" == "tmux" ]] && ! command -v tmux >/dev/null 2>&1; then
-  echo "RDO_WORKER_BACKEND=tmux requires tmux, but tmux was not found" >&2
+case "${RDO_RUNTIME_BACKEND}" in
+  plain|tmux) ;;
+  *)
+    echo "invalid RDO_RUNTIME_BACKEND: ${RDO_RUNTIME_BACKEND} (expected plain or tmux)" >&2
+    exit 2
+    ;;
+esac
+
+case "${RDO_IO_MODE}" in
+  machine|human) ;;
+  *)
+    echo "invalid RDO_IO_MODE: ${RDO_IO_MODE} (expected machine or human)" >&2
+    exit 2
+    ;;
+esac
+
+case "${RDO_PERMISSION_MODE}" in
+  default|auto|yolo) ;;
+  *)
+    echo "invalid RDO_PERMISSION_MODE: ${RDO_PERMISSION_MODE} (expected default, auto, yolo)" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "${RDO_RUNTIME_BACKEND}" == "plain" && "${RDO_IO_MODE}" != "machine" ]]; then
+  echo "plain runtime only supports machine IO mode in v0.3" >&2
+  exit 2
+fi
+if [[ "${RDO_RUNTIME_BACKEND}" == "tmux" && "${RDO_IO_MODE}" != "human" ]]; then
+  echo "tmux runtime only supports human IO mode in v0.3" >&2
+  exit 2
+fi
+
+if [[ "${RDO_RUNTIME_BACKEND}" == "tmux" ]] && ! command -v tmux >/dev/null 2>&1; then
+  echo "RDO_RUNTIME_BACKEND=tmux requires tmux, but tmux was not found" >&2
   exit 2
 fi
 
@@ -170,9 +218,20 @@ if ! [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]]; then
   exit 2
 fi
 
+if [[ -z "${RDO_WORKER_COMMAND}" ]]; then
+  python3 "${AGENT_BACKEND_CLI}" command \
+    --backend "${RDO_WORKER_BACKEND}" \
+    --io-mode "${RDO_IO_MODE}" \
+    --permission-mode "${RDO_PERMISSION_MODE}" \
+    --cwd "${REPO_ROOT}" \
+    --prompt "" \
+    --agent-name "${RDO_WORKER_AGENT_NAME}" >/dev/null
+fi
+
 ATTEMPT_SEQ="$(find "${TASK_DIR}/attempts" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
 ATTEMPT_NUM="$(printf "%03d" "$((ATTEMPT_SEQ + 1))")"
-ATTEMPT_ID="A${ATTEMPT_NUM}-claude-$(python3 - <<'PY'
+ATTEMPT_BACKEND_SHORT="$(printf "%s" "${RDO_WORKER_BACKEND}" | sed 's/-code$//' | sanitize_name | cut -c1-12)"
+ATTEMPT_ID="A${ATTEMPT_NUM}-${ATTEMPT_BACKEND_SHORT:-worker}-$(python3 - <<'PY'
 import secrets
 print(secrets.token_hex(3))
 PY
@@ -195,11 +254,13 @@ DISPATCH_LOCK_ACQUIRED=1
   echo "created_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   echo "command: $0 $RUN_ID $TASK_ID"
   echo "attempt_id: ${ATTEMPT_ID}"
-  echo "backend: ${RDO_WORKER_BACKEND}"
+  echo "worker_backend: ${RDO_WORKER_BACKEND}"
+  echo "runtime_backend: ${RDO_RUNTIME_BACKEND}"
+  echo "io_mode: ${RDO_IO_MODE}"
 } > "${DISPATCH_LOCK_DIR}/owner"
 printf "%s\n" "${ATTEMPT_ID}" > "${DISPATCH_LOCK_DIR}/attempt_id"
 printf "%s\n" "$$" > "${DISPATCH_LOCK_DIR}/pid"
-if [[ "${RDO_WORKER_BACKEND}" == "tmux" ]]; then
+if [[ "${RDO_RUNTIME_BACKEND}" == "tmux" ]]; then
   printf "%s\n" "${TMUX_SESSION}" > "${DISPATCH_LOCK_DIR}/tmux_session"
   printf "%s\n" "${TMUX_ATTACH_COMMAND}" > "${DISPATCH_LOCK_DIR}/attach_command"
 fi
@@ -232,7 +293,9 @@ mkdir -p "${ATTEMPT_DIR}"
   echo "created_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   echo "command: $0 $RUN_ID $TASK_ID"
   echo "attempt_id: ${ATTEMPT_ID}"
-  echo "backend: ${RDO_WORKER_BACKEND}"
+  echo "worker_backend: ${RDO_WORKER_BACKEND}"
+  echo "runtime_backend: ${RDO_RUNTIME_BACKEND}"
+  echo "io_mode: ${RDO_IO_MODE}"
 } > "${LOCK_PATH}"
 
 if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
@@ -245,31 +308,72 @@ if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
   fi
 fi
 
-python3 "${PROTOCOL_CLI}" create-attempt \
-  --path "${ATTEMPT_DIR}/ATTEMPT.json" \
-  --attempt-id "${ATTEMPT_ID}" \
-  --task-id "${TASK_ID}" \
-  --agent-name "${CLAUDE_AGENT_NAME}" \
-  --session-id "${CLAUDE_SESSION_ID}" \
-  --command "${CLAUDE_CODE_CMD}" \
-  --cwd "${WORKTREE_PATH}" \
-  --backend "${RDO_WORKER_BACKEND}" \
-  --tmux-session "${TMUX_SESSION}" \
-  --attach-command "${TMUX_ATTACH_COMMAND}"
-
 python3 "${DISPATCH_ASSETS}" render-prompt \
   --output "${ATTEMPT_DIR}/prompt.md" \
   --worktree-path "${WORKTREE_PATH}" \
   --task-dir "${TASK_DIR}" \
   --status-path "${STATUS_PATH}" \
-  --attempt-dir "${ATTEMPT_DIR}"
+  --attempt-dir "${ATTEMPT_DIR}" \
+  --worker-backend "${RDO_WORKER_BACKEND}" \
+  --agent-name "${RDO_WORKER_AGENT_NAME}"
+
+PROMPT_TRANSPORT="stdin"
+PROMPT_SUBMIT_KEY=""
+PROMPT_POST_PASTE_DELAY_MS="0"
+if [[ -z "${RDO_WORKER_COMMAND}" ]]; then
+  BACKEND_COMMAND_JSON="$(python3 "${AGENT_BACKEND_CLI}" command \
+    --backend "${RDO_WORKER_BACKEND}" \
+    --io-mode "${RDO_IO_MODE}" \
+    --permission-mode "${RDO_PERMISSION_MODE}" \
+    --cwd "${WORKTREE_PATH}" \
+    --prompt-path "${ATTEMPT_DIR}/prompt.md" \
+    --agent-name "${RDO_WORKER_AGENT_NAME}" \
+    --json)"
+  RDO_WORKER_COMMAND="$(python3 - <<'PY' "${BACKEND_COMMAND_JSON}"
+import json, sys
+print(json.loads(sys.argv[1])["command"])
+PY
+)"
+  PROMPT_TRANSPORT="$(python3 - <<'PY' "${BACKEND_COMMAND_JSON}"
+import json, sys
+print(json.loads(sys.argv[1])["prompt_transport"])
+PY
+)"
+  PROMPT_SUBMIT_KEY="$(python3 - <<'PY' "${BACKEND_COMMAND_JSON}"
+import json, sys
+print(json.loads(sys.argv[1]).get("submit_key") or "")
+PY
+)"
+  PROMPT_POST_PASTE_DELAY_MS="$(python3 - <<'PY' "${BACKEND_COMMAND_JSON}"
+import json, sys
+print(json.loads(sys.argv[1]).get("post_paste_delay_ms") or 0)
+PY
+)"
+fi
+
+python3 "${PROTOCOL_CLI}" create-attempt \
+  --path "${ATTEMPT_DIR}/ATTEMPT.json" \
+  --attempt-id "${ATTEMPT_ID}" \
+  --task-id "${TASK_ID}" \
+  --agent-name "${RDO_WORKER_AGENT_NAME}" \
+  --session-id "${RDO_BACKEND_SESSION_ID}" \
+  --worker-backend "${RDO_WORKER_BACKEND}" \
+  --execution-mode "start" \
+  --permission-mode "${RDO_PERMISSION_MODE}" \
+  --io-mode "${RDO_IO_MODE}" \
+  --command "${RDO_WORKER_COMMAND}" \
+  --cwd "${WORKTREE_PATH}" \
+  --backend "${RDO_RUNTIME_BACKEND}" \
+  --tmux-session "${TMUX_SESSION}" \
+  --attach-command "${TMUX_ATTACH_COMMAND}"
 
 python3 "${PROTOCOL_CLI}" transition-running \
   --status-path "${STATUS_PATH}" \
   --fsm-path "${FSM_PATH}" \
   --attempt-id "${ATTEMPT_ID}" \
-  --agent-name "${CLAUDE_AGENT_NAME}" \
-  --session-id "${CLAUDE_SESSION_ID}"
+  --agent-name "${RDO_WORKER_AGENT_NAME}" \
+  --session-id "${RDO_BACKEND_SESSION_ID}" \
+  --worker-backend "${RDO_WORKER_BACKEND}"
 STATUS_UPDATED=1
 python3 "${PROTOCOL_CLI}" set-attempt-running \
   --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json"
@@ -281,9 +385,9 @@ if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
   EXIT_CODE=0
   EXIT_CODE_RAW="0"
 else
-  if [[ "${RDO_WORKER_BACKEND}" == "plain" ]]; then
+  if [[ "${RDO_RUNTIME_BACKEND}" == "plain" ]]; then
     set +e
-    (cd "${WORKTREE_PATH}" && eval "${CLAUDE_CODE_CMD}" < "${ATTEMPT_DIR}/prompt.md") \
+    (cd "${WORKTREE_PATH}" && eval "${RDO_WORKER_COMMAND}" < "${ATTEMPT_DIR}/prompt.md") \
       > "${ATTEMPT_DIR}/transcript.log" 2>&1
     EXIT_CODE=$?
     set -e
@@ -296,12 +400,15 @@ else
     python3 "${DISPATCH_ASSETS}" render-tmux-runner \
       --output "${RUNNER_PATH}" \
       --worktree-path "${WORKTREE_PATH}" \
-      --command "${CLAUDE_CODE_CMD}" \
+      --command "${RDO_WORKER_COMMAND}" \
       --prompt-path "${ATTEMPT_DIR}/prompt.md" \
       --transcript-path "${ATTEMPT_DIR}/transcript.log" \
       --exit-code-file "${EXIT_CODE_FILE}" \
       --done-signal "${DONE_SIGNAL}" \
-      --keep-session "${RDO_TMUX_KEEP_SESSION}"
+      --keep-session "${RDO_TMUX_KEEP_SESSION}" \
+      --prompt-transport "${PROMPT_TRANSPORT}" \
+      --submit-key "${PROMPT_SUBMIT_KEY}" \
+      --post-paste-delay-ms "${PROMPT_POST_PASTE_DELAY_MS}"
     TMUX_COMMAND="$(python3 - "$RUNNER_PATH" <<'PY'
 import shlex
 import sys
@@ -310,6 +417,9 @@ print("exec " + shlex.quote(sys.argv[1]))
 PY
 )"
     tmux new-session -d -s "${TMUX_SESSION}" "${TMUX_COMMAND}"
+    if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
+      tmux pipe-pane -o -t "${TMUX_SESSION}" "cat >> '${ATTEMPT_DIR}/transcript.log'" || true
+    fi
     WAIT_START="$(date +%s)"
     while [[ ! -f "${EXIT_CODE_FILE}" ]]; do
       if [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" != "0" ]]; then

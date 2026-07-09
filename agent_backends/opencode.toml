@@ -1,0 +1,31 @@
+id = "opencode"
+display_name = "OpenCode"
+roles = ["worker"]
+
+[prompt]
+machine_transport = "arg"
+human_transport = "arg"
+max_arg_bytes = 100000
+
+[session]
+handling = "manual"
+
+[permission_modes.default]
+supported = true
+args = []
+
+[permission_modes.auto]
+supported = true
+args = ["--auto"]
+
+[permission_modes.yolo]
+supported = false
+args = []
+
+[commands.machine]
+command = "opencode"
+args = ["run", "--dir", "{cwd}", "--format", "json", "{permission_args}", "{prompt}"]
+
+[commands.human]
+command = "opencode"
+args = ["{permission_args}", "--prompt", "{prompt}", "{cwd}"]

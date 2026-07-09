@@ -99,7 +99,7 @@ def main() -> int:
         run_dir,
         {
             "at": now,
-            "actor": "codex",
+            "actor": "coordinator",
             "event": "task_created",
             "run_id": args.run_id,
             "task_id": args.task_id,

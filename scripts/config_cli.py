@@ -20,10 +20,16 @@ def as_env_bool(value: bool) -> str:
 
 
 ENV_KEYS = {
+    "RDO_WORKER_COMMAND": "worker_command",
     "CLAUDE_CODE_CMD": "worker_command",
-    "CLAUDE_AGENT_NAME": "worker_agent_name",
-    "CLAUDE_SESSION_ID": "worker_session_id",
     "RDO_WORKER_BACKEND": "worker_backend",
+    "RDO_WORKER_AGENT_NAME": "worker_agent_name",
+    "CLAUDE_AGENT_NAME": "worker_agent_name",
+    "RDO_BACKEND_SESSION_ID": "worker_session_id",
+    "CLAUDE_SESSION_ID": "worker_session_id",
+    "RDO_PERMISSION_MODE": "permission_mode",
+    "RDO_RUNTIME_BACKEND": "runtime_backend",
+    "RDO_IO_MODE": "io_mode",
     "RDO_TMUX_SESSION_PREFIX": "tmux_session_prefix",
     "RDO_TMUX_KEEP_SESSION": "tmux_keep_session",
     "RDO_TMUX_WAIT_TIMEOUT_SECONDS": "tmux_wait_timeout_seconds",

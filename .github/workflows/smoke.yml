@@ -40,7 +40,7 @@ jobs:
 
       - name: Bash syntax
         run: |
-          bash -n scripts/dispatch_claude.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
+          bash -n scripts/dispatch_claude.sh scripts/dispatch_agent.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
 
       - name: Skill validation
         run: |

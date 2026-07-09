@@ -1,17 +1,17 @@
 ---
 name: research-dev-orchestrator
-description: Coordinate research proposal, experiment design, reproducible experiment implementation, and open-source contribution workflows with Codex as coordinator and CLI-based coding agents as workers. Use when Codex needs to turn research or experiment goals into requirements, design decisions, task packets, worker dispatch, evidence-based review, and iterative implementation using repo-local filesystem protocols and Git worktree isolation.
+description: Coordinate research proposal, experiment design, reproducible experiment implementation, and open-source contribution workflows with a role-neutral coordinator and CLI-based coding agents as workers. Use when an agent needs to turn research or experiment goals into requirements, design decisions, task packets, worker dispatch, evidence-based review, and iterative implementation using repo-local filesystem protocols and Git worktree isolation.
 ---
 
 # Research Dev Orchestrator
 
-Use this skill to coordinate research and experiment-driven development with Codex as the coordinator and CLI coding agents, such as Claude Code, as execution workers.
+Use this skill to coordinate research and experiment-driven development with a coordinator backend such as Codex or Claude Code and CLI coding agents as execution workers.
 
 Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-local files as the protocol and Git branches/worktrees as execution isolation.
 
 ## Core Rules
 
-- Codex owns intent: requirements, experiment design, architecture decisions, task decomposition, acceptance criteria, review, and merge decisions.
+- The coordinator owns intent: requirements, experiment design, architecture decisions, task decomposition, acceptance criteria, review, and merge decisions.
 - Workers own execution: implement only assigned task packets and write evidence plus a `HANDOFF.json` transition request. Workers must not edit `STATUS.json` terminal state.
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
@@ -33,7 +33,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 4. Decompose work into task packets using `references/task-packet-template.md`.
 5. Create a run with `scripts/init_run.py` if no run exists.
 6. Create tasks with `scripts/create_task.py`.
-7. Dispatch worker tasks with `scripts/dispatch_claude.sh` only when task states allow dispatch.
+7. Dispatch worker tasks with `scripts/dispatch_agent.sh` only when task states allow dispatch. `scripts/dispatch_claude.sh` remains a compatibility entrypoint.
 8. Collect state with `scripts/collect_status.py`; use `--json` for machine consumers and `--write-summary` for `SUMMARY.md`. Use `scripts/render_dashboard.py` when the user wants a visual run monitor.
 9. Review tasks manually using `references/review-rubric.md`.
 10. Only mark `approved` after diff review, evidence review, mergeability verification, and required integration smoke tests pass.
@@ -57,7 +57,8 @@ Read references only when they are needed:
 - `references/status-schema.md`: use before writing or reviewing `STATUS.json`.
 - `references/attempt-lifecycle.md`: use before dispatching workers or auditing running/review/blocked invariants.
 - `references/configuration.md`: use when changing `.agent-collab/rdo.toml`, config defaults, env overrides, stale thresholds, or task branch/worktree defaults.
-- `references/runtime-backends.md`: use before enabling `RDO_WORKER_BACKEND=tmux` or auditing backend-specific attempt metadata.
+- `references/runtime-backends.md`: use before enabling `RDO_RUNTIME_BACKEND=tmux` or auditing backend-specific attempt metadata.
+- `references/agent-backends.md`: use before changing worker backend registry definitions or backend-specific command contracts.
 - `references/protocol-constants.md`: use when changing script constants, exit codes, blocker types, or event types.
 - `references/command-surface.md`: use when the user invokes coordinator intent phrases such as `$research-dev-orchestrator dispatch ...`.
 - `references/lock-recovery.md`: use when `.dispatch-lock` is stale, mismatched, or present outside `running`.
@@ -74,8 +75,8 @@ Run scripts from the target repository root, but call the scripts by absolute pa
 export RESEARCH_DEV_ORCHESTRATOR_HOME=/absolute/path/to/research-dev-orchestrator
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/init_run.py" --project-slug <slug> --objective "<objective>" --target-branch <branch>
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" --run-id <run-id> --task-id T001-name --goal "<goal>" --allowed-paths path1 path2
-"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> <task-id>
-RDO_WORKER_BACKEND=tmux "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> <task-id>
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_agent.sh" <run-id> <task-id>
+RDO_WORKER_BACKEND=opencode RDO_RUNTIME_BACKEND=tmux "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_agent.sh" <run-id> <task-id>
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --json
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id> --write-summary
@@ -114,16 +115,21 @@ Read `references/command-surface.md` before acting on these intents. `review` do
 
 `config.py` loads operational defaults from `.agent-collab/rdo.toml` and environment variables. It must not define or mutate protocol truth. CLI flags, explicit coordinator intent arguments, and explicit env vars still override config.
 
-`protocol_cli.py` is a narrow internal bridge for `dispatch_claude.sh`. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
+`agent_backends/` defines supported worker backend adapters: `claude-code`, `codex`, `opencode`, and `kimi-code`. `scripts/agent_backend_cli.py` validates adapters and renders backend command lines.
 
-`dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; `dispatch_claude.sh` remains responsible for locks, worktrees, process supervision, and handoff validation.
+`protocol_cli.py` is a narrow internal bridge for dispatch scripts. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
 
-`dispatch_claude.sh` may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid `HANDOFF.json` terminal request. It loads operational defaults from config before any protocol mutation, but explicit env vars still win. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and applies validated `running -> review|blocked` terminal transitions. A `review` request requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
+`dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; dispatch remains responsible for locks, worktrees, process supervision, and handoff validation.
+
+`dispatch_agent.sh` is the generic worker dispatch entrypoint. It may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid `HANDOFF.json` terminal request. It loads operational defaults from config before any protocol mutation, but explicit env vars still win. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and applies validated `running -> review|blocked` terminal transitions. A `review` request requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
 
 Worker backend configuration:
 
 ```bash
-RDO_WORKER_BACKEND=plain|tmux
+RDO_WORKER_BACKEND=claude-code|codex|opencode|kimi-code
+RDO_RUNTIME_BACKEND=plain|tmux
+RDO_IO_MODE=machine|human
+RDO_PERMISSION_MODE=default|auto|yolo
 RDO_TMUX_KEEP_SESSION=0|1
 RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
 ```

@@ -4,7 +4,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-A repo-local orchestration protocol for turning research ideas into reproducible experiment code with Codex as the coordinator and CLI coding agents as workers.
+A repo-local orchestration protocol for turning research ideas into reproducible experiment code with a role-neutral coordinator and CLI coding agents as workers.
 
 Research code often evolves over weeks: requirements shift, baselines change, experiments fail, agents lose context, and results become hard to audit. `research-dev-orchestrator` gives Codex a lightweight way to manage that lifecycle without a server, database, queue, or daemon.
 
@@ -41,7 +41,7 @@ It is intentionally small: the protocol is files plus Git.
 
 The design is built around four rules:
 
-1. **Codex owns intent**
+1. **Coordinator owns intent**
    Requirements, experiment design, task decomposition, acceptance criteria, review, and merge decisions stay with the coordinator.
 
 2. **Workers own execution**
@@ -125,7 +125,7 @@ Implementation details are intentionally secondary in the diagram:
 | --- | --- | --- |
 | Coordinator | Requirements, design, task split, review, merge decisions | `SKILL.md`, `$research-dev-orchestrator` intent surface |
 | Planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
-| Execution | Worker dispatch, attempt supervision, Git-isolated execution | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends, Git worktree |
+| Execution | Worker dispatch, attempt supervision, Git-isolated execution | `dispatch_agent.sh`, `dispatch_claude.sh`, `dispatch_assets.py`, agent backend registry, plain/tmux runtimes, Git worktree |
 | Run Store | Repo-local system of record for task state, attempt lifecycle, handoff evidence, event timeline, memory, results, and recovery context | `.agent-collab/runs/<run-id>/`, `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md`, `RESULT_LEDGER.md` |
 | Validation & recovery | Deterministic gates, read-only audit, derived reports, user-approved recovery | `validation.py`, `protocol_cli.py`, `collect_status.py`, `SUMMARY.md`, `diagnostics/` |
 
@@ -263,11 +263,36 @@ flowchart LR
 
 Worker failure affects an attempt first, not the task directly. A completed attempt is review-ready evidence, not automatic task completion. This lets the system retry, inspect, compare, and recover worker executions without losing the task's intent or history.
 
+## Agent And Runtime Backends
+
+v0.3 separates agent identity from process supervision:
+
+```text
+worker backend  = claude-code | codex | opencode | kimi-code
+runtime backend = plain | tmux
+io mode         = machine | human
+```
+
+The supported runtime combinations are intentionally narrow:
+
+```text
+plain + machine
+tmux + human
+```
+
+Backend command contracts live in `agent_backends/*.toml`; validate them with:
+
+```bash
+python scripts/agent_backend_cli.py validate --backend all
+```
+
+See [references/agent-backends.md](references/agent-backends.md).
+
 ## Runtime Backends
 
 Two worker execution backends are supported:
 
-- `plain`: default direct execution from `dispatch_claude.sh`.
+- `plain`: default direct execution from `dispatch_agent.sh`.
 - `tmux`: attachable execution for long-running workers.
 
 The tmux backend is still synchronous from dispatch's protocol perspective. It is not a daemon, watcher, queue, or source of truth. Completion is determined by the attempt-local `exit_code` file and validated protocol files, not by tmux session state.
@@ -297,10 +322,13 @@ git clone https://github.com/LKCY23/research-dev-orchestrator.git \
   ~/.codex/skills/research-dev-orchestrator
 ```
 
-Only the coordinator needs the skill installed. Claude Code or other CLI workers do not need to install this skill; they are launched by dispatch with task-packet paths and protocol instructions. A worker only needs the configured CLI command available, for example:
+Only the coordinator needs the skill installed. Claude Code or other CLI workers do not need to install this skill; they are launched by dispatch with task-packet paths and protocol instructions. A worker only needs the configured CLI backend available, for example:
 
 ```bash
-export CLAUDE_CODE_CMD=claude
+claude --version
+codex --version
+opencode --version
+kimi --version
 ```
 
 For a cleaner final skill package, keep `SKILL.md`, `references/`, `scripts/`, `templates/`, and `agents/openai.yaml`; `README.md`, `DESIGN_SPEC.md`, `.github/`, and `tests/` are development artifacts.
@@ -324,7 +352,7 @@ Codex should then:
 5. collect status and review worker evidence;
 6. update `SUMMARY.md`, `JOURNAL.md`, and related run artifacts at session closeout.
 
-The worker side remains CLI-based. Configure defaults in `.agent-collab/rdo.toml` or with environment variables such as `CLAUDE_CODE_CMD`, `RDO_WORKER_BACKEND`, and `RDO_TMUX_KEEP_SESSION`.
+The worker side remains CLI-based. Configure defaults in `.agent-collab/rdo.toml` or with environment variables such as `RDO_WORKER_BACKEND`, `RDO_RUNTIME_BACKEND`, `RDO_PERMISSION_MODE`, and `RDO_TMUX_KEEP_SESSION`.
 
 ### Direct script usage
 
@@ -357,7 +385,7 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" \
 Dispatch a worker:
 
 ```bash
-"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> T001-data-loader
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_agent.sh" <run-id> T001-data-loader
 ```
 
 Collect status:
@@ -380,8 +408,8 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" \
 Use tmux when you want to attach to a long-running worker:
 
 ```bash
-RDO_WORKER_BACKEND=tmux \
-  "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> T001-data-loader
+RDO_WORKER_BACKEND=opencode RDO_RUNTIME_BACKEND=tmux RDO_IO_MODE=human \
+  "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_agent.sh" <run-id> T001-data-loader
 ```
 
 Operational defaults live in `.agent-collab/rdo.toml`, but protocol truth is not configurable. Config may choose defaults such as backend, worker command, stale thresholds, and task path prefixes. It cannot change FSM states, blocker types, event types, protocol version, or review semantics.
@@ -438,7 +466,7 @@ Local CI equivalent:
 ```bash
 python3 .github/ci/quick_validate_skill.py .
 python3 -m py_compile scripts/*.py .github/ci/quick_validate_skill.py
-bash -n scripts/dispatch_claude.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
+bash -n scripts/dispatch_claude.sh scripts/dispatch_agent.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
 RDO_KEEP_SMOKE_REPOS=0 scripts/run_smoke_tests.sh
 git diff --check
 ```

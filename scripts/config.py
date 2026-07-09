@@ -13,15 +13,18 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from protocol import RUNTIME_BACKENDS
+from protocol import IO_MODES, PERMISSION_MODES, RUNTIME_BACKENDS, WORKER_BACKENDS
 
 
 @dataclass(frozen=True)
 class RdoConfig:
-    worker_command: str = "claude"
+    worker_command: str = ""
+    worker_backend: str = "claude-code"
     worker_agent_name: str = "claude-worker"
     worker_session_id: str = ""
-    worker_backend: str = "plain"
+    permission_mode: str = "auto"
+    runtime_backend: str = "plain"
+    io_mode: str = "machine"
     tmux_session_prefix: str = "rdo"
     tmux_keep_session: bool = False
     tmux_wait_timeout_seconds: int = 0
@@ -41,8 +44,8 @@ class ConfigLoadResult:
 
 
 TOML_SCHEMA = {
-    "worker": {"command", "agent_name"},
-    "runtime": {"backend"},
+    "worker": {"backend", "command", "agent_name", "permission_mode"},
+    "runtime": {"backend", "io_mode"},
     "tmux": {"session_prefix", "keep_session", "wait_timeout_seconds", "exit_code_grace_seconds"},
     "status": {"stale_lock_hours", "stale_created_minutes"},
     "task": {"branch_prefix", "worktree_root"},
@@ -50,10 +53,16 @@ TOML_SCHEMA = {
 
 
 ENV_MAP = {
+    "RDO_WORKER_COMMAND": ("worker_command", "string_empty_ok"),
     "CLAUDE_CODE_CMD": ("worker_command", "string"),
+    "RDO_WORKER_BACKEND": ("worker_backend_or_legacy_runtime", "worker_backend_or_legacy_runtime"),
     "CLAUDE_AGENT_NAME": ("worker_agent_name", "string"),
+    "RDO_WORKER_AGENT_NAME": ("worker_agent_name", "string"),
     "CLAUDE_SESSION_ID": ("worker_session_id", "string_empty_ok"),
-    "RDO_WORKER_BACKEND": ("worker_backend", "backend"),
+    "RDO_BACKEND_SESSION_ID": ("worker_session_id", "string_empty_ok"),
+    "RDO_PERMISSION_MODE": ("permission_mode", "permission_mode"),
+    "RDO_RUNTIME_BACKEND": ("runtime_backend", "runtime_backend"),
+    "RDO_IO_MODE": ("io_mode", "io_mode"),
     "RDO_TMUX_SESSION_PREFIX": ("tmux_session_prefix", "string"),
     "RDO_TMUX_KEEP_SESSION": ("tmux_keep_session", "bool"),
     "RDO_TMUX_WAIT_TIMEOUT_SECONDS": ("tmux_wait_timeout_seconds", "int_nonnegative"),
@@ -66,9 +75,12 @@ ENV_MAP = {
 
 
 TOML_MAP = {
-    ("worker", "command"): ("worker_command", "string"),
+    ("worker", "backend"): ("worker_backend", "worker_backend"),
+    ("worker", "command"): ("worker_command", "string_empty_ok"),
     ("worker", "agent_name"): ("worker_agent_name", "string"),
-    ("runtime", "backend"): ("worker_backend", "backend"),
+    ("worker", "permission_mode"): ("permission_mode", "permission_mode"),
+    ("runtime", "backend"): ("runtime_backend", "runtime_backend"),
+    ("runtime", "io_mode"): ("io_mode", "io_mode"),
     ("tmux", "session_prefix"): ("tmux_session_prefix", "string"),
     ("tmux", "keep_session"): ("tmux_keep_session", "bool"),
     ("tmux", "wait_timeout_seconds"): ("tmux_wait_timeout_seconds", "int_nonnegative"),
@@ -105,10 +117,28 @@ def coerce_value(value: Any, kind: str) -> tuple[Any, str | None]:
         if isinstance(value, str):
             return value, None
         return None, "must be a string"
-    if kind == "backend":
+    if kind == "runtime_backend":
         if isinstance(value, str) and value in RUNTIME_BACKENDS:
             return value, None
         return None, f"must be one of {sorted(RUNTIME_BACKENDS)}"
+    if kind == "worker_backend":
+        if isinstance(value, str) and value in WORKER_BACKENDS:
+            return value, None
+        return None, f"must be one of {sorted(WORKER_BACKENDS)}"
+    if kind == "worker_backend_or_legacy_runtime":
+        if isinstance(value, str) and value in WORKER_BACKENDS:
+            return ("worker_backend", value), None
+        if isinstance(value, str) and value in RUNTIME_BACKENDS:
+            return ("runtime_backend", value), None
+        return None, f"must be one of worker backends {sorted(WORKER_BACKENDS)} or legacy runtime backends {sorted(RUNTIME_BACKENDS)}"
+    if kind == "io_mode":
+        if isinstance(value, str) and value in IO_MODES:
+            return value, None
+        return None, f"must be one of {sorted(IO_MODES)}"
+    if kind == "permission_mode":
+        if isinstance(value, str) and value in PERMISSION_MODES:
+            return value, None
+        return None, f"must be one of {sorted(PERMISSION_MODES)}"
     if kind == "bool":
         parsed = parse_bool(value)
         if parsed is not None:
@@ -185,6 +215,10 @@ def apply_env(config: RdoConfig, environ: Mapping[str, str]) -> tuple[RdoConfig,
         coerced, error = coerce_value(environ[env_name], kind)
         if error:
             errors.append(f"env: {env_name} {error}")
+            continue
+        if kind == "worker_backend_or_legacy_runtime":
+            field, value = coerced
+            updated = apply_field(updated, field, value)
             continue
         updated = apply_field(updated, field, coerced)
     return updated, errors

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Narrow CLI for dispatch_claude.sh protocol operations."""
+"""Narrow CLI for dispatch protocol operations."""
 
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ def apply_dispatch_terminal_transition(
     status["previous_state"] = "running"
     status["state"] = target_state
     status["updated_at"] = now
-    status["owner"] = "claude-code"
+    status["owner"] = "worker"
     status["summary"] = summary or status.get("summary", "")
     status["needs_coordinator"] = needs_coordinator
     status["blocker_type"] = blocker_type
@@ -103,7 +103,7 @@ def cmd_append_event(args: argparse.Namespace) -> int:
     dispatch_events = {"task_dispatched", "worker_exit_without_valid_status", "worker_blocked", "worker_review_ready"}
     payload: dict[str, Any] = {
         "at": utc_now(),
-        "actor": "dispatch" if args.event_name in dispatch_events else "claude-code",
+        "actor": "dispatch" if args.event_name in dispatch_events else "coordinator",
         "event": args.event_name,
         "run_id": args.run_id,
         "task_id": args.task_id,
@@ -111,6 +111,7 @@ def cmd_append_event(args: argparse.Namespace) -> int:
     }
     if args.event_name == "task_dispatched":
         payload["worker"] = args.agent_name
+        payload["worker_backend"] = getattr(args, "worker_backend", "")
     if args.event_name == "worker_blocked":
         status = load_json(Path(args.status_path))
         payload["blocker_type"] = status.get("blocker_type", "")
@@ -123,22 +124,29 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
     command = args.command
     command_parts = shlex.split(command)
     runtime: dict[str, Any] = {
-        "backend": args.backend,
+        "backend": args.runtime_backend,
+        "runtime_backend": args.runtime_backend,
+        "io_mode": args.io_mode,
         "model": os.environ.get("CLAUDE_MODEL"),
         "cli": command_parts[0] if command_parts else command,
         "command": command,
         "cwd": args.cwd,
     }
-    if args.backend == "tmux":
+    if args.runtime_backend == "tmux":
         runtime["tmux_session"] = args.tmux_session
         runtime["attach_command"] = args.attach_command
 
     payload = {
         "attempt_id": args.attempt_id,
         "task_id": args.task_id,
-        "agent": "claude-code",
+        "role": "worker",
+        "backend_id": args.worker_backend,
+        "agent": args.worker_backend,
         "agent_name": args.agent_name,
+        "backend_session_id": args.session_id,
         "session_id": args.session_id,
+        "execution_mode": args.execution_mode,
+        "permission_mode": args.permission_mode,
         "state": "created",
         "handoff_valid": None,
         "handoff_state": None,
@@ -162,15 +170,17 @@ def cmd_transition_running(args: argparse.Namespace) -> int:
     now = utc_now()
     status["previous_state"] = state
     status["state"] = "running"
-    status["owner"] = "claude-code"
+    status["owner"] = "worker"
     status["updated_at"] = now
     status["needs_coordinator"] = False
     status["blocking_reason"] = ""
     status["blocker_type"] = ""
     status["current_attempt_id"] = args.attempt_id
     status["assigned_worker"] = {
-        "agent": "claude-code",
+        "backend_id": args.worker_backend,
+        "agent": args.worker_backend,
         "agent_name": args.agent_name,
+        "backend_session_id": args.session_id,
         "session_id": args.session_id,
         "role": "worker",
     }
@@ -352,7 +362,7 @@ def cmd_write_tmux_timeout_diagnostics(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Internal protocol operations for dispatch_claude.sh.")
+    parser = argparse.ArgumentParser(description="Internal protocol operations for dispatch.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     check = sub.add_parser("check-dispatch-transition")
@@ -364,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_event_args(event)
     event.add_argument("--event-name", required=True)
     event.add_argument("--agent-name", required=True)
+    event.add_argument("--worker-backend", default="")
     event.add_argument("--status-path", required=True)
     event.set_defaults(func=cmd_append_event)
 
@@ -373,9 +384,14 @@ def build_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--task-id", required=True)
     attempt.add_argument("--agent-name", required=True)
     attempt.add_argument("--session-id", default="")
+    attempt.add_argument("--worker-backend", default="claude-code")
+    attempt.add_argument("--execution-mode", default="start")
+    attempt.add_argument("--permission-mode", default="auto")
+    attempt.add_argument("--io-mode", default="machine")
     attempt.add_argument("--command", required=True)
     attempt.add_argument("--cwd", required=True)
-    attempt.add_argument("--backend", required=True)
+    attempt.add_argument("--backend", dest="runtime_backend", required=True)
+    attempt.add_argument("--runtime-backend", dest="runtime_backend", default=None)
     attempt.add_argument("--tmux-session", default="")
     attempt.add_argument("--attach-command", default="")
     attempt.set_defaults(func=cmd_create_attempt)
@@ -386,6 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     transition.add_argument("--attempt-id", required=True)
     transition.add_argument("--agent-name", required=True)
     transition.add_argument("--session-id", default="")
+    transition.add_argument("--worker-backend", default="claude-code")
     transition.set_defaults(func=cmd_transition_running)
 
     set_running = sub.add_parser("set-attempt-running")

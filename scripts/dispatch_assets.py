@@ -23,12 +23,15 @@ def render_worker_prompt(
     task_dir: Path,
     status_path: Path,
     attempt_dir: Path,
+    worker_backend: str = "claude-code",
+    agent_name: str = "",
 ) -> str:
     return "\n".join(
         [
             "# Worker Task Prompt",
             "",
-            "You are a Claude Code worker. Execute only this task packet.",
+            f"You are a {worker_backend} worker. Execute only this task packet.",
+            f"Agent name: {agent_name or worker_backend}.",
             "",
             "## Protocol File Paths",
             "",
@@ -80,16 +83,27 @@ def render_tmux_runner(
     exit_code_file: str,
     done_signal: str,
     keep_session: str,
+    prompt_transport: str,
+    submit_key: str,
+    post_paste_delay_ms: str,
 ) -> str:
+    delay_seconds = "0"
+    try:
+        delay_seconds = str(max(0, int(post_paste_delay_ms)) / 1000)
+    except ValueError:
+        delay_seconds = "0"
     return f"""#!/usr/bin/env bash
 set +e
 WORKTREE_PATH={shlex.quote(worktree_path)}
-CLAUDE_CODE_CMD={shlex.quote(command)}
+WORKER_COMMAND={shlex.quote(command)}
 PROMPT_PATH={shlex.quote(prompt_path)}
 TRANSCRIPT_PATH={shlex.quote(transcript_path)}
 EXIT_CODE_FILE={shlex.quote(exit_code_file)}
 DONE_SIGNAL={shlex.quote(done_signal)}
 KEEP_SESSION={shlex.quote(keep_session)}
+PROMPT_TRANSPORT={shlex.quote(prompt_transport)}
+SUBMIT_KEY={shlex.quote(submit_key)}
+POST_PASTE_DELAY_SECONDS={shlex.quote(delay_seconds)}
 
 finish() {{
   local rc="$?"
@@ -109,7 +123,26 @@ trap finish EXIT
 
 cd "${{WORKTREE_PATH}}" || exit 127
 set -o pipefail
-eval "${{CLAUDE_CODE_CMD}}" < "${{PROMPT_PATH}}" 2>&1 | tee "${{TRANSCRIPT_PATH}}"
+if [[ "${{PROMPT_TRANSPORT}}" == "tmux_send_keys" ]]; then
+  (
+    sleep 3
+    if [[ -s "${{PROMPT_PATH}}" ]]; then
+      tmux load-buffer -b rdo-worker-prompt "${{PROMPT_PATH}}" 2>/dev/null || true
+      tmux paste-buffer -b rdo-worker-prompt 2>/dev/null || true
+      sleep "${{POST_PASTE_DELAY_SECONDS}}"
+      if [[ -n "${{SUBMIT_KEY}}" ]]; then
+        tmux send-keys "${{SUBMIT_KEY}}" 2>/dev/null || true
+      fi
+    fi
+  ) &
+  eval "${{WORKER_COMMAND}}"
+  exit "$?"
+fi
+if [[ "${{PROMPT_TRANSPORT}}" == "arg" ]]; then
+  eval "${{WORKER_COMMAND}}"
+  exit "$?"
+fi
+eval "${{WORKER_COMMAND}}" < "${{PROMPT_PATH}}" 2>&1 | tee "${{TRANSCRIPT_PATH}}"
 exit "${{PIPESTATUS[0]}}"
 """
 
@@ -122,6 +155,8 @@ def cmd_render_prompt(args: argparse.Namespace) -> int:
             task_dir=Path(args.task_dir),
             status_path=Path(args.status_path),
             attempt_dir=Path(args.attempt_dir),
+            worker_backend=args.worker_backend,
+            agent_name=args.agent_name,
         ),
         encoding="utf-8",
     )
@@ -139,6 +174,9 @@ def cmd_render_tmux_runner(args: argparse.Namespace) -> int:
             exit_code_file=args.exit_code_file,
             done_signal=args.done_signal,
             keep_session=args.keep_session,
+            prompt_transport=args.prompt_transport,
+            submit_key=args.submit_key,
+            post_paste_delay_ms=args.post_paste_delay_ms,
         ),
         encoding="utf-8",
     )
@@ -156,6 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
     prompt.add_argument("--task-dir", required=True)
     prompt.add_argument("--status-path", required=True)
     prompt.add_argument("--attempt-dir", required=True)
+    prompt.add_argument("--worker-backend", default="claude-code")
+    prompt.add_argument("--agent-name", default="")
     prompt.set_defaults(func=cmd_render_prompt)
 
     runner = sub.add_parser("render-tmux-runner")
@@ -167,6 +207,9 @@ def build_parser() -> argparse.ArgumentParser:
     runner.add_argument("--exit-code-file", required=True)
     runner.add_argument("--done-signal", required=True)
     runner.add_argument("--keep-session", required=True)
+    runner.add_argument("--prompt-transport", default="stdin")
+    runner.add_argument("--submit-key", default="")
+    runner.add_argument("--post-paste-delay-ms", default="0")
     runner.set_defaults(func=cmd_render_tmux_runner)
 
     return parser

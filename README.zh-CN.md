@@ -41,7 +41,7 @@
 
 这个设计围绕四条规则：
 
-1. **Codex owns intent**
+1. **Coordinator owns intent**
    需求、实验设计、任务拆分、验收标准、review 和 merge 决策都由 coordinator 负责。
 
 2. **Workers own execution**
@@ -125,7 +125,7 @@ flowchart TB
 | --- | --- | --- |
 | Coordinator | 需求、设计、任务拆分、review、merge 决策 | `SKILL.md`, `$research-dev-orchestrator` intent surface |
 | Planning | 持久化研究意图和任务契约 | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
-| Execution | Worker 派发、attempt supervision、Git 隔离执行 | `dispatch_claude.sh`, `dispatch_assets.py`, plain/tmux backends, Git worktree |
+| Execution | Worker 派发、attempt supervision、Git 隔离执行 | `dispatch_agent.sh`, `dispatch_claude.sh`, `dispatch_assets.py`, agent backend registry, plain/tmux runtimes, Git worktree |
 | Run Store | task state、attempt lifecycle、handoff evidence、event timeline、memory、results、recovery context 的 repo-local system of record | `.agent-collab/runs/<run-id>/`, `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md`, `RESULT_LEDGER.md` |
 | Validation & recovery | 确定性 gate、只读 audit、derived reports、用户批准的 recovery | `validation.py`, `protocol_cli.py`, `collect_status.py`, `SUMMARY.md`, `diagnostics/` |
 
@@ -263,11 +263,36 @@ flowchart LR
 
 Worker 失败会先影响 attempt，而不是直接让 task 失败。Completed attempt 是 review-ready evidence，不是自动 task completion。这样系统可以 retry、inspect、compare 和 recover worker executions，同时不丢失 task 的 intent 或历史。
 
+## Agent And Runtime Backends
+
+v0.3 把 agent 身份和进程监督方式拆开：
+
+```text
+worker backend  = claude-code | codex | opencode | kimi-code
+runtime backend = plain | tmux
+io mode         = machine | human
+```
+
+当前只支持两个组合：
+
+```text
+plain + machine
+tmux + human
+```
+
+Backend 命令契约位于 `agent_backends/*.toml`，可以这样校验：
+
+```bash
+python scripts/agent_backend_cli.py validate --backend all
+```
+
+见 [references/agent-backends.md](references/agent-backends.md)。
+
 ## Runtime Backends
 
 支持两种 worker execution backend：
 
-- `plain`：默认，由 `dispatch_claude.sh` 直接执行。
+- `plain`：默认，由 `dispatch_agent.sh` 直接执行。
 - `tmux`：适合长任务，可以 attach 查看 worker。
 
 tmux backend 从 dispatch 的协议视角看仍然是同步的。它不是 daemon、watcher、queue 或 source of truth。完成状态由 attempt-local `exit_code` 文件和经过校验的 protocol files 决定，不由 tmux session state 决定。
@@ -297,10 +322,13 @@ git clone https://github.com/LKCY23/research-dev-orchestrator.git \
   ~/.codex/skills/research-dev-orchestrator
 ```
 
-只有 coordinator 需要安装这个 skill。Claude Code 或其他 CLI worker 不需要安装 skill；dispatch 会把 task packet 路径和 protocol instructions 传给 worker。Worker 只需要可用的 CLI command，例如：
+只有 coordinator 需要安装这个 skill。Claude Code 或其他 CLI worker 不需要安装 skill；dispatch 会把 task packet 路径和 protocol instructions 传给 worker。Worker 只需要可用的 CLI backend，例如：
 
 ```bash
-export CLAUDE_CODE_CMD=claude
+claude --version
+codex --version
+opencode --version
+kimi --version
 ```
 
 如果要打包成更干净的最终 skill package，请保留 `SKILL.md`、`references/`、`scripts/`、`templates/` 和 `agents/openai.yaml`；`README.md`、`README.zh-CN.md`、`DESIGN_SPEC.md`、`.github/` 和 `tests/` 是开发 artifact。
@@ -324,7 +352,7 @@ export CLAUDE_CODE_CMD=claude
 5. 收集状态并 review worker evidence；
 6. 在 session closeout 时更新 `SUMMARY.md`、`JOURNAL.md` 和相关 run artifacts。
 
-Worker 侧仍然是 CLI-based。你可以通过 `.agent-collab/rdo.toml` 或环境变量配置默认值，例如 `CLAUDE_CODE_CMD`、`RDO_WORKER_BACKEND` 和 `RDO_TMUX_KEEP_SESSION`。
+Worker 侧仍然是 CLI-based。你可以通过 `.agent-collab/rdo.toml` 或环境变量配置默认值，例如 `RDO_WORKER_BACKEND`、`RDO_RUNTIME_BACKEND`、`RDO_PERMISSION_MODE` 和 `RDO_TMUX_KEEP_SESSION`。
 
 ### Direct script usage
 
@@ -357,7 +385,7 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" \
 派发 worker：
 
 ```bash
-"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> T001-data-loader
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_agent.sh" <run-id> T001-data-loader
 ```
 
 收集状态：
@@ -380,8 +408,8 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" \
 当你希望 attach 到长时间运行的 worker 时，使用 tmux backend：
 
 ```bash
-RDO_WORKER_BACKEND=tmux \
-  "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_claude.sh" <run-id> T001-data-loader
+RDO_WORKER_BACKEND=opencode RDO_RUNTIME_BACKEND=tmux RDO_IO_MODE=human \
+  "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_agent.sh" <run-id> T001-data-loader
 ```
 
 Operational defaults 位于 `.agent-collab/rdo.toml`，但 protocol truth 不可配置。Config 可以选择 backend、worker command、stale thresholds、task path prefixes 等默认值。它不能改变 FSM states、blocker types、event types、protocol version 或 review semantics。
@@ -438,7 +466,7 @@ Smoke tests 使用 fake workers。它们验证 protocol 和 orchestration 行为
 ```bash
 python3 .github/ci/quick_validate_skill.py .
 python3 -m py_compile scripts/*.py .github/ci/quick_validate_skill.py
-bash -n scripts/dispatch_claude.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
+bash -n scripts/dispatch_claude.sh scripts/dispatch_agent.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
 RDO_KEEP_SMOKE_REPOS=0 scripts/run_smoke_tests.sh
 git diff --check
 ```

@@ -3,13 +3,16 @@
 # version, task states, event types, schema fields, or FSM transitions.
 
 [worker]
-# Interpreted by the dispatch shell when dispatch config integration is enabled.
-# Do not put secrets in this command; prefer environment variables for credentials.
-command = "claude"
+backend = "claude-code" # claude-code | codex | opencode | kimi-code
 agent_name = "claude-worker"
+permission_mode = "auto" # default | auto | yolo
+# Optional command override for fake workers or advanced local wrappers.
+# Leave empty to use agent_backends/<backend>.toml.
+command = ""
 
 [runtime]
 backend = "plain" # plain | tmux
+io_mode = "machine" # machine | human
 
 [tmux]
 session_prefix = "rdo"

@@ -9,7 +9,7 @@
   "task_id": "T001-name",
   "state": "review",
   "previous_state": "running",
-  "owner": "claude-code",
+  "owner": "worker",
   "branch": "agent/T001-name",
   "worktree": ".agent-worktrees/T001-name",
   "updated_at": "2026-07-03T12:00:00Z",
@@ -19,8 +19,10 @@
   "blocker_type": "",
   "current_attempt_id": "A001-claude-x4p9a",
   "assigned_worker": {
+    "backend_id": "claude-code",
     "agent": "claude-code",
     "agent_name": "claude-worker-1",
+    "backend_session_id": "s8d21",
     "session_id": "s8d21",
     "role": "worker"
   },

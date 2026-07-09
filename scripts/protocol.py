@@ -71,6 +71,10 @@ BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "ir
 ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
 HANDOFF_STATES = {"review", "blocked", None}
 RUNTIME_BACKENDS = {"plain", "tmux"}
+IO_MODES = {"machine", "human"}
+WORKER_BACKENDS = {"claude-code", "codex", "opencode", "kimi-code"}
+COORDINATOR_BACKENDS = {"codex", "claude-code"}
+PERMISSION_MODES = {"default", "auto", "yolo"}
 
 CORE_EVENTS = {
     "run_created",
@@ -83,6 +87,7 @@ CORE_EVENTS = {
     "worker_review_ready",
     "worker_exit_without_valid_status",
     "dispatch_lock_removed",
+    "coordinator_reviewed",
     "codex_reviewed",
     "changes_requested",
     "task_approved",
@@ -100,6 +105,7 @@ TASK_EVENTS = {
     "worker_review_ready",
     "worker_exit_without_valid_status",
     "dispatch_lock_removed",
+    "coordinator_reviewed",
     "codex_reviewed",
     "changes_requested",
     "task_approved",

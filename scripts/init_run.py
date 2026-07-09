@@ -29,6 +29,8 @@ def main() -> int:
     parser.add_argument("--objective", required=True)
     parser.add_argument("--target-branch", default="")
     parser.add_argument("--run-id", default="")
+    parser.add_argument("--coordinator-backend", default="codex")
+    parser.add_argument("--coordinator-agent-name", default="codex-main")
     parser.add_argument("--coordinator-session-id", default="")
     args = parser.parse_args()
 
@@ -72,9 +74,12 @@ def main() -> int:
         "base_commit": base_commit,
         "coordinator_sessions": [
             {
-                "agent": "codex",
                 "role": "coordinator",
+                "backend_id": args.coordinator_backend,
+                "agent_name": args.coordinator_agent_name,
+                "backend_session_id": session_id,
                 "session_id": session_id,
+                "notification_mode": "none",
                 "started_at": created_at,
             }
         ],
@@ -85,9 +90,10 @@ def main() -> int:
         run_dir,
         {
             "at": created_at,
-            "actor": "codex",
+            "actor": "coordinator",
             "event": "run_created",
             "run_id": run_id,
+            "backend_id": args.coordinator_backend,
             "project_slug": project_slug,
             "target_branch": target_branch,
             "base_commit": base_commit,

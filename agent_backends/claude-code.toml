@@ -1,0 +1,31 @@
+id = "claude-code"
+display_name = "Claude Code"
+roles = ["coordinator", "worker"]
+
+[prompt]
+machine_transport = "arg"
+human_transport = "arg"
+max_arg_bytes = 100000
+
+[session]
+handling = "manual"
+
+[permission_modes.default]
+supported = true
+args = ["--permission-mode", "default"]
+
+[permission_modes.auto]
+supported = true
+args = ["--permission-mode", "auto"]
+
+[permission_modes.yolo]
+supported = true
+args = ["--dangerously-skip-permissions"]
+
+[commands.machine]
+command = "claude"
+args = ["-p", "--verbose", "--output-format", "stream-json", "{permission_args}", "{prompt}"]
+
+[commands.human]
+command = "claude"
+args = ["{permission_args}", "--name", "{agent_name}", "{prompt}"]

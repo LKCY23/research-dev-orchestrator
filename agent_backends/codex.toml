@@ -1,0 +1,31 @@
+id = "codex"
+display_name = "Codex"
+roles = ["coordinator", "worker"]
+
+[prompt]
+machine_transport = "arg"
+human_transport = "arg"
+max_arg_bytes = 100000
+
+[session]
+handling = "manual"
+
+[permission_modes.default]
+supported = true
+args = []
+
+[permission_modes.auto]
+supported = true
+args = ["--ask-for-approval", "never"]
+
+[permission_modes.yolo]
+supported = true
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[commands.machine]
+command = "codex"
+args = ["{permission_args}", "exec", "--json", "--cd", "{cwd}", "{prompt}"]
+
+[commands.human]
+command = "codex"
+args = ["--cd", "{cwd}", "{permission_args}", "{prompt}"]

@@ -27,7 +27,7 @@ python3 "${RDO_ROOT}/scripts/create_task.py" \
   --goal env \
   --allowed-paths file.txt >/dev/null
 
-RDO_WORKER_BACKEND=tmux python3 "${RDO_ROOT}/scripts/config_cli.py" export-env > "${repo}/env.out"
+RDO_RUNTIME_BACKEND=tmux python3 "${RDO_ROOT}/scripts/config_cli.py" export-env > "${repo}/env.out"
 
 python3 - <<'PY'
 import json
@@ -37,5 +37,6 @@ status = json.load(open(".agent-collab/runs/smoke-run/tasks/T001-env/STATUS.json
 assert status["branch"] == "env/T001-env", status
 assert status["worktree"] == "env-worktrees/T001-env", status
 text = Path("env.out").read_text(encoding="utf-8")
-assert "RDO_WORKER_BACKEND=tmux" in text, text
+assert "RDO_RUNTIME_BACKEND=tmux" in text, text
+assert "RDO_WORKER_BACKEND=claude-code" in text, text
 PY

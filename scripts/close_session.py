@@ -29,7 +29,7 @@ def main() -> int:
     parser.add_argument("--decision", action="append", default=[], help="Important session decision or tradeoff; repeatable.")
     parser.add_argument("--next-action", action="append", default=[], help="Next action; repeatable.")
     parser.add_argument("--experiment", action="append", default=[], help="Experiment result note; repeatable.")
-    parser.add_argument("--actor", default="codex")
+    parser.add_argument("--actor", default="coordinator")
     args = parser.parse_args()
 
     root = repo_root(Path.cwd())

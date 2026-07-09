@@ -20,18 +20,18 @@
     },
     "blocked": {
       "running": ["dispatch"],
-      "failed": ["codex"]
+      "failed": ["coordinator"]
     },
     "review": {
-      "approved": ["codex"],
-      "changes_requested": ["codex"],
-      "failed": ["codex"]
+      "approved": ["coordinator"],
+      "changes_requested": ["coordinator"],
+      "failed": ["coordinator"]
     },
     "changes_requested": {
       "running": ["dispatch"]
     },
     "approved": {
-      "merged": ["codex"]
+      "merged": ["coordinator"]
     },
     "merged": {},
     "failed": {}

@@ -1,18 +1,24 @@
 # Runtime Backends
 
-Worker backend means how `dispatch_claude.sh` launches and supervises the worker CLI. It is not a protocol role and not a terminal application contract.
+Runtime backend means how `dispatch_agent.sh` launches and supervises a worker CLI. It is separate from worker backend identity.
+
+```text
+worker backend  = claude-code | codex | opencode | kimi-code
+runtime backend = plain | tmux
+io mode         = machine | human
+```
 
 ## Backends
 
 ```text
 plain
-  Default. Run the worker CLI directly from dispatch_claude.sh.
+  Default. Run the worker CLI directly from dispatch_agent.sh.
 
 tmux
   Optional attachable execution. Run the worker CLI inside a tmux session so a human can attach and observe.
 ```
 
-Use `tmux` only when the user asks for attachable/background observation or the worker is expected to run long enough that live inspection matters.
+Use `tmux` only when the user asks for attachable human observation or the worker is expected to run long enough that live inspection matters.
 
 ## Core Boundary
 
@@ -38,7 +44,10 @@ Do not introduce watcher, daemon, queue, RPC, or fire-and-forget semantics in th
 Project-level defaults may be stored in `.agent-collab/rdo.toml`; see `configuration.md`.
 
 ```bash
-RDO_WORKER_BACKEND=plain|tmux
+RDO_WORKER_BACKEND=claude-code|codex|opencode|kimi-code
+RDO_RUNTIME_BACKEND=plain|tmux
+RDO_IO_MODE=machine|human
+RDO_PERMISSION_MODE=default|auto|yolo
 RDO_TMUX_SESSION_PREFIX=rdo
 RDO_TMUX_KEEP_SESSION=0|1
 RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
@@ -49,7 +58,16 @@ Meanings:
 
 ```text
 RDO_WORKER_BACKEND
+  Selects the CLI agent backend.
+
+RDO_RUNTIME_BACKEND
   plain by default. tmux enables attachable execution.
+
+RDO_IO_MODE
+  machine for plain runtime, human for tmux runtime.
+
+RDO_PERMISSION_MODE
+  Backend-level permission profile. Unsupported modes fail before protocol mutation.
 
 RDO_TMUX_SESSION_PREFIX
   Prefix for generated tmux session names.
@@ -78,6 +96,8 @@ Common fields:
 {
   "runtime": {
     "backend": "plain",
+    "runtime_backend": "plain",
+    "io_mode": "machine",
     "model": null,
     "cli": "claude",
     "command": "claude",
@@ -92,6 +112,8 @@ For `tmux`:
 {
   "runtime": {
     "backend": "tmux",
+    "runtime_backend": "tmux",
+    "io_mode": "human",
     "model": null,
     "cli": "claude",
     "command": "claude",
@@ -102,7 +124,7 @@ For `tmux`:
 }
 ```
 
-`runtime.backend`, `runtime.cli`, `runtime.command`, and `runtime.cwd` are required. `runtime.tmux_session` and `runtime.attach_command` are required only when `backend = tmux`.
+`runtime.backend`, `runtime.runtime_backend`, `runtime.io_mode`, `runtime.cli`, `runtime.command`, and `runtime.cwd` are required. `runtime.tmux_session` and `runtime.attach_command` are required only when `backend = tmux`.
 
 Generated tmux session names must be sanitized to avoid tmux target separators such as `:`.
 

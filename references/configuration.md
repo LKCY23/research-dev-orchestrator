@@ -37,11 +37,14 @@ CLI flag or coordinator intent argument
 
 ```toml
 [worker]
-command = "claude"
+backend = "claude-code"
 agent_name = "claude-worker"
+permission_mode = "auto"
+command = ""
 
 [runtime]
 backend = "plain" # plain | tmux
+io_mode = "machine" # machine | human
 
 [tmux]
 session_prefix = "rdo"
@@ -58,17 +61,23 @@ branch_prefix = "agent/"
 worktree_root = ".agent-worktrees"
 ```
 
-Do not add `session_id` to this file. Session id is runtime identity and should be passed with `CLAUDE_SESSION_ID` when available.
+Do not add persistent `session_id` to this file. Session id is runtime identity and should be passed with `RDO_BACKEND_SESSION_ID` when available.
 
 Do not add `protocol_version` or `package_version`. Versions are defined by the installed package in the top-level `VERSION` file, written to `RUN.json`, and audited by `collect_status.py`.
 
 ## Environment Overrides
 
 ```text
+RDO_WORKER_COMMAND
 CLAUDE_CODE_CMD
-CLAUDE_AGENT_NAME
-CLAUDE_SESSION_ID
 RDO_WORKER_BACKEND
+RDO_WORKER_AGENT_NAME
+CLAUDE_AGENT_NAME
+RDO_BACKEND_SESSION_ID
+CLAUDE_SESSION_ID
+RDO_PERMISSION_MODE
+RDO_RUNTIME_BACKEND
+RDO_IO_MODE
 RDO_TMUX_SESSION_PREFIX
 RDO_TMUX_KEEP_SESSION
 RDO_TMUX_WAIT_TIMEOUT_SECONDS
@@ -81,7 +90,7 @@ RDO_WORKTREE_ROOT
 
 Boolean env values use the same parser as TOML booleans where applicable: `1/0`, `true/false`, `yes/no`, and `on/off`.
 
-`worker.command` and `CLAUDE_CODE_CMD` are interpreted by the dispatch shell. Do not put secrets in them; prefer environment variables for credentials.
+`worker.command`, `RDO_WORKER_COMMAND`, and legacy `CLAUDE_CODE_CMD` are interpreted by the dispatch shell. Do not put secrets in them; prefer environment variables for credentials.
 
 If the command path contains spaces, quote it inside TOML as a shell command string, for example:
 
@@ -105,7 +114,7 @@ create_task.py
   default branch and worktree from task.branch_prefix and task.worktree_root
 ```
 
-`dispatch_claude.sh` reads config defaults through `scripts/config_cli.py export-env --no-env --prefix CONFIG_` before any protocol mutation. Explicit environment variables still win over config defaults.
+`dispatch_agent.sh` and its compatibility entrypoint `dispatch_claude.sh` read config defaults through `scripts/config_cli.py export-env --no-env --prefix CONFIG_` before any protocol mutation. Explicit environment variables still win over config defaults.
 
 Do not use unchecked command substitution:
 

@@ -18,7 +18,7 @@ No destructive overwrite; use a new run, new attempt, or revision task.
 LOCK           = human-readable ownership metadata
 ```
 
-`dispatch_claude.sh` must acquire `.dispatch-lock` atomically with `mkdir` before starting a worker. The directory contains `attempt_id`, `pid`, and owner metadata so cleanup only removes a lock owned by the current dispatch.
+`dispatch_agent.sh` must acquire `.dispatch-lock` atomically with `mkdir` before starting a worker. The directory contains `attempt_id`, `pid`, and owner metadata so cleanup only removes a lock owned by the current dispatch.
 
 Release `.dispatch-lock` after the worker process exits and handoff validation finishes, including invalid handoff. Keep `LOCK` for audit until Codex review or triage.
 
@@ -30,9 +30,14 @@ If `.dispatch-lock` exists while `STATUS.state` is not `running`, report a proto
 {
   "attempt_id": "A001-claude-x4p9a",
   "task_id": "T001-name",
+  "role": "worker",
+  "backend_id": "claude-code",
   "agent": "claude-code",
   "agent_name": "claude-worker-1",
+  "backend_session_id": "s8d21",
   "session_id": "s8d21",
+  "execution_mode": "start",
+  "permission_mode": "auto",
   "state": "completed",
   "handoff_valid": true,
   "handoff_state": "review",
@@ -41,6 +46,8 @@ If `.dispatch-lock` exists while `STATUS.state` is not `running`, report a proto
   "exit_code": 0,
   "runtime": {
     "backend": "plain",
+    "runtime_backend": "plain",
+    "io_mode": "machine",
     "model": null,
     "cli": "claude",
     "command": "claude ...",
@@ -54,7 +61,8 @@ Schema constraints:
 ```text
 attempt_id: non-empty string
 task_id: non-empty string
-agent: non-empty string
+backend_id: non-empty string, one of supported worker backends
+agent: legacy backend alias; non-empty string
 agent_name: non-empty string
 session_id: string; may be empty only if runtime cannot provide one
 state: created|running|completed|invalid_handoff
@@ -62,7 +70,8 @@ started_at: non-empty valid ISO timestamp
 ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff
 exit_code: null for created/running; integer for completed; integer or null for invalid_handoff
 runtime: object
-runtime.backend: plain|tmux
+runtime.backend/runtime_backend: plain|tmux
+runtime.io_mode: machine|human
 runtime.cli: non-empty string
 runtime.command: non-empty string
 runtime.cwd: non-empty string

@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-07-08
+
+### Added
+
+- Role-neutral coordinator/worker backend model for Codex, Claude Code, OpenCode, and Kimi Code.
+- `agent_backends/*.toml` backend registry plus `scripts/agent_backend_cli.py` validation and command rendering.
+- Generic `scripts/dispatch_agent.sh` entrypoint; `dispatch_claude.sh` remains as a compatibility entrypoint.
+- Separate worker backend, runtime backend, IO mode, and permission mode configuration.
+- Backend registry smoke tests, generic dispatch smoke tests, and unsupported permission pre-mutation checks.
+
+### Changed
+
+- Protocol actors now use `coordinator` for review/approval/fail/merge transitions instead of binding the FSM to Codex.
+- `ATTEMPT.json` and `STATUS.json.assigned_worker` now record backend-neutral metadata such as `backend_id`, `runtime_backend`, `io_mode`, and `permission_mode`.
+- Runtime backend terminology now distinguishes `plain|tmux` supervision from worker backend identity.
+- Implements Run Store protocol `research-dev-orchestrator/v0.3`.
+
 ## [0.2.0] - 2026-07-07
 
 ### Added

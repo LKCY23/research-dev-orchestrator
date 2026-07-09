@@ -7,8 +7,32 @@ The script-level source for these constants is `scripts/protocol.py`. This refer
 ## Worker Backends
 
 ```text
+claude-code
+codex
+opencode
+kimi-code
+```
+
+## Runtime Backends
+
+```text
 plain
 tmux
+```
+
+## IO Modes
+
+```text
+machine
+human
+```
+
+## Permission Modes
+
+```text
+default
+auto
+yolo
 ```
 
 ## Dispatch Exit Codes
@@ -68,6 +92,7 @@ worker_blocked
 worker_review_ready
 worker_exit_without_valid_status
 dispatch_lock_removed
+coordinator_reviewed
 codex_reviewed
 changes_requested
 task_approved
