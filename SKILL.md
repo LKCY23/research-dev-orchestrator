@@ -1,6 +1,6 @@
 ---
 name: research-dev-orchestrator
-description: Coordinate research proposal, experiment design, reproducible experiment implementation, and open-source contribution workflows with a role-neutral coordinator and CLI-based coding agents as workers. Use when an agent needs to turn research or experiment goals into requirements, design decisions, task packets, worker dispatch, evidence-based review, and iterative implementation using repo-local filesystem protocols and Git worktree isolation.
+description: Coordinate research proposal, experiment design, reproducible experiment implementation, and open-source contribution workflows with a role-neutral coordinator and CLI-based coding agents as workers. Use when an agent needs to turn research or experiment goals into requirements, design decisions, task packets, worker dispatch, evidence-based review, and iterative implementation, or resume this workflow from existing materials at any stage, using repo-local filesystem protocols and Git worktree isolation.
 ---
 
 # Research Dev Orchestrator
@@ -25,7 +25,44 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - Coordinator intents are structured natural-language requests for human control. They are not Codex slash commands and must still follow all protocol invariants.
 - Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
 
+## Default Progression and Stage Entry
+
+Follow the Standard Workflow by default unless the user explicitly requests a different process. Do not treat an RDO invocation as permission to continue substantive work in ad hoc documents outside the workflow.
+
+On every activation or resumption, perform a read-only phase audit before substantive work or protocol state mutation:
+
+1. Resolve the intended project root and, when present, the Git repository root.
+2. Inventory canonical RDO artifacts and relevant existing materials supplied by the user or found in the project.
+3. Classify each prerequisite as `satisfied`, `satisfied_by_existing_material`, `needs_normalization`, `missing`, or `blocked`.
+4. Infer the current workflow stage and identify the next required gate.
+5. Briefly report the inferred stage, usable artifacts, and blocking gaps before proceeding.
+
+When the user does not specify an entry stage, continue from the earliest unmet required gate. Preserve completed work; do not restart requirements or design merely because the material uses non-RDO filenames.
+
+When the user explicitly requests entry at a later stage, treat that request as an entrypoint, not as permission to bypass prerequisites:
+
+- Accept semantically sufficient existing materials regardless of filename.
+- Create or update thin canonical RDO artifacts that reference and normalize those materials when downstream protocol steps require them.
+- Fill only the prerequisite gaps that block the requested stage.
+- Do not redo completed research, design, implementation, or review work.
+- Proceed to the requested stage as soon as its prerequisites are satisfied.
+
+An explicit request to skip or alter the workflow may waive soft planning ceremony, but record the waiver and its consequences in the available audit trail. It never waives Git isolation, FSM validity, immutable strategy approval, attempt supervision, handoff validation, review gates, or merge gates.
+
+Synchronize approved decisions to canonical artifacts before continuing:
+
+- requirements, scope, constraints, non-goals, and acceptance criteria -> `REQUIREMENTS.md`;
+- design-method and architecture choices -> `DESIGN_METHOD_SELECTION.md`, `DESIGN_BRIEF.md`, or relevant `ADR/*`;
+- hypotheses, baselines, datasets, metrics, and evaluation protocol -> `EXPERIMENT_PLAN.md`;
+- environment, versions, seeds, commands, artifacts, and expected outputs -> `REPRODUCIBILITY.md`;
+- implementation decomposition and task acceptance -> task packets and `ACCEPTANCE.md`;
+- experiment outcomes and claim support -> `RESULT_LEDGER.md`.
+
+If no Git repository exists, remain in pre-run planning: canonical planning artifacts may be created or normalized, but do not initialize RDO runs, create worktrees, dispatch workers, or claim execution readiness.
+
 ## Standard Workflow
+
+This is the canonical default progression. A stage-aware entry may begin later only after the phase audit above confirms or normalizes its prerequisites.
 
 1. Clarify requirements with the user and create/update `REQUIREMENTS.md`.
 2. Before design, select the design method and architecture style in `DESIGN_METHOD_SELECTION.md`.
