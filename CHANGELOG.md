@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - Claude Code attempt-local plugin settings, Agent Team configuration, native-agent budget hooks, and governance-aware handoff validation.
 - Codex per-attempt multi-agent settings, native thread/depth limits, unobservable fanout disablement, JSONL spawn-budget supervision, and hard-violation process termination.
 - Strict `plain + machine` / `tmux + human` runtime matrix, side-effect-free backend preflight, exactly-once prompt transport, and attempt-local startup handshake evidence.
+- Claude worker invocations disable slash-command skills while retaining native subagents and Agent Teams, preventing unreviewed skill-triggered context expansion.
 
 ## [0.3.0] - 2026-07-08
 

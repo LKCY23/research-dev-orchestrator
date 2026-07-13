@@ -39,8 +39,8 @@ args = ["--dangerously-skip-permissions"]
 
 [commands.machine]
 command = "claude"
-args = ["-p", "--verbose", "--output-format", "stream-json", "{permission_args}", "{prompt}"]
+args = ["-p", "--verbose", "--output-format", "stream-json", "--disable-slash-commands", "{permission_args}", "{prompt}"]
 
 [commands.human]
 command = "claude"
-args = ["{permission_args}", "--name", "{agent_name}", "{prompt}"]
+args = ["--disable-slash-commands", "{permission_args}", "--name", "{agent_name}", "{prompt}"]

@@ -152,8 +152,20 @@ class BackendGovernanceTests(unittest.TestCase):
         ).command
         self.assertIn("--settings", command)
         self.assertIn("--permission-mode auto", command)
+        self.assertIn("--disable-slash-commands", command)
         self.assertIn("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1", command)
         self.assertIn("RDO_BACKEND_PROFILE_SHA256=", command)
+
+        human_command = build_command(
+            backend_id="claude-code",
+            io_mode="human",
+            permission_mode="auto",
+            cwd=str(self.root),
+            prompt="OK",
+            agent_name="test",
+            backend_profile=result["profile_path"],
+        ).command
+        self.assertIn("--disable-slash-commands", human_command)
 
     def test_project_policy_tightens_shipped_policy(self):
         config = self.root / ".agent-collab" / "rdo.toml"

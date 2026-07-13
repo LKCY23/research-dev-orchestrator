@@ -270,6 +270,8 @@ The first implementation uses only documented Claude Code surfaces:
 - `PreToolUse` hooks to reject disallowed native-agent launches before they run;
 - `SubagentStart` and `SubagentStop` hooks for lifecycle evidence;
 - `stream-json` in machine mode for an additional audit trail;
+- `--disable-slash-commands` for RDO worker invocations so bundled and user
+  skills cannot inject unreviewed workflows or large implicit context;
 - the existing process-group supervisor as the final deadline and cleanup
   boundary.
 
@@ -283,6 +285,10 @@ managed settings. The current profile records this as an external limitation and
 guarantees only that the generated attempt-local settings contain the requested
 disable entries and remain unchanged through handoff. It does not claim that
 ordinary settings can override an organization force-enable policy.
+
+Disabling slash-command skills does not disable Claude Code's native `Task`
+subagents or Agent Teams. The flag is scoped to RDO-launched workers and does
+not change direct user-launched Claude Code sessions.
 
 ## Codex Adapter
 
@@ -451,6 +457,8 @@ The target sequence is:
   configuration;
 - validate generated JSON before dispatch;
 - add native-agent lifecycle hooks and atomic counters;
+- disable bundled and user skills while preserving native subagents and Agent
+  Teams;
 - preserve Agent Team use when approved.
 
 ### Implemented: Codex Adapter
