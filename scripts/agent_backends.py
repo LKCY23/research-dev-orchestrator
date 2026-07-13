@@ -86,6 +86,8 @@ GOVERNANCE_FIELDS: dict[str, dict[str, str]] = {
 @dataclass(frozen=True)
 class BackendCommand:
     command: str
+    argv: list[str]
+    environment: dict[str, str]
     prompt_transport: str
     submit_key: str = ""
     post_paste_delay_ms: int = 0
@@ -320,10 +322,13 @@ def build_command(
                 "--prompt",
                 prompt,
             ]
+    display_argv = argv
     if environment:
-        argv = ["env", *(f"{key}={value}" for key, value in sorted(environment.items())), *argv]
+        display_argv = ["env", *(f"{key}={value}" for key, value in sorted(environment.items())), *argv]
     return BackendCommand(
-        command=" ".join(shlex.quote(part) for part in argv),
+        command=" ".join(shlex.quote(part) for part in display_argv),
+        argv=argv,
+        environment=environment,
         prompt_transport=str(transport),
         submit_key=str(prompt_info.get("submit_key") or ""),
         post_paste_delay_ms=int(prompt_info.get("post_paste_delay_ms") or 0),

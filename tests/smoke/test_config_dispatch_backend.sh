@@ -18,6 +18,7 @@ agent_name = "config-worker"
 
 [runtime]
 backend = "tmux"
+io_mode = "human"
 TOML
 
 "${RDO_ROOT}/scripts/dispatch_claude.sh" smoke-run T001-config-backend

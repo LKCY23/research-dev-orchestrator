@@ -199,6 +199,7 @@ The target repository gets a local `.agent-collab/` directory:
             <attempt-id>/
               ATTEMPT.json
               prompt.md
+              runtime/STARTUP.json
               transcript.log
               result.md
 ```
@@ -303,6 +304,13 @@ The supported runtime combinations are intentionally narrow:
 plain + machine
 tmux + human
 ```
+
+`plain + machine` performs a side-effect-free backend preflight before locking,
+delivers the initial prompt through exactly one adapter-declared channel, and
+requires a valid backend startup event within the configured startup timeout.
+`tmux + human` launches an attachable TUI and records prompt submission as
+best-effort evidence; it does not claim machine-level interaction guarantees.
+Unsupported pairs fail before attempt, worktree, lock, or task-state mutation.
 
 Backend command contracts live in `agent_backends/*.toml`; validate them with:
 

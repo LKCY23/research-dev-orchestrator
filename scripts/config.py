@@ -26,6 +26,7 @@ class RdoConfig:
     permission_mode: str = "auto"
     runtime_backend: str = "plain"
     io_mode: str = "machine"
+    startup_timeout_seconds: int = 45
     tmux_session_prefix: str = "rdo"
     tmux_keep_session: bool = False
     tmux_wait_timeout_seconds: int = 0
@@ -47,7 +48,7 @@ class ConfigLoadResult:
 
 TOML_SCHEMA = {
     "worker": {"backend", "command", "agent_name", "permission_mode"},
-    "runtime": {"backend", "io_mode"},
+    "runtime": {"backend", "io_mode", "startup_timeout_seconds"},
     "tmux": {"session_prefix", "keep_session", "wait_timeout_seconds", "exit_code_grace_seconds"},
     "status": {"stale_lock_hours", "stale_created_minutes"},
     "task": {"branch_prefix", "worktree_root"},
@@ -66,6 +67,7 @@ ENV_MAP = {
     "RDO_PERMISSION_MODE": ("permission_mode", "permission_mode"),
     "RDO_RUNTIME_BACKEND": ("runtime_backend", "runtime_backend"),
     "RDO_IO_MODE": ("io_mode", "io_mode"),
+    "RDO_STARTUP_TIMEOUT_SECONDS": ("startup_timeout_seconds", "int_positive"),
     "RDO_TMUX_SESSION_PREFIX": ("tmux_session_prefix", "string"),
     "RDO_TMUX_KEEP_SESSION": ("tmux_keep_session", "bool"),
     "RDO_TMUX_WAIT_TIMEOUT_SECONDS": ("tmux_wait_timeout_seconds", "int_nonnegative"),
@@ -84,6 +86,7 @@ TOML_MAP = {
     ("worker", "permission_mode"): ("permission_mode", "permission_mode"),
     ("runtime", "backend"): ("runtime_backend", "runtime_backend"),
     ("runtime", "io_mode"): ("io_mode", "io_mode"),
+    ("runtime", "startup_timeout_seconds"): ("startup_timeout_seconds", "int_positive"),
     ("tmux", "session_prefix"): ("tmux_session_prefix", "string"),
     ("tmux", "keep_session"): ("tmux_keep_session", "bool"),
     ("tmux", "wait_timeout_seconds"): ("tmux_wait_timeout_seconds", "int_nonnegative"),
@@ -153,6 +156,12 @@ def coerce_value(value: Any, kind: str) -> tuple[Any, str | None]:
         if isinstance(value, str) and re.match(r"^[0-9]+$", value):
             return int(value), None
         return None, "must be a non-negative integer"
+    if kind == "int_positive":
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value, None
+        if isinstance(value, str) and re.match(r"^[1-9][0-9]*$", value):
+            return int(value), None
+        return None, "must be a positive integer"
     if kind == "float_nonnegative":
         if isinstance(value, bool):
             return None, "must be a non-negative number"

@@ -10,12 +10,20 @@ An attempt supervisor is a deterministic, attempt-local program. It starts with 
 
 ```text
 dispatch_agent.sh
-  -> supervise_attempt.py
+  -> machine_attempt_supervisor.py (plain + machine)
+     or supervise_attempt.py (tmux + human runner)
        -> worker process group
             -> worker commands and managed subprocesses
 ```
 
 The supervisor records the worker PID and process-group ID, monotonic start/deadline values, approved strategy digest, runtime backend, and outcome. It owns process cleanup even when the worker CLI's own timeout is ineffective.
+
+Machine attempts have a separate startup deadline. Process creation and prompt
+delivery are insufficient: the supervisor must decode a valid backend first
+event and write `worker_started` to `runtime/STARTUP.json`. Early exit or startup
+timeout terminates the process group, records `worker_startup_failed`, and is
+classified as an environment blocker. This deadline is independent of the
+larger attempt wall timeout.
 
 ## Enforcement Layers
 
@@ -43,4 +51,4 @@ Backend-native subagents may not expose independently controllable local process
 
 ## No Daemon
 
-The supervisor does not wait for future tasks. Plain dispatch runs it synchronously. Tmux dispatch runs it inside the attempt's tmux session. When the worker exits or is terminated, supervision validates the outcome and exits.
+The supervisor does not wait for future tasks. Plain dispatch runs it synchronously. Tmux dispatch runs an attempt-local wrapper inside the tmux session. When the worker exits or is terminated, supervision validates the outcome and exits.

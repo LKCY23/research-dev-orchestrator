@@ -20,6 +20,19 @@ tmux
 
 Use `tmux` only when the user asks for attachable human observation or the worker is expected to run long enough that live inspection matters.
 
+## Supported Matrix
+
+```text
+plain + machine  supported
+tmux + human     supported
+plain + human    rejected before protocol mutation
+tmux + machine   rejected before protocol mutation
+```
+
+RDO does not silently convert one pair into another. `plain + machine` is the
+deterministic automation path. `tmux + human` is the interactive, attachable,
+best-effort path.
+
 ## Core Boundary
 
 ```text
@@ -48,6 +61,7 @@ RDO_WORKER_BACKEND=claude-code|codex|opencode|kimi-code
 RDO_RUNTIME_BACKEND=plain|tmux
 RDO_IO_MODE=machine|human
 RDO_PERMISSION_MODE=default|auto|yolo
+RDO_STARTUP_TIMEOUT_SECONDS=45
 RDO_TMUX_SESSION_PREFIX=rdo
 RDO_TMUX_KEEP_SESSION=0|1
 RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
@@ -69,6 +83,10 @@ RDO_IO_MODE
 RDO_PERMISSION_MODE
   Backend-level permission profile. Unsupported modes fail before protocol mutation.
 
+RDO_STARTUP_TIMEOUT_SECONDS
+  Positive startup deadline. Machine mode must emit a valid backend event before
+  this deadline. Human mode uses it for best-effort TUI prompt submission.
+
 RDO_TMUX_SESSION_PREFIX
   Prefix for generated tmux session names.
 
@@ -87,6 +105,24 @@ RDO_TMUX_EXIT_CODE_GRACE_SECONDS
 ```
 
 For dispatch, explicit environment variables override `.agent-collab/rdo.toml`. Invalid config must fail before `.dispatch-lock`, `LOCK`, attempts, worktrees, or `STATUS -> running` mutations.
+
+## Preflight And Startup
+
+Before lock or attempt creation, dispatch validates the requested runtime/IO
+pair, executable availability, CLI version invocation, requested permission
+mode, command construction, and authentication when the backend exposes a
+deterministic auth probe. An unavailable `auto` or `yolo` mode is an error; RDO
+does not widen permissions or fall back to an interactive mode.
+
+For `plain + machine`, the adapter returns structured `argv`, environment, and
+one prompt transport. With `arg`, the prompt appears only in `argv` and stdin is
+`/dev/null`; with `stdin`, it appears only in the input stream. Receipt of the
+first recognized machine event advances `runtime/STARTUP.json` from
+`prompt_dispatched` to `worker_started`. Timeout or early exit becomes
+`worker_startup_failed` and blocks the task with `blocker_type=environment`.
+
+For `tmux + human`, startup records TUI process creation and prompt submission.
+These are transport observations, not proof that the model acted on the prompt.
 
 ## ATTEMPT.runtime Schema
 

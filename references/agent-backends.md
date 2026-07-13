@@ -42,6 +42,16 @@ tmux + human
 
 `tmux + human` is for attachable observation. It is still supervised by dispatch; tmux is not a protocol source of truth.
 
+The command builder returns structured `argv` and environment values in
+addition to a display command. Machine supervision launches the structured
+form without shell parsing. Each adapter declares exactly one initial-prompt
+transport, preventing the same prompt from being supplied through both argv and
+stdin.
+
+Arbitrary worker command overrides are not a production adapter surface. They
+are available only to isolated test fixtures because RDO cannot infer their
+startup event, permission, or prompt-delivery contract.
+
 Codex native-subagent strategies support both runtime/IO pairs. Native thread
 and depth limits apply in either mode. If project policy explicitly enables the
 optional cumulative spawn limit, the adapter requires `plain + machine` so its
@@ -61,7 +71,9 @@ same supervised session.
 
 ## Prompt Transport
 
-Machine mode uses direct argument prompt transport in v0.3.
+Machine mode currently uses direct argument prompt transport for all shipped
+adapters. The supervisor also supports adapter-declared stdin transport without
+changing the exactly-once rule.
 
 Human mode supports:
 

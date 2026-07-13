@@ -45,6 +45,7 @@ command = ""
 [runtime]
 backend = "plain" # plain | tmux
 io_mode = "machine" # machine | human
+startup_timeout_seconds = 45
 
 [tmux]
 session_prefix = "rdo"
@@ -86,6 +87,12 @@ max_agent_depth = 1
 pure_mode = false
 ```
 
+The only supported runtime/IO pairs are `plain + machine` and `tmux + human`.
+`startup_timeout_seconds` is a positive integer. It limits the wait for the
+first valid machine event, or the best-effort TUI prompt-submission startup
+sequence. Invalid combinations and invalid startup timeouts fail before
+protocol mutation.
+
 `[backends."<id>"]` is durable backend governance for RDO-launched workers,
 not an attempt setting and not a user-global CLI setting. Each adapter validates
 its own fields. Deny lists are unioned with shipped restrictions, maxima can only
@@ -110,6 +117,7 @@ CLAUDE_SESSION_ID
 RDO_PERMISSION_MODE
 RDO_RUNTIME_BACKEND
 RDO_IO_MODE
+RDO_STARTUP_TIMEOUT_SECONDS
 RDO_TMUX_SESSION_PREFIX
 RDO_TMUX_KEEP_SESSION
 RDO_TMUX_WAIT_TIMEOUT_SECONDS
@@ -122,13 +130,11 @@ RDO_WORKTREE_ROOT
 
 Boolean env values use the same parser as TOML booleans where applicable: `1/0`, `true/false`, `yes/no`, and `on/off`.
 
-`worker.command`, `RDO_WORKER_COMMAND`, and legacy `CLAUDE_CODE_CMD` are interpreted by the dispatch shell. Do not put secrets in them; prefer environment variables for credentials.
-
-A custom worker command is accepted only when the compiled backend profile has
-no hard native controls that require adapter injection. For example, a Claude
-Code profile with attempt-local settings must use the registered backend command;
-dispatch fails before lock acquisition rather than launching an ungoverned
-wrapper.
+`worker.command`, `RDO_WORKER_COMMAND`, and legacy `CLAUDE_CODE_CMD` are reserved
+for isolated RDO test fixtures. Production dispatch rejects command overrides
+before lock acquisition because they do not carry a registered permission,
+prompt-transport, governance, and startup-event contract. Use the registered
+backend adapter and keep credentials in environment variables.
 
 Codex project policy may disable multi-agent or lower the shipped thread/depth
 limits. Execution attempts enable Codex multi-agent only when the approved

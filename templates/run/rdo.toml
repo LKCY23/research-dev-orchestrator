@@ -13,6 +13,7 @@ command = ""
 [runtime]
 backend = "plain" # plain | tmux
 io_mode = "machine" # machine | human
+startup_timeout_seconds = 45
 
 [tmux]
 session_prefix = "rdo"

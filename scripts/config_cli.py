@@ -30,6 +30,7 @@ ENV_KEYS = {
     "RDO_PERMISSION_MODE": "permission_mode",
     "RDO_RUNTIME_BACKEND": "runtime_backend",
     "RDO_IO_MODE": "io_mode",
+    "RDO_STARTUP_TIMEOUT_SECONDS": "startup_timeout_seconds",
     "RDO_TMUX_SESSION_PREFIX": "tmux_session_prefix",
     "RDO_TMUX_KEEP_SESSION": "tmux_keep_session",
     "RDO_TMUX_WAIT_TIMEOUT_SECONDS": "tmux_wait_timeout_seconds",

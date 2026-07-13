@@ -2,6 +2,17 @@
 
 Tmux provides attachable observation for one attempt. It is not a protocol source of truth and raw `tmux send-keys` is not the preferred coordinator interface.
 
+Tmux is supported only with `io_mode=human`. Machine workers use the plain
+runtime so their startup events and prompt transport can be supervised
+deterministically. Human prompt submission is best effort: `prompt_submitted`
+means RDO invoked the configured argv or tmux key path, not that the agent read
+or acted on the message.
+
+While dispatch is supervising the pane, a small deterministic probe recognizes
+common workspace-trust, login, and explicit confirmation prompts. It records
+`worker_waiting_for_user` and prints the attach command. It never answers the
+prompt automatically and cannot recognize every backend-specific TUI screen.
+
 ## Attach And Detach
 
 ```bash

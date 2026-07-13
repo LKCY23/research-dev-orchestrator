@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 - Strategy schema v2 backend binding and pre-lock attempt profile compilation.
 - Claude Code attempt-local plugin settings, Agent Team configuration, native-agent budget hooks, and governance-aware handoff validation.
 - Codex per-attempt multi-agent settings, native thread/depth limits, unobservable fanout disablement, JSONL spawn-budget supervision, and hard-violation process termination.
+- Strict `plain + machine` / `tmux + human` runtime matrix, side-effect-free backend preflight, exactly-once prompt transport, and attempt-local startup handshake evidence.
 
 ## [0.3.0] - 2026-07-08
 

@@ -197,6 +197,7 @@ Backend governance 是长期且由各 adapter 独立定义的。Strategy schema 
             <attempt-id>/
               ATTEMPT.json
               prompt.md
+              runtime/STARTUP.json
               transcript.log
               result.md
 ```
@@ -301,6 +302,12 @@ io mode         = machine | human
 plain + machine
 tmux + human
 ```
+
+`plain + machine` 会在加锁前完成无副作用的 backend preflight，只通过
+adapter 声明的唯一通道交付一次初始 prompt，并要求在配置的启动超时内收到
+合法 backend 首事件。`tmux + human` 启动可 attach 的 TUI，prompt 提交记录是
+best-effort evidence，不承诺 machine-level 交互保证。其他组合会在创建 attempt、
+worktree、lock 或修改 task state 前失败。
 
 Backend 命令契约位于 `agent_backends/*.toml`，可以这样校验：
 

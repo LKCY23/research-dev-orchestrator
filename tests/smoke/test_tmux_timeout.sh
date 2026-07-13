@@ -12,7 +12,7 @@ make_sleep_worker "${worker}" 2
 
 init_run_and_task smoke-run T001-timeout timeout
 set +e
-RDO_WORKER_BACKEND=tmux RDO_TMUX_WAIT_TIMEOUT_SECONDS=1 CLAUDE_CODE_CMD="${worker}" \
+RDO_WORKER_BACKEND=tmux RDO_IO_MODE=human RDO_TMUX_WAIT_TIMEOUT_SECONDS=1 CLAUDE_CODE_CMD="${worker}" \
   "${RDO_ROOT}/scripts/dispatch_claude.sh" smoke-run T001-timeout
 code="$?"
 set -e

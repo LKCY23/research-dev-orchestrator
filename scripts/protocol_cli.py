@@ -105,6 +105,11 @@ def cmd_check_dispatch_transition(args: argparse.Namespace) -> int:
 def cmd_append_event(args: argparse.Namespace) -> int:
     dispatch_events = {
         "task_dispatched",
+        "worker_process_started",
+        "prompt_dispatched",
+        "worker_started",
+        "worker_waiting_for_user",
+        "worker_startup_failed",
         "worker_exit_without_valid_status",
         "worker_blocked",
         "worker_review_ready",
@@ -255,18 +260,50 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
     attempt["exit_code"] = result.exit_code
 
     if not result.valid:
+        startup_failure = None
+        if args.startup_path:
+            startup_path = Path(args.startup_path)
+            if startup_path.exists():
+                try:
+                    startup = load_json(startup_path)
+                except json.JSONDecodeError:
+                    startup = None
+                if isinstance(startup, dict) and startup.get("state") in {
+                    "worker_startup_failed",
+                    "tui_startup_failed",
+                }:
+                    failure = startup.get("failure")
+                    startup_failure = failure if isinstance(failure, dict) else {}
+                    if not startup_failure:
+                        evidence = startup.get("startup_evidence")
+                        startup_failure = {
+                            "code": str(startup.get("state")),
+                            "message": str(evidence or "worker startup failed"),
+                        }
         attempt["state"] = "invalid_handoff"
         attempt["handoff_valid"] = False
         attempt["handoff_state"] = None
+        if startup_failure is not None:
+            attempt["startup_failure"] = startup_failure
         write_json(attempt_path, attempt)
         try:
+            if startup_failure is not None:
+                failure_code = str(startup_failure.get("code") or "worker_startup_failed")
+                failure_message = str(startup_failure.get("message") or "worker startup failed")
+                summary = "Worker startup failed"
+                blocker_type = "environment"
+                blocking_reason = f"{failure_code}: {failure_message}"
+            else:
+                summary = "Invalid worker handoff"
+                blocker_type = "needs_coordinator"
+                blocking_reason = "invalid worker handoff: " + "; ".join(result.reasons[:3])
             apply_dispatch_terminal_transition(
                 Path(args.status_path),
                 target_state="blocked",
-                summary="Invalid worker handoff",
+                summary=summary,
                 needs_coordinator=True,
-                blocker_type="needs_coordinator",
-                blocking_reason="invalid worker handoff: " + "; ".join(result.reasons[:3]),
+                blocker_type=blocker_type,
+                blocking_reason=blocking_reason,
             )
         except Exception as exc:
             print(f"- failed to mark task blocked after invalid handoff: {exc}", file=sys.stderr)
@@ -440,6 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--task-dir", required=True)
     validate.add_argument("--attempt-path", required=True)
     validate.add_argument("--exit-code-raw", required=True)
+    validate.add_argument("--startup-path", default="")
     validate.set_defaults(func=cmd_validate_handoff)
 
     diagnostics = sub.add_parser("write-dispatch-diagnostics")

@@ -31,6 +31,13 @@ import sys
 import time
 from pathlib import Path
 
+if "--version" in sys.argv:
+    print("fake-codex 1.0")
+    raise SystemExit(0)
+if sys.argv[1:3] == ["login", "status"]:
+    print("Logged in")
+    raise SystemExit(0)
+
 prompt = sys.argv[-1]
 task = Path(re.search(r"^- TASK_DIR: (.+)$", prompt, re.M).group(1))
 (task / "EVIDENCE.md").write_text("# Evidence\n\nCodex governance smoke.\n", encoding="utf-8")
@@ -46,6 +53,7 @@ task = Path(re.search(r"^- TASK_DIR: (.+)$", prompt, re.M).group(1))
     "blocker_type": "",
     "blocking_reason": "",
 }) + "\n", encoding="utf-8")
+print(json.dumps({"type": "thread.started", "thread_id": "root"}), flush=True)
 for index in (1, 2):
     agent_id = f"agent-{index}"
     print(json.dumps({

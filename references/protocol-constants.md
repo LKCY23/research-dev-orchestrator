@@ -90,6 +90,11 @@ design_method_selected
 adr_added
 task_created
 task_dispatched
+worker_process_started
+prompt_dispatched
+worker_started
+worker_waiting_for_user
+worker_startup_failed
 strategy_submitted
 strategy_reviewed
 strategy_review_ready

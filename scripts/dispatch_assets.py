@@ -109,6 +109,9 @@ def render_tmux_runner(
     prompt_transport: str,
     submit_key: str,
     post_paste_delay_ms: str,
+    startup_path: str = "",
+    startup_timeout_seconds: str = "45",
+    backend_id: str = "",
 ) -> str:
     delay_seconds = "0"
     try:
@@ -127,6 +130,34 @@ KEEP_SESSION={shlex.quote(keep_session)}
 PROMPT_TRANSPORT={shlex.quote(prompt_transport)}
 SUBMIT_KEY={shlex.quote(submit_key)}
 POST_PASTE_DELAY_SECONDS={shlex.quote(delay_seconds)}
+STARTUP_PATH={shlex.quote(startup_path)}
+STARTUP_TIMEOUT_SECONDS={shlex.quote(startup_timeout_seconds)}
+BACKEND_ID={shlex.quote(backend_id)}
+
+startup_state() {{
+  local state="$1"
+  local evidence="${{2:-}}"
+  [[ -n "${{STARTUP_PATH}}" ]] || return 0
+  python3 - "${{STARTUP_PATH}}" "${{BACKEND_ID}}" "${{PROMPT_TRANSPORT}}" "${{STARTUP_TIMEOUT_SECONDS}}" "${{state}}" "${{evidence}}" <<'PY'
+import hashlib, json, os, pathlib, sys
+path, backend, transport, timeout, state, evidence = sys.argv[1:]
+payload = {{
+    "mode": "human",
+    "state": state,
+    "backend_id": backend,
+    "prompt_transport": transport,
+    "startup_timeout_seconds": int(timeout),
+    "startup_evidence": {{"event": evidence}} if evidence else None,
+    "failure": (
+        {{"code": state, "message": evidence or "human worker startup failed"}}
+        if state == "tui_startup_failed" else None
+    ),
+}}
+temporary = pathlib.Path(path + ".tmp")
+temporary.write_text(json.dumps(payload, indent=2) + "\\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+}}
 
 finish() {{
   local rc="$?"
@@ -146,22 +177,36 @@ trap finish EXIT
 
 cd "${{WORKTREE_PATH}}" || exit 127
 set -o pipefail
+startup_state "tui_process_started" "tmux_session_created"
 if [[ "${{PROMPT_TRANSPORT}}" == "tmux_send_keys" ]]; then
   (
-    sleep 3
+    deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
+    while [[ "${{SECONDS}}" -lt "${{deadline}}" ]]; do
+      pane="$(tmux capture-pane -p -t "${{TMUX_PANE}}" 2>/dev/null || true)"
+      [[ -n "${{pane//[[:space:]]/}}" ]] && break
+      sleep 0.25
+    done
     if [[ -s "${{PROMPT_PATH}}" ]]; then
-      tmux load-buffer -b rdo-worker-prompt "${{PROMPT_PATH}}" 2>/dev/null || true
-      tmux paste-buffer -b rdo-worker-prompt 2>/dev/null || true
+      if ! tmux load-buffer -b rdo-worker-prompt "${{PROMPT_PATH}}" 2>/dev/null || \
+         ! tmux paste-buffer -b rdo-worker-prompt -t "${{TMUX_PANE}}" 2>/dev/null; then
+        startup_state "tui_startup_failed" "prompt_paste_failed"
+        exit 126
+      fi
       sleep "${{POST_PASTE_DELAY_SECONDS}}"
       if [[ -n "${{SUBMIT_KEY}}" ]]; then
-        tmux send-keys "${{SUBMIT_KEY}}" 2>/dev/null || true
+        if ! tmux send-keys -t "${{TMUX_PANE}}" "${{SUBMIT_KEY}}" 2>/dev/null; then
+          startup_state "tui_startup_failed" "prompt_submit_failed"
+          exit 126
+        fi
       fi
+      startup_state "prompt_submitted" "tmux_send_keys"
     fi
   ) &
   eval "${{WORKER_COMMAND}}"
   exit "$?"
 fi
 if [[ "${{PROMPT_TRANSPORT}}" == "arg" ]]; then
+  startup_state "prompt_submitted" "argv"
   eval "${{WORKER_COMMAND}}"
   exit "$?"
 fi
@@ -202,6 +247,9 @@ def cmd_render_tmux_runner(args: argparse.Namespace) -> int:
             prompt_transport=args.prompt_transport,
             submit_key=args.submit_key,
             post_paste_delay_ms=args.post_paste_delay_ms,
+            startup_path=args.startup_path,
+            startup_timeout_seconds=args.startup_timeout_seconds,
+            backend_id=args.backend_id,
         ),
         encoding="utf-8",
     )
@@ -237,6 +285,9 @@ def build_parser() -> argparse.ArgumentParser:
     runner.add_argument("--prompt-transport", default="stdin")
     runner.add_argument("--submit-key", default="")
     runner.add_argument("--post-paste-delay-ms", default="0")
+    runner.add_argument("--startup-path", default="")
+    runner.add_argument("--startup-timeout-seconds", default="45")
+    runner.add_argument("--backend-id", default="")
     runner.set_defaults(func=cmd_render_tmux_runner)
 
     return parser

@@ -17,6 +17,7 @@ CONFIG_CLI="${SCRIPT_DIR}/config_cli.py"
 DISPATCH_ASSETS="${SCRIPT_DIR}/dispatch_assets.py"
 AGENT_BACKEND_CLI="${SCRIPT_DIR}/agent_backend_cli.py"
 BACKEND_GOVERNANCE_CLI="${SCRIPT_DIR}/backend_governance_cli.py"
+BACKEND_PREFLIGHT="${SCRIPT_DIR}/backend_preflight.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -149,6 +150,7 @@ eval "${CONFIG_ENV}"
 : "${RDO_PERMISSION_MODE:=${CONFIG_RDO_PERMISSION_MODE}}"
 : "${RDO_RUNTIME_BACKEND:=${CONFIG_RDO_RUNTIME_BACKEND}}"
 : "${RDO_IO_MODE:=${CONFIG_RDO_IO_MODE}}"
+: "${RDO_STARTUP_TIMEOUT_SECONDS:=${CONFIG_RDO_STARTUP_TIMEOUT_SECONDS}}"
 : "${RDO_TMUX_SESSION_PREFIX:=${CONFIG_RDO_TMUX_SESSION_PREFIX}}"
 : "${RDO_TMUX_KEEP_SESSION:=${CONFIG_RDO_TMUX_KEEP_SESSION}}"
 : "${RDO_TMUX_WAIT_TIMEOUT_SECONDS:=${CONFIG_RDO_TMUX_WAIT_TIMEOUT_SECONDS}}"
@@ -204,10 +206,6 @@ if [[ "${RDO_WORKER_BACKEND}" == "plain" || "${RDO_WORKER_BACKEND}" == "tmux" ]]
   RDO_WORKER_BACKEND="claude-code"
 fi
 
-if [[ "${RDO_RUNTIME_BACKEND}" == "tmux" && "${RDO_IO_MODE}" == "machine" ]]; then
-  RDO_IO_MODE="human"
-fi
-
 case "${RDO_WORKER_BACKEND}" in
   claude-code|codex|opencode|kimi-code) ;;
   *)
@@ -240,12 +238,10 @@ case "${RDO_PERMISSION_MODE}" in
     ;;
 esac
 
-if [[ "${RDO_RUNTIME_BACKEND}" == "plain" && "${RDO_IO_MODE}" != "machine" ]]; then
-  echo "plain runtime only supports machine IO mode in v0.3" >&2
-  exit 2
-fi
-if [[ "${RDO_RUNTIME_BACKEND}" == "tmux" && "${RDO_IO_MODE}" != "human" ]]; then
-  echo "tmux runtime only supports human IO mode in v0.3" >&2
+if [[ "${RDO_RUNTIME_BACKEND}:${RDO_IO_MODE}" != "plain:machine" && \
+      "${RDO_RUNTIME_BACKEND}:${RDO_IO_MODE}" != "tmux:human" ]]; then
+  echo "unsupported runtime/io combination: ${RDO_RUNTIME_BACKEND} + ${RDO_IO_MODE}" >&2
+  echo "supported combinations: plain + machine; tmux + human" >&2
   exit 2
 fi
 
@@ -256,6 +252,10 @@ fi
 
 if ! [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]]; then
   echo "RDO_TMUX_WAIT_TIMEOUT_SECONDS must be a non-negative integer" >&2
+  exit 2
+fi
+if ! [[ "${RDO_STARTUP_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "RDO_STARTUP_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
 fi
 
@@ -269,6 +269,10 @@ if [[ -z "${RDO_WORKER_COMMAND}" ]]; then
     --agent-name "${RDO_WORKER_AGENT_NAME}" >/dev/null
 fi
 
+PREFLIGHT_JSON="$(python3 "${BACKEND_PREFLIGHT}" \
+  --backend "${RDO_WORKER_BACKEND}" \
+  --command "${RDO_WORKER_COMMAND}")" || exit 2
+
 BACKEND_PROFILE_COMPILE_ARGS=(
   compile
   --repo-root "${REPO_ROOT}"
@@ -281,11 +285,8 @@ if [[ -n "${STRATEGY_PATH}" ]]; then
 fi
 BACKEND_PROFILE_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" "${BACKEND_PROFILE_COMPILE_ARGS[@]}")" || exit 2
 if [[ -n "${RDO_WORKER_COMMAND}" && "${RDO_TEST_ALLOW_UNGOVERNED_COMMAND_OVERRIDE:-0}" != "1" ]]; then
-  HARD_BACKEND_CONTROLS="$(python3 -c 'import json,sys; print(sum(1 for item in json.loads(sys.argv[1])["controls"] if item.get("hard") and item.get("enforcement") != "observed"))' "${BACKEND_PROFILE_JSON}")"
-  if [[ "${HARD_BACKEND_CONTROLS}" != "0" ]]; then
-    echo "worker.command cannot receive ${HARD_BACKEND_CONTROLS} required backend governance control(s); use the registered backend command" >&2
-    exit 2
-  fi
+  echo "worker.command overrides do not provide a registered startup-event contract; use the registered backend command" >&2
+  exit 2
 fi
 
 ATTEMPT_SEQ="$(find "${TASK_DIR}/attempts" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
@@ -354,6 +355,7 @@ BACKEND_MATERIALIZED_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" materialize \
 BACKEND_PROFILE_PATH="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["profile_path"])' "${BACKEND_MATERIALIZED_JSON}")"
 BACKEND_PROFILE_SHA256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["profile_sha256"])' "${BACKEND_MATERIALIZED_JSON}")"
 BACKEND_SETTINGS_SHA256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("settings_sha256") or "")' "${BACKEND_MATERIALIZED_JSON}")"
+printf '%s\n' "${PREFLIGHT_JSON}" > "${ATTEMPT_DIR}/runtime/PREFLIGHT.json"
 
 for artifact in EVIDENCE.md HANDOFF.md HANDOFF.json; do
   if [[ -f "${TASK_DIR}/${artifact}" ]]; then
@@ -398,7 +400,11 @@ python3 "${DISPATCH_ASSETS}" render-prompt \
 PROMPT_TRANSPORT="stdin"
 PROMPT_SUBMIT_KEY=""
 PROMPT_POST_PASTE_DELAY_MS="0"
+BACKEND_ARGV_JSON="[]"
+BACKEND_ENVIRONMENT_JSON="{}"
+REGISTERED_BACKEND_COMMAND=0
 if [[ -z "${RDO_WORKER_COMMAND}" ]]; then
+  REGISTERED_BACKEND_COMMAND=1
   BACKEND_COMMAND_JSON="$(python3 "${AGENT_BACKEND_CLI}" command \
     --backend "${RDO_WORKER_BACKEND}" \
     --io-mode "${RDO_IO_MODE}" \
@@ -428,11 +434,57 @@ import json, sys
 print(json.loads(sys.argv[1]).get("post_paste_delay_ms") or 0)
 PY
 )"
+  BACKEND_ARGV_JSON="$(python3 - <<'PY' "${BACKEND_COMMAND_JSON}"
+import json, sys
+print(json.dumps(json.loads(sys.argv[1])["argv"], separators=(",", ":")))
+PY
+)"
+  BACKEND_ENVIRONMENT_JSON="$(python3 - <<'PY' "${BACKEND_COMMAND_JSON}"
+import json, sys
+print(json.dumps(json.loads(sys.argv[1])["environment"], separators=(",", ":")))
+PY
+)"
 fi
 
 ORIGINAL_WORKER_COMMAND="${RDO_WORKER_COMMAND}"
 SUPERVISOR_RESULT="${ATTEMPT_DIR}/supervisor-result.json"
-RDO_WORKER_COMMAND="$(python3 - "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${ORIGINAL_WORKER_COMMAND}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" <<'PY'
+if [[ "${RDO_RUNTIME_BACKEND}" == "plain" ]]; then
+  if [[ "${REGISTERED_BACKEND_COMMAND}" == "0" ]]; then
+    BACKEND_ARGV_JSON="$(python3 -c 'import json,sys; print(json.dumps(["/bin/bash", "-c", sys.argv[1]], separators=(",", ":")))' "${ORIGINAL_WORKER_COMMAND}")"
+  fi
+  RDO_WORKER_COMMAND="$(python3 - \
+    "${SCRIPT_DIR}/machine_attempt_supervisor.py" "${RDO_WORKER_BACKEND}" \
+    "${BACKEND_ARGV_JSON}" "${BACKEND_ENVIRONMENT_JSON}" "${WORKTREE_PATH}" \
+    "${ATTEMPT_DIR}/prompt.md" "${PROMPT_TRANSPORT}" "${RDO_STARTUP_TIMEOUT_SECONDS}" \
+    "${ATTEMPT_TIMEOUT_SECONDS}" "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+    "${SUPERVISOR_RESULT}" "${ATTEMPT_DIR}/runtime/supervisor.json" \
+    "${ATTEMPT_DIR}/transcript.log" "${STRATEGY_ID}" "${STRATEGY_SHA256}" \
+    "${REGISTERED_BACKEND_COMMAND}" <<'PY'
+import shlex, sys
+(
+    script, backend, argv_json, environment_json, cwd, prompt_path,
+    prompt_transport, startup_timeout, timeout, startup_result,
+    supervisor_result, supervisor_state, transcript, strategy_id,
+    strategy_sha256, registered,
+) = sys.argv[1:]
+parts = [
+    sys.executable, script, "--backend", backend,
+    "--argv-json", argv_json, "--environment-json", environment_json,
+    "--cwd", cwd, "--prompt-path", prompt_path,
+    "--prompt-transport", prompt_transport,
+    "--startup-timeout-seconds", startup_timeout,
+    "--timeout-seconds", timeout, "--startup-result", startup_result,
+    "--supervisor-result", supervisor_result, "--supervisor-state", supervisor_state,
+    "--transcript", transcript, "--strategy-id", strategy_id,
+    "--strategy-sha256", strategy_sha256,
+]
+if registered == "0":
+    parts.append("--custom-command")
+print(" ".join(shlex.quote(part) for part in parts))
+PY
+)"
+else
+  RDO_WORKER_COMMAND="$(python3 - "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${ORIGINAL_WORKER_COMMAND}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" <<'PY'
 import shlex, sys
 script, timeout, result, cwd, command, strategy_id, strategy_sha256 = sys.argv[1:]
 print(" ".join([
@@ -446,6 +498,7 @@ print(" ".join([
 ]))
 PY
 )"
+fi
 
 python3 "${PROTOCOL_CLI}" create-attempt \
   --path "${ATTEMPT_DIR}/ATTEMPT.json" \
@@ -496,8 +549,7 @@ if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
 else
   if [[ "${RDO_RUNTIME_BACKEND}" == "plain" ]]; then
     set +e
-    (cd "${WORKTREE_PATH}" && eval "${RDO_WORKER_COMMAND}" < "${ATTEMPT_DIR}/prompt.md") \
-      > "${ATTEMPT_DIR}/transcript.log" 2>&1
+    (cd "${WORKTREE_PATH}" && eval "${RDO_WORKER_COMMAND}" < /dev/null)
     EXIT_CODE=$?
     set -e
     EXIT_CODE_RAW="${EXIT_CODE}"
@@ -517,7 +569,10 @@ else
       --keep-session "${RDO_TMUX_KEEP_SESSION}" \
       --prompt-transport "${PROMPT_TRANSPORT}" \
       --submit-key "${PROMPT_SUBMIT_KEY}" \
-      --post-paste-delay-ms "${PROMPT_POST_PASTE_DELAY_MS}"
+      --post-paste-delay-ms "${PROMPT_POST_PASTE_DELAY_MS}" \
+      --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+      --startup-timeout-seconds "${RDO_STARTUP_TIMEOUT_SECONDS}" \
+      --backend-id "${RDO_WORKER_BACKEND}"
     TMUX_COMMAND="$(python3 - "$RUNNER_PATH" <<'PY'
 import shlex
 import sys
@@ -531,6 +586,18 @@ PY
     fi
     WAIT_START="$(date +%s)"
     while [[ ! -f "${EXIT_CODE_FILE}" ]]; do
+      WAITING_MARKER="${ATTEMPT_DIR}/runtime/worker-waiting-for-user"
+      if [[ "${RDO_IO_MODE}" == "human" && ! -f "${WAITING_MARKER}" ]]; then
+        PANE_SNAPSHOT="${ATTEMPT_DIR}/runtime/startup-pane.txt"
+        tmux capture-pane -p -t "${TMUX_SESSION}" > "${PANE_SNAPSHOT}" 2>/dev/null || true
+        if python3 "${SCRIPT_DIR}/human_startup_probe.py" \
+          --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+          --pane-path "${PANE_SNAPSHOT}" >/dev/null; then
+          touch "${WAITING_MARKER}"
+          append_event "worker_waiting_for_user"
+          echo "Worker is waiting for startup input; attach with: ${TMUX_ATTACH_COMMAND}" >&2
+        fi
+      fi
       if [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" != "0" ]]; then
         NOW="$(date +%s)"
         if (( NOW - WAIT_START >= RDO_TMUX_WAIT_TIMEOUT_SECONDS )); then
@@ -556,6 +623,26 @@ PY
     echo
     echo "exit_code: ${EXIT_CODE_RAW}"
   } > "${ATTEMPT_DIR}/result.md"
+fi
+
+if [[ -f "${ATTEMPT_DIR}/runtime/STARTUP.json" ]]; then
+  STARTUP_STATE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "${ATTEMPT_DIR}/runtime/STARTUP.json")"
+  append_event "worker_process_started"
+  if [[ "${STARTUP_STATE}" == "prompt_dispatched" || \
+        "${STARTUP_STATE}" == "worker_started" || \
+        "${STARTUP_STATE}" == "prompt_submitted" || \
+        "${STARTUP_STATE}" == "worker_waiting_for_user" || \
+        "${STARTUP_STATE}" == "worker_startup_failed" ]]; then
+    append_event "prompt_dispatched"
+  fi
+  if [[ "${STARTUP_STATE}" == "worker_started" ]]; then
+    append_event "worker_started"
+  elif [[ "${STARTUP_STATE}" == "worker_waiting_for_user" ]]; then
+    : # Event was appended at detection time so the user sees it immediately.
+  elif [[ "${STARTUP_STATE}" == "worker_startup_failed" || \
+          "${STARTUP_STATE}" == "tui_startup_failed" ]]; then
+    append_event "worker_startup_failed"
+  fi
 fi
 
 if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
@@ -592,6 +679,7 @@ python3 "${PROTOCOL_CLI}" validate-handoff \
   --attempt-id "${ATTEMPT_ID}" \
   --task-dir "${TASK_DIR}" \
   --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
+  --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
   --exit-code-raw "${EXIT_CODE_RAW}"
 VALIDATION_CODE=$?
 set -e

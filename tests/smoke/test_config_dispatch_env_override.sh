@@ -21,6 +21,7 @@ backend = "plain"
 TOML
 
 RDO_WORKER_BACKEND=tmux \
+RDO_IO_MODE=human \
 RDO_TMUX_KEEP_SESSION=true \
 CLAUDE_CODE_CMD="${worker}" \
 CLAUDE_AGENT_NAME="env-worker" \

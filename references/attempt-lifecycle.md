@@ -8,6 +8,13 @@
 Task FSM stays about task progress only.
 ATTEMPT.json owns worker execution lifecycle.
 Strategy revisions own reviewed execution intent; runtime workflow events own activity inside an execution attempt.
+
+Each non-dry-run attempt also writes `runtime/STARTUP.json`. Machine startup
+progresses through `process_started -> prompt_dispatched -> worker_started`, or
+terminates as `worker_startup_failed`. Tmux human startup records
+`tui_process_started -> prompt_submitted`, with `tui_startup_failed` when the
+best-effort submission path fails. Startup evidence is separate from handoff
+evidence and does not grant a task terminal state.
 collect_status.py validates invariants across STATUS, ATTEMPT, LOCK, EVENTS, EVIDENCE, and HANDOFF.
 No destructive overwrite; use a new run, new attempt, or revision task.
 ```

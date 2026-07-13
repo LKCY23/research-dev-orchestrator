@@ -173,9 +173,16 @@ RDO_WORKER_BACKEND=claude-code|codex|opencode|kimi-code
 RDO_RUNTIME_BACKEND=plain|tmux
 RDO_IO_MODE=machine|human
 RDO_PERMISSION_MODE=default|auto|yolo
+RDO_STARTUP_TIMEOUT_SECONDS=45
 RDO_TMUX_KEEP_SESSION=0|1
 RDO_TMUX_WAIT_TIMEOUT_SECONDS=0
 ```
+
+Only `plain + machine` and `tmux + human` are valid. Machine dispatch performs
+backend executable/version/auth preflight before protocol mutation and requires
+a valid first machine event before the startup deadline. Human tmux dispatch is
+attachable and best effort; prompt submission is recorded but not treated as a
+machine acknowledgement.
 
 `tmux` backend is attachable execution, not detached orchestration. Dispatch still waits for the attempt-local `exit_code` file and validates handoff. If tmux wait times out before `exit_code` appears, dispatch exits `5`, keeps `.dispatch-lock`, leaves `ATTEMPT.state=running`, writes diagnostics, and requires Lock Recovery Review.
 
