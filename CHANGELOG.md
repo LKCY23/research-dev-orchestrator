@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - Claude worker invocations disable slash-command skills while retaining native subagents and Agent Teams, preventing unreviewed skill-triggered context expansion.
 - Planning prompts embed a policy-bounded strategy skeleton so workers can submit valid strategies without inspecting RDO implementation files.
 - Codex worker attempts omit user-level skill instructions through a session-local config override, preventing recursive orchestrator activation.
+- Codex machine workers ignore user configuration while retaining authentication, preventing incompatible models, plugins, and MCP servers from blocking startup.
 
 ## [0.3.0] - 2026-07-08
 

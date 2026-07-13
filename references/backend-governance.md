@@ -338,10 +338,18 @@ multi-agent off. Execution is stricter: a strategy that declares
 All Codex settings are passed as one-invocation `-c` overrides. RDO does not
 write `~/.codex/config.toml`.
 
-Codex worker invocations also set `skills.include_instructions=false` for the
-attempt. This prevents user-level skills from recursively activating inside an
-RDO worker while leaving the user's normal Codex sessions and native subagent
-support unchanged.
+Codex `plain + machine` worker invocations use `codex exec
+--ignore-user-config` and all Codex worker invocations set
+`skills.include_instructions=false` for the attempt. Authentication is still
+read from `CODEX_HOME`; in machine mode, user-level model choices, plugins, MCP
+servers, and skills cannot delay startup or recursively activate inside an RDO
+worker. RDO's permission and governance settings are supplied explicitly on
+argv. The user's normal Codex sessions and configuration remain unchanged.
+
+Older Codex releases do not expose `--ignore-user-config` on the interactive
+top-level command used by `tmux + human`. Human mode therefore omits skill
+instructions but otherwise remains explicitly best-effort with respect to user
+configuration isolation.
 
 ## Kimi Code Adapter
 

@@ -227,6 +227,7 @@ class BackendGovernanceTests(unittest.TestCase):
         self.assertIn("agents.max_threads=1", command)
         self.assertIn("features.enable_fanout=false", command)
         self.assertIn("skills.include_instructions=false", command)
+        self.assertIn("--ignore-user-config", command)
 
         human_command = build_command(
             backend_id="codex",
@@ -240,6 +241,7 @@ class BackendGovernanceTests(unittest.TestCase):
         self.assertNotIn("codex_stream_monitor.py", human_command)
         self.assertIn("agents.max_threads=1", human_command)
         self.assertIn("skills.include_instructions=false", human_command)
+        self.assertNotIn("--ignore-user-config", human_command)
 
     def test_codex_spawn_monitor_can_be_explicitly_enabled(self):
         config = self.root / ".agent-collab" / "rdo.toml"
