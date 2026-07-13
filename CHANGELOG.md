@@ -18,6 +18,7 @@ All notable changes to this project will be documented in this file.
 - Planning prompts embed a policy-bounded strategy skeleton so workers can submit valid strategies without inspecting RDO implementation files.
 - Codex worker attempts omit user-level skill instructions through a session-local config override, preventing recursive orchestrator activation.
 - Codex machine workers ignore user configuration while retaining authentication, preventing incompatible models, plugins, and MCP servers from blocking startup.
+- Planning prompts select `strategy submit` or `strategy revise` from the existing immutable revisions instead of always emitting the first-revision command.
 
 ## [0.3.0] - 2026-07-08
 

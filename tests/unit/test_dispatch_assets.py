@@ -35,6 +35,36 @@ class DispatchAssetsTests(unittest.TestCase):
             self.assertIn('"backend_id": "claude-code"', prompt)
             self.assertIn('"allowed_paths": [\n          "."', prompt)
             self.assertIn("do not inspect RDO source code or tests", prompt)
+            self.assertIn("strategy submit --task-dir", prompt)
+
+    def test_revision_prompt_uses_strategy_revise(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary)
+            (task / "strategy").mkdir()
+            (task / "STATUS.json").write_text(
+                json.dumps({"task_id": "T101-example"}), encoding="utf-8"
+            )
+            (task / "EXECUTION_POLICY.json").write_text(
+                json.dumps(DEFAULT_EXECUTION_POLICY), encoding="utf-8"
+            )
+            (task / "strategy" / "STRATEGY-v001.json").write_text(
+                json.dumps({"strategy_id": "T101-example-S001"}), encoding="utf-8"
+            )
+            for name in ("TASK.md", "CONTEXT.md", "ACCEPTANCE.md"):
+                (task / name).write_text(name, encoding="utf-8")
+
+            prompt = render_worker_prompt(
+                worktree_path="/tmp/worktree",
+                task_dir=task,
+                status_path=task / "STATUS.json",
+                attempt_dir=task / "attempts" / "A002",
+                worker_backend="codex",
+                phase="planning",
+            )
+
+            self.assertIn("strategy revise --task-dir", prompt)
+            self.assertIn('"revision": 2', prompt)
+            self.assertIn('"supersedes": "T101-example-S001"', prompt)
 
     def test_execution_prompt_does_not_embed_strategy_skeleton(self):
         with tempfile.TemporaryDirectory() as temporary:

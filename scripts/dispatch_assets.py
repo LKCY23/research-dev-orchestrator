@@ -96,13 +96,14 @@ def render_worker_prompt(
     strategy_path: str = "",
 ) -> str:
     if phase == "planning":
+        strategy_action = "revise" if any((task_dir / "strategy").glob("STRATEGY-v*.json")) else "submit"
         phase_rules = [
             "## Planning Phase",
             "",
             "- Inspect the task and worktree read-only. Do not edit, commit, or run implementation workflows.",
             "- Design all anticipated workflows, subagents, permissions, dependencies, budgets, and completion gates.",
             f"- Set strategy.backend_id to {worker_backend!r}; an approved strategy cannot execute through another backend.",
-            f"- Write the strategy JSON outside the worktree, then run: python3 {Path(__file__).resolve().parent / 'rdo.py'} strategy submit --task-dir {task_dir} --file <strategy-file>.",
+            f"- Write the strategy JSON outside the worktree, then run: python3 {Path(__file__).resolve().parent / 'rdo.py'} strategy {strategy_action} --task-dir {task_dir} --file <strategy-file>.",
             "- The complete minimal schema is embedded below. Adapt it to the task; do not inspect RDO source code or tests to rediscover the protocol.",
             "- Exit immediately after strategy submission; the coordinator reviews it in a separate step.",
             "",
