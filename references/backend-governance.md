@@ -338,6 +338,11 @@ multi-agent off. Execution is stricter: a strategy that declares
 All Codex settings are passed as one-invocation `-c` overrides. RDO does not
 write `~/.codex/config.toml`.
 
+Codex worker invocations also set `skills.include_instructions=false` for the
+attempt. This prevents user-level skills from recursively activating inside an
+RDO worker while leaving the user's normal Codex sessions and native subagent
+support unchanged.
+
 ## Kimi Code Adapter
 
 Kimi Code uses a temporary `KIMI_CODE_HOME` for each attempt. The launcher copies

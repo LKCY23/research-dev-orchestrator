@@ -43,8 +43,8 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
 
 [commands.machine]
 command = "codex"
-args = ["{permission_args}", "exec", "--json", "--cd", "{cwd}", "{prompt}"]
+args = ["{permission_args}", "-c", "skills.include_instructions=false", "exec", "--json", "--cd", "{cwd}", "{prompt}"]
 
 [commands.human]
 command = "codex"
-args = ["--cd", "{cwd}", "{permission_args}", "{prompt}"]
+args = ["--cd", "{cwd}", "{permission_args}", "-c", "skills.include_instructions=false", "{prompt}"]

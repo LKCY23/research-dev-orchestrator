@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 - Strict `plain + machine` / `tmux + human` runtime matrix, side-effect-free backend preflight, exactly-once prompt transport, and attempt-local startup handshake evidence.
 - Claude worker invocations disable slash-command skills while retaining native subagents and Agent Teams, preventing unreviewed skill-triggered context expansion.
 - Planning prompts embed a policy-bounded strategy skeleton so workers can submit valid strategies without inspecting RDO implementation files.
+- Codex worker attempts omit user-level skill instructions through a session-local config override, preventing recursive orchestrator activation.
 
 ## [0.3.0] - 2026-07-08
 
