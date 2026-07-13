@@ -8,6 +8,7 @@ attempt-local files used by dispatch_claude.sh.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 from pathlib import Path
@@ -15,6 +16,72 @@ from pathlib import Path
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8").rstrip()
+
+
+def render_strategy_template(task_dir: Path, worker_backend: str) -> str:
+    """Render a policy-bounded strategy skeleton so planners need no RDO source inspection."""
+    status = json.loads((task_dir / "STATUS.json").read_text(encoding="utf-8"))
+    policy = json.loads((task_dir / "EXECUTION_POLICY.json").read_text(encoding="utf-8"))
+    existing = sorted((task_dir / "strategy").glob("STRATEGY-v*.json"))
+    revision = len(existing) + 1
+    supersedes = None
+    if existing:
+        previous = json.loads(existing[-1].read_text(encoding="utf-8"))
+        supersedes = previous["strategy_id"]
+    command_seconds = min(policy["default_command_seconds"], policy["attempt_wall_seconds"])
+    template = {
+        "schema_version": 2,
+        "backend_id": worker_backend,
+        "strategy_id": f"{status['task_id']}-S{revision:03d}",
+        "task_id": status["task_id"],
+        "revision": revision,
+        "supersedes": supersedes,
+        "objective": "Replace with the task-specific execution objective",
+        "global_budget": {
+            "wall_seconds": policy["attempt_wall_seconds"],
+            "max_workflows": policy["max_workflows"],
+            "max_workflow_instances": policy["max_workflow_instances"],
+            "max_parallel_workflows": policy["max_parallel_workflows"],
+            "max_subagents": policy["max_subagents"],
+            "max_parallel_subagents": policy["max_parallel_subagents"],
+        },
+        "workflows": [
+            {
+                "workflow_id": "WF-implementation",
+                "kind": "implementation",
+                "purpose": "Replace with a bounded task-specific workflow",
+                "depends_on": [],
+                "required": True,
+                "executor": {
+                    "mode": "primary_worker",
+                    "write_access": True,
+                    "max_agents": 0,
+                    "max_parallel": 0,
+                    "allowed_paths": policy["allowed_paths"],
+                },
+                "budget": {
+                    "wall_seconds": policy["attempt_wall_seconds"],
+                    "command_seconds": command_seconds,
+                    "max_enumerated_cases": policy["max_enumerated_cases"],
+                    "max_instances": 1,
+                },
+                "completion": {"evidence": "Replace with concrete completion evidence"},
+                "on_timeout": "block",
+            }
+        ],
+        "runtime_change_policy": {
+            "allow_new_instances_of_approved_workflows": True,
+            "require_revision_for_new_workflow_kind": True,
+            "require_revision_for_budget_increase": True,
+            "allow_unbounded_search": policy["allow_unbounded_search"],
+        },
+        "completion_gate": {
+            "required_workflows_complete": True,
+            "acceptance_commands_pass": True,
+            "optional_workflows_may_timeout": True,
+        },
+    }
+    return json.dumps(template, ensure_ascii=True, indent=2)
 
 
 def render_worker_prompt(
@@ -36,7 +103,14 @@ def render_worker_prompt(
             "- Design all anticipated workflows, subagents, permissions, dependencies, budgets, and completion gates.",
             f"- Set strategy.backend_id to {worker_backend!r}; an approved strategy cannot execute through another backend.",
             f"- Write the strategy JSON outside the worktree, then run: python3 {Path(__file__).resolve().parent / 'rdo.py'} strategy submit --task-dir {task_dir} --file <strategy-file>.",
+            "- The complete minimal schema is embedded below. Adapt it to the task; do not inspect RDO source code or tests to rediscover the protocol.",
             "- Exit immediately after strategy submission; the coordinator reviews it in a separate step.",
+            "",
+            "### Minimal Valid Strategy Skeleton",
+            "",
+            "```json",
+            render_strategy_template(task_dir, worker_backend),
+            "```",
         ]
     else:
         phase_rules = [
