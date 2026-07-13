@@ -18,6 +18,7 @@ python3 "${RDO_ROOT}/scripts/protocol_cli.py" create-attempt \
   --task-id T001-status \
   --agent-name test-worker \
   --session-id "" \
+  --phase execution \
   --command true \
   --cwd "${repo}" \
   --backend plain >/dev/null

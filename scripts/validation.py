@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,8 +59,8 @@ def load_handoff_request(task_dir: Path) -> tuple[dict[str, Any] | None, list[st
 
     reasons: list[str] = []
     requested_state = request.get("requested_state")
-    if requested_state not in {"review", "blocked"}:
-        reasons.append(f"HANDOFF.json requested_state must be review or blocked, got {requested_state!r}")
+    if requested_state not in {"strategy_review", "review", "blocked"}:
+        reasons.append(f"HANDOFF.json requested_state must be strategy_review, review, or blocked, got {requested_state!r}")
     for field in ("commands_run", "files_changed", "known_limitations"):
         if field in request and not isinstance(request.get(field), list):
             reasons.append(f"HANDOFF.json {field} must be a list")
@@ -99,7 +101,7 @@ def validate_status_schema(status: Any, fsm: dict[str, Any], task_name: str) -> 
             violations.append(f"{task_name}: evidence.logs must be a list")
 
     attempt_id = status.get("current_attempt_id")
-    if state in {"running", "blocked", "review", "approved", "merged"} and not attempt_id:
+    if state in {"planning", "strategy_review", "running", "blocked", "review", "approved", "merged"} and not attempt_id:
         violations.append(f"{task_name}: {state} task is missing current_attempt_id")
 
     return violations
@@ -201,6 +203,7 @@ def validate_attempt_schema(
         "ended_at",
         "exit_code",
         "runtime",
+        "phase",
     }
     missing = sorted(required - set(attempt))
     if missing:
@@ -222,6 +225,8 @@ def validate_attempt_schema(
         violations.append(f"{task_name}: invalid ATTEMPT.started_at {attempt.get('started_at')!r}")
     if attempt.get("ended_at") and parse_iso(attempt.get("ended_at")) is None:
         violations.append(f"{task_name}: invalid ATTEMPT.ended_at {attempt.get('ended_at')!r}")
+    if attempt.get("phase") not in {"planning", "execution"}:
+        violations.append(f"{task_name}: ATTEMPT.phase must be planning or execution")
 
     runtime_violations, _ = validate_runtime_backend(attempt.get("runtime"), task_name)
     violations.extend(runtime_violations)
@@ -244,8 +249,8 @@ def validate_attempt_schema(
     if attempt_state == "completed":
         if attempt.get("handoff_valid") is not True:
             violations.append(f"{task_name}: completed ATTEMPT requires handoff_valid=true")
-        if attempt.get("handoff_state") not in {"review", "blocked"}:
-            violations.append(f"{task_name}: completed ATTEMPT requires handoff_state review or blocked")
+        if attempt.get("handoff_state") not in {"strategy_review", "review", "blocked"}:
+            violations.append(f"{task_name}: completed ATTEMPT requires a terminal handoff_state")
     if attempt_state == "invalid_handoff":
         if attempt.get("handoff_valid") is not False:
             violations.append(f"{task_name}: invalid_handoff ATTEMPT requires handoff_valid=false")
@@ -295,6 +300,49 @@ def validate_worker_handoff(
     """
 
     reasons: list[str] = []
+    attempt_path = task_dir / "attempts" / attempt_id / "ATTEMPT.json"
+    try:
+        attempt = load_json(attempt_path)
+    except Exception as exc:
+        attempt = None
+        reasons.append(f"ATTEMPT.json is unreadable during governance validation: {exc}")
+    profile = None
+    if isinstance(attempt, dict) and attempt.get("backend_profile_sha256"):
+        profile_path = attempt_path.parent / "runtime" / "BACKEND_PROFILE.json"
+        try:
+            profile = load_json(profile_path)
+            unsigned = dict(profile)
+            actual = unsigned.pop("profile_sha256", None)
+            from strategy import canonical_digest
+            recomputed = canonical_digest(unsigned)
+        except Exception as exc:
+            reasons.append(f"backend profile is unreadable during handoff: {exc}")
+        else:
+            if actual != recomputed or actual != attempt.get("backend_profile_sha256"):
+                reasons.append("backend profile digest changed during the attempt")
+    if isinstance(attempt, dict) and attempt.get("backend_settings_sha256"):
+        generated = profile.get("generated_files", []) if isinstance(profile, dict) else []
+        settings_files = [item for item in generated if isinstance(item, str) and item]
+        settings_path = attempt_path.parent / "runtime" / (
+            settings_files[0] if len(settings_files) == 1 else "claude-settings.json"
+        )
+        try:
+            settings_digest = hashlib.sha256(settings_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            reasons.append(f"backend settings are unreadable during handoff: {exc}")
+        else:
+            if settings_digest != attempt.get("backend_settings_sha256"):
+                reasons.append("backend settings changed during the attempt")
+    violations_path = task_dir / "attempts" / attempt_id / "runtime" / "VIOLATIONS.ndjson"
+    if violations_path.exists():
+        try:
+            violations = [json.loads(line) for line in violations_path.read_text(encoding="utf-8").splitlines() if line]
+        except (OSError, json.JSONDecodeError) as exc:
+            reasons.append(f"backend governance violations are unreadable: {exc}")
+        else:
+            hard = [item for item in violations if isinstance(item, dict) and item.get("hard") is True]
+            if hard:
+                reasons.append(f"attempt has {len(hard)} hard backend governance violation(s)")
     exit_code, exit_code_error = parse_exit_code(exit_code_raw)
     if exit_code_error:
         reasons.append(exit_code_error)
@@ -312,8 +360,14 @@ def validate_worker_handoff(
         )
 
     state = status.get("state")
-    if state != "running":
-        reasons.append(f"STATUS.state must remain running until dispatch applies handoff, got {state!r}")
+    if requested_state == "review":
+        allowed_active_states = {"running"}
+    else:
+        allowed_active_states = {"planning", "running"}
+    expected_state = state if state in allowed_active_states else "running"
+    if state not in allowed_active_states:
+        allowed = ", ".join(sorted(allowed_active_states))
+        reasons.append(f"STATUS.state must remain one of [{allowed}] until dispatch applies handoff, got {state!r}")
 
     if status.get("current_attempt_id") != attempt_id:
         reasons.append(
@@ -324,23 +378,82 @@ def validate_worker_handoff(
     last_transition = history[-1] if history else {}
     valid_history = (
         isinstance(last_transition, dict)
-        and last_transition.get("to") == "running"
+        and last_transition.get("to") == expected_state
         and last_transition.get("actor") == "dispatch"
         and parse_iso(last_transition.get("at")) is not None
     )
     if not valid_history:
-        reasons.append("state_history must show dispatch moved the task into running before worker handoff")
+        reasons.append(f"state_history must show dispatch moved the task into {expected_state} before worker handoff")
 
     handoff_ok = has_substantive_content(task_dir / "HANDOFF.md")
     evidence_ok = has_substantive_content(task_dir / "EVIDENCE.md")
 
-    if requested_state == "review":
+    if requested_state == "strategy_review":
+        if exit_code != 0:
+            reasons.append(f"strategy review handoff requires exit_code 0, got {exit_code!r}")
+        if not handoff_ok or not evidence_ok:
+            reasons.append("strategy review handoff requires substantive HANDOFF.md and EVIDENCE.md")
+        revision = request.get("strategy_revision") if isinstance(request, dict) else None
+        digest = request.get("strategy_sha256") if isinstance(request, dict) else None
+        if not is_int_not_bool(revision) or revision <= 0 or not is_non_empty_string(digest):
+            reasons.append("strategy review handoff requires strategy_revision and strategy_sha256")
+        else:
+            try:
+                from strategy import canonical_digest, strategy_path
+
+                submitted = load_json(strategy_path(task_dir, revision))
+                if canonical_digest(submitted) != digest:
+                    reasons.append("strategy review handoff digest does not match submitted strategy")
+            except Exception as exc:
+                reasons.append(f"strategy review handoff cannot load submitted strategy: {exc}")
+    elif requested_state == "review":
         if exit_code != 0:
             reasons.append(f"review handoff requires exit_code 0, got {exit_code!r}")
         if not handoff_ok:
             reasons.append("review handoff requires substantive HANDOFF.md")
         if not evidence_ok:
             reasons.append("review handoff requires substantive EVIDENCE.md")
+        try:
+            attempt = load_json(task_dir / "attempts" / attempt_id / "ATTEMPT.json")
+            if attempt.get("phase") != "execution":
+                reasons.append("review handoff requires an execution attempt")
+            from strategy import load_approved_strategy
+
+            approved, _ = load_approved_strategy(task_dir)
+            attempt_runtime = task_dir / "attempts" / attempt_id / "runtime"
+            records_path = attempt_runtime / "WORKFLOWS.ndjson"
+            records = []
+            if records_path.exists():
+                records = [json.loads(line) for line in records_path.read_text().splitlines() if line.strip()]
+            if approved["completion_gate"]["required_workflows_complete"]:
+                completed = {
+                    record.get("workflow_id")
+                    for record in records
+                    if record.get("event") == "workflow_completed"
+                }
+                missing = sorted(
+                    workflow["workflow_id"]
+                    for workflow in approved["workflows"]
+                    if workflow["required"] and workflow["workflow_id"] not in completed
+                )
+                if missing:
+                    reasons.append(f"required workflows are incomplete: {missing}")
+            commands_path = attempt_runtime / "COMMANDS.ndjson"
+            commands = []
+            if commands_path.exists():
+                commands = [json.loads(line) for line in commands_path.read_text().splitlines() if line.strip()]
+            acceptance_commands = [item for item in commands if item.get("acceptance") is True]
+            if approved["completion_gate"]["acceptance_commands_pass"] and (
+                not acceptance_commands
+                or any(item.get("exit_code") != 0 or item.get("timed_out") for item in acceptance_commands)
+            ):
+                reasons.append("acceptance command completion gate failed")
+            if not approved["completion_gate"]["optional_workflows_may_timeout"] and any(
+                record.get("event") == "workflow_timed_out" for record in records
+            ):
+                reasons.append("workflow timeout is forbidden by the completion gate")
+        except Exception as exc:
+            reasons.append(f"review handoff cannot validate approved strategy completion: {exc}")
     elif requested_state == "blocked":
         if not handoff_ok:
             reasons.append("blocked handoff requires substantive HANDOFF.md")
@@ -353,7 +466,7 @@ def validate_worker_handoff(
 
     return HandoffValidationResult(
         valid=not reasons,
-        handoff_state=requested_state if requested_state in {"review", "blocked"} else None,
+        handoff_state=requested_state if requested_state in {"strategy_review", "review", "blocked"} else None,
         exit_code=exit_code,
         reasons=reasons,
         request=request,

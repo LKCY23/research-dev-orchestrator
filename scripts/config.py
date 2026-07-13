@@ -9,11 +9,12 @@ try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
     tomllib = None  # type: ignore[assignment]
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
 from protocol import IO_MODES, PERMISSION_MODES, RUNTIME_BACKENDS, WORKER_BACKENDS
+from agent_backends import validate_project_governance
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class RdoConfig:
     stale_created_minutes: float = 10.0
     task_branch_prefix: str = "agent/"
     worktree_root: str = ".agent-worktrees"
+    backend_policies: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,7 @@ TOML_SCHEMA = {
     "tmux": {"session_prefix", "keep_session", "wait_timeout_seconds", "exit_code_grace_seconds"},
     "status": {"stale_lock_hours", "stale_created_minutes"},
     "task": {"branch_prefix", "worktree_root"},
+    "backends": None,
 }
 
 
@@ -189,6 +192,20 @@ def apply_toml(config: RdoConfig, payload: dict[str, Any]) -> tuple[RdoConfig, l
     for section, value in payload.items():
         if section not in TOML_SCHEMA:
             warnings.append(f"unknown section [{section}]")
+            continue
+        if section == "backends":
+            if not isinstance(value, dict):
+                errors.append("[backends] must be a table")
+                continue
+            policies: dict[str, dict[str, Any]] = {}
+            for backend_id, policy in value.items():
+                backend_errors = validate_project_governance(
+                    backend_id, policy, prefix=f'[backends."{backend_id}"]'
+                )
+                errors.extend(backend_errors)
+                if not backend_errors:
+                    policies[backend_id] = dict(policy)
+            updated = apply_field(updated, "backend_policies", policies)
             continue
         if not isinstance(value, dict):
             errors.append(f"[{section}] must be a table")

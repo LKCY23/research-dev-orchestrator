@@ -8,7 +8,7 @@ cd "${repo}"
 worker="${repo}/worker-review.sh"
 make_review_worker "${worker}"
 
-init_run_and_task smoke-run T001-generic generic
+init_run_and_task smoke-run T001-generic generic codex
 "${RDO_ROOT}/scripts/dispatch_agent.sh" smoke-run T001-generic \
   --worker codex \
   --runtime plain \

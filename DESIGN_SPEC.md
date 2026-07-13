@@ -20,9 +20,35 @@ Git is the isolation boundary.
 FSM is a hard protocol.
 ```
 
-第一版不做常驻服务、不依赖 `resume`、不自动 review、不引入数据库或消息队列。
+不做常驻服务、不依赖 `resume`、不自动批准代码、不引入数据库或消息队列。每次 execution attempt 使用一个同生命周期的确定性 supervisor。
 
-## 2. 顶层流程
+## 2. 执行治理
+
+Worker 执行分为 planning 和 execution。Planning attempt 只读代码并提交不可变 `STRATEGY-vNNN.json`；orchestrator 审查并绑定策略 SHA-256 后，新的 execution attempt 才能开始。
+
+一个 strategy 可以声明多个 workflow。已批准 workflow 可在预算内产生多个 runtime instance；新增 workflow 类型、提高预算/并发/权限、扩大路径或启动无界搜索时，必须提交新 revision。
+
+```text
+task + EXECUTION_POLICY
+  -> planning attempt
+  -> strategy review
+  -> supervised execution attempt
+  -> atomic handoff
+  -> coordinator code review
+```
+
+详见 `references/execution-strategy.md`、`references/attempt-supervision.md` 和 `references/tmux-control.md`。
+
+Backend 长期治理、task strategy 与单次 attempt settings 必须保持分离。各
+agent CLI 的能力不一致，因此治理策略由 backend adapter 分别定义；dispatch
+再将 backend policy、task policy 和已批准 strategy 编译为 attempt-local
+profile。该扩展的完整设计和实施状态见 `references/backend-governance.md`。
+
+当前 v0.4 已实现 Claude Code adapter 的 profile 编译、attempt-local settings、
+native-agent Hook 和 handoff gate。其他 backend 只声明经过验证的能力，不会
+复用或伪造 Claude 专属控制。
+
+## 3. 顶层流程
 
 ```text
 需求澄清
@@ -207,6 +233,8 @@ references/state-machine.json
 {
   "states": [
     "pending",
+    "planning",
+    "strategy_review",
     "running",
     "blocked",
     "review",
@@ -218,26 +246,37 @@ references/state-machine.json
   "terminal_states": ["merged", "failed"],
   "transitions": {
     "pending": {
-      "running": ["dispatch"]
+      "planning": ["dispatch"]
+    },
+    "planning": {
+      "strategy_review": ["dispatch"],
+      "blocked": ["dispatch"]
+    },
+    "strategy_review": {
+      "changes_requested": ["coordinator"],
+      "running": ["dispatch"],
+      "failed": ["coordinator"]
     },
     "running": {
-      "review": ["claude-code"],
-      "blocked": ["claude-code"]
+      "review": ["dispatch"],
+      "blocked": ["dispatch"],
+      "strategy_review": ["dispatch"]
     },
     "blocked": {
+      "planning": ["dispatch"],
       "running": ["dispatch"],
-      "failed": ["codex"]
+      "failed": ["coordinator"]
     },
     "review": {
-      "approved": ["codex"],
-      "changes_requested": ["codex"],
-      "failed": ["codex"]
+      "approved": ["coordinator"],
+      "changes_requested": ["coordinator"],
+      "failed": ["coordinator"]
     },
     "changes_requested": {
-      "running": ["dispatch"]
+      "planning": ["dispatch"]
     },
     "approved": {
-      "merged": ["codex"]
+      "merged": ["coordinator"]
     },
     "merged": {},
     "failed": {}
@@ -252,13 +291,14 @@ create_task.py:
   only creates pending
 
 dispatch_claude.sh:
-  pending -> running
-  blocked -> running
-  changes_requested -> running
+  pending|blocked|changes_requested -> planning
+  planning -> strategy_review after validated strategy handoff
+  strategy_review -> running only for an approved exact strategy digest
+  explicit blocked -> running may retry the still-approved strategy
 
-Claude Code:
-  running -> review
-  running -> blocked
+Worker request, applied by dispatch:
+  planning -> strategy_review
+  running -> review|blocked|strategy_review
 
 collect_status.py:
   read-only validation
@@ -748,7 +788,7 @@ EVENTS + diagnostics  保留审计记录
 触发条件：
 
 ```text
-STATUS.state != running but .dispatch-lock exists
+STATUS.state not in planning|running but .dispatch-lock exists
 STATUS.state = running but .dispatch-lock/attempt_id mismatch
 STATUS.state = running but ATTEMPT.state in [completed, invalid_handoff]
 .dispatch-lock age > stale threshold
@@ -1113,16 +1153,17 @@ Only creates pending task.
 
 ```text
 1. 读取 state-machine.json。
-2. 校验 pending|blocked|changes_requested -> running 是否合法。
+2. 根据当前 state 选择 planning 或 execution phase，并校验对应 FSM transition。
 3. 原子获取 .dispatch-lock；不能用 LOCK 作为互斥判断。
 4. 创建 branch/worktree。
 5. 创建 attempt 目录。
 6. 拼接 prompt.md，并显式写入 TASK_DIR、STATUS_PATH、EVIDENCE_PATH、HANDOFF_PATH、ATTEMPT_DIR 等绝对协议路径。
-7. 调用配置化 Claude Code CLI；默认 plain backend，可选 tmux backend 用于 attachable execution。
-8. 保存 transcript.log / result.md。
-9. 检查 worker 是否写出合法交付状态；review 必须 exit_code = 0，blocked 可为非零。
-10. 维护 ATTEMPT.json state / ended_at / exit_code / handoff_valid / handoff_state。
-11. 追加 task_dispatched / worker_review_ready / worker_blocked / worker_exit_without_valid_status events。
+7. Planning 阶段对 worktree 做前后内容指纹检查；execution 阶段校验已批准 strategy digest。
+8. 通过 attempt-local supervisor 调用配置化 worker CLI；默认 plain backend，可选 tmux backend 用于 attachable execution。
+9. 保存 transcript.log / result.md / supervisor runtime metadata。
+10. 检查 worker 是否写出合法交付状态；strategy_review/review 必须 exit_code = 0，blocked 可为非零。
+11. 维护 ATTEMPT.json phase / strategy digest / state / ended_at / exit_code / handoff fields。
+12. 追加 strategy、workflow、timeout 和 worker handoff events。
 ```
 
 限制：
@@ -1140,11 +1181,11 @@ Do not release .dispatch-lock on tmux timeout before exit_code appears.
 dispatch 后必须检查：
 
 ```text
-STATUS.json.state in [review, blocked]
+STATUS.json.state in [strategy_review, review, blocked]
 STATUS.json.current_attempt_id == current attempt
-STATUS.json.previous_state == running
-last state_history is running -> review|blocked by claude-code with valid timestamp
-review: exit_code == 0 and EVIDENCE.md + HANDOFF.md have substantive content
+STATUS.json.previous_state matches attempt phase (planning|running)
+last state_history is planning|running -> requested terminal state by dispatch with valid timestamp
+strategy_review/review: exit_code == 0 and EVIDENCE.md + HANDOFF.md have substantive content
 blocked: HANDOFF.md + allowed blocker_type + blocking_reason have substantive content
 attempt transcript/result exists
 ```

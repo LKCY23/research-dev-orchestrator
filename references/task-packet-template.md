@@ -16,7 +16,7 @@ logs/
 attempts/
 ```
 
-`LOCK` is human-readable ownership metadata. `.dispatch-lock/` is present only while active dispatch/worker execution is held. `create_task.py` must not create either file.
+`LOCK` is human-readable ownership metadata. `.dispatch-lock/` is present only while an active planning or execution dispatch is held. `create_task.py` must not create either file.
 
 ## TASK.md
 

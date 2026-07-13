@@ -26,6 +26,18 @@ design_method_selected
 adr_added
 task_created
 task_dispatched
+strategy_submitted
+strategy_reviewed
+strategy_review_ready
+strategy_revision_requested
+workflow_started
+workflow_heartbeat
+workflow_completed
+workflow_timed_out
+worker_instruction_submitted
+worker_interrupted
+worker_terminated
+attempt_timed_out
 worker_blocked
 worker_review_ready
 worker_exit_without_valid_status
@@ -43,7 +55,7 @@ session_closed
 
 Do not record every small edit. Record events needed to reconstruct the history of requirements, design, dispatch, review, merge, experiments, blockers, and session closeout.
 
-`worker_review_ready`, `worker_blocked`, and `worker_exit_without_valid_status` describe the worker outcome, but the event actor is `dispatch` because dispatch validates the worker's handoff request and applies the terminal task transition. Workers do not write terminal `STATUS.json` transitions directly.
+`strategy_review_ready`, `worker_review_ready`, `worker_blocked`, and `worker_exit_without_valid_status` describe worker outcomes, but the event actor is `dispatch` because dispatch validates handoff and applies the task transition. Workers do not write terminal `STATUS.json` transitions directly.
 
 `dispatch_lock_removed` records a user-approved recovery action that removed a stale `.dispatch-lock`. It must include `task_id`, should include `attempt_id` when known, and should include `reason` plus a diagnostics `snapshot` path.
 

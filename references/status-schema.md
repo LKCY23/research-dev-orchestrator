@@ -34,7 +34,7 @@
   "state_history": [
     {
       "from": "pending",
-      "to": "running",
+      "to": "planning",
       "actor": "dispatch",
       "at": "2026-07-03T12:00:00Z"
     }
@@ -95,10 +95,12 @@ Template-only `EVIDENCE.md` or `HANDOFF.md` files with `RDO_TEMPLATE` markers ar
 
 `current_attempt_id` points to the current `attempts/<attempt-id>/ATTEMPT.json`.
 
-`STATUS.state = running` requires matching `LOCK` metadata, an active `.dispatch-lock`, and an attempt whose state is `created` or `running`.
+`STATUS.state = planning|running` requires matching `LOCK` metadata, an active `.dispatch-lock`, and an attempt whose state is `created` or `running`. The attempt phase must match the task state.
 
 For tmux dispatch timeout before the attempt-local `exit_code` file appears, `STATUS.state` remains `running`, `ATTEMPT.state` remains `running`, and `.dispatch-lock` remains in place until Lock Recovery Review.
 
 `STATUS.state = review` requires `previous_state = running`, a completed attempt with `handoff_valid = true`, `handoff_state = review`, worker `exit_code = 0`, substantive `EVIDENCE.md` and `HANDOFF.md`, and `HANDOFF.json` with `requested_state = review`. The final `running -> review` state transition is written by `dispatch`, not by the worker.
 
-`STATUS.state = blocked` requires `previous_state = running`, valid `blocker_type`, and non-empty `blocking_reason`. A normal blocked handoff also requires a completed attempt with `handoff_valid = true`, `handoff_state = blocked`, substantive `HANDOFF.md`, and `HANDOFF.json` with `requested_state = blocked`. An invalid worker handoff may instead use `ATTEMPT.state = invalid_handoff`, `handoff_valid = false`, and `blocker_type = needs_coordinator` for coordinator triage. The final `running -> blocked` state transition is written by `dispatch`, not by the worker.
+`STATUS.state = strategy_review` requires a completed planning or execution revision attempt with `handoff_state = strategy_review`, exit code `0`, and a handoff digest matching an immutable submitted strategy revision. No `.dispatch-lock` may remain active.
+
+`STATUS.state = blocked` requires `previous_state = planning|running`, valid `blocker_type`, and non-empty `blocking_reason`. A normal blocked handoff also requires a completed attempt with `handoff_valid = true`, `handoff_state = blocked`, substantive `HANDOFF.md`, and `HANDOFF.json` with `requested_state = blocked`. An invalid worker handoff may instead use `ATTEMPT.state = invalid_handoff`, `handoff_valid = false`, and `blocker_type = needs_coordinator` for coordinator triage. The final transition is written by `dispatch`, not by the worker.

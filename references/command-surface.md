@@ -2,6 +2,27 @@
 
 Coordinator intents are structured natural-language requests for Codex. They are not executable shell commands, and they are not registered Codex slash commands.
 
+The separate `scripts/rdo.py` executable is a narrow local control surface used by coordinator and worker agents through shell tools. It is not RPC and does not call a foreground agent session.
+
+Coordinator-only commands:
+
+```text
+rdo strategy approve|changes
+rdo worker message|interrupt|terminate
+rdo status
+```
+
+Worker-only commands:
+
+```text
+rdo strategy submit|revise
+rdo workflow start|heartbeat|complete
+rdo exec --attempt-dir <path> --workflow-id <id> --instance-id <id> --timeout <seconds> [--acceptance] -- <command>
+rdo handoff
+```
+
+Workers may submit artifacts and runtime events, but may not approve strategy, mutate `STATUS.json`, or merge.
+
 Use them in either of these forms:
 
 ```text

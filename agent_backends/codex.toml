@@ -2,6 +2,20 @@ id = "codex"
 display_name = "Codex"
 roles = ["coordinator", "worker"]
 
+[capabilities]
+tool_stream_events = true
+native_subagents = true
+session_config_overrides = true
+subagent_lifecycle_events = true
+native_parallel_agent_limit = true
+native_agent_depth_limit = true
+
+[governance]
+enable_multi_agent = true
+max_agent_threads = 4
+max_agent_depth = 1
+enforce_spawn_limit = false
+
 [prompt]
 machine_transport = "arg"
 human_transport = "arg"
@@ -16,7 +30,12 @@ args = []
 
 [permission_modes.auto]
 supported = true
-args = ["--ask-for-approval", "never"]
+args = [
+  "--ask-for-approval", "on-request",
+  "--sandbox", "workspace-write",
+  "--enable", "guardian_approval",
+  "-c", "approvals_reviewer=\"guardian_subagent\"",
+]
 
 [permission_modes.yolo]
 supported = true

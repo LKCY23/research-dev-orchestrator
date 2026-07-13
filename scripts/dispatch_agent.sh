@@ -13,6 +13,7 @@ Options:
   --agent-name <name>       worker display name
   --session-id <id>         backend session id for manual resume metadata
   --command <shell-command> explicit command override, mainly for tests
+  --phase <phase>           planning | execution (auto-detected when omitted)
 EOF
 }
 
@@ -53,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --command)
       export RDO_WORKER_COMMAND="$2"
+      shift 2
+      ;;
+    --phase)
+      export RDO_ATTEMPT_PHASE="$2"
       shift 2
       ;;
     -h|--help)

@@ -2,6 +2,21 @@ id = "opencode"
 display_name = "OpenCode"
 roles = ["worker"]
 
+[capabilities]
+tool_stream_events = true
+native_subagents = true
+session_server = true
+permission_events = true
+native_agent_depth_limit = false
+native_parallel_agent_limit = false
+
+[governance]
+enable_native_subagents = true
+allowed_subagent_types = ["general", "explore", "scout"]
+max_parallel_subagents = 4
+max_agent_depth = 1
+pure_mode = false
+
 [prompt]
 machine_transport = "arg"
 human_transport = "arg"

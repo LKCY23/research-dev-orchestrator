@@ -72,8 +72,8 @@ def load_handoff_index(task_dir: Path) -> tuple[dict[str, Any] | None, list[str]
 
     warnings: list[str] = []
     requested_state = payload.get("requested_state")
-    if requested_state not in {"", None, "review", "blocked"}:
-        warnings.append(f"{task_dir.name}: HANDOFF.json requested_state should be review or blocked")
+    if requested_state not in {"", None, "strategy_review", "review", "blocked"}:
+        warnings.append(f"{task_dir.name}: HANDOFF.json requested_state should be strategy_review, review, or blocked")
     for field in ("commands_run", "files_changed", "known_limitations"):
         if field in payload and not isinstance(payload.get(field), list):
             warnings.append(f"{task_dir.name}: HANDOFF.json {field} must be a list")
@@ -141,14 +141,19 @@ def validate_attempt(
 
     lock = task_dir / "LOCK"
     dispatch_lock = task_dir / ".dispatch-lock"
-    if state == "running":
+    if state in {"planning", "running"}:
+        expected_phase = "planning" if state == "planning" else "execution"
         dispatch_pid_alive: bool | None = None
         if attempt_state not in {"created", "running"}:
-            violations.append(f"{task_dir.name}: STATUS running requires ATTEMPT.state created or running, got {attempt_state!r}")
+            violations.append(
+                f"{task_dir.name}: STATUS {state} requires ATTEMPT.state created or running, got {attempt_state!r}"
+            )
+        if attempt.get("phase") != expected_phase:
+            violations.append(f"{task_dir.name}: STATUS {state} requires ATTEMPT.phase={expected_phase}")
         if not lock.exists():
-            violations.append(f"{task_dir.name}: STATUS running requires LOCK")
+            violations.append(f"{task_dir.name}: STATUS {state} requires LOCK")
         if not dispatch_lock.is_dir():
-            violations.append(f"{task_dir.name}: STATUS running requires active .dispatch-lock")
+            violations.append(f"{task_dir.name}: STATUS {state} requires active .dispatch-lock")
         else:
             dispatch_attempt = dispatch_lock / "attempt_id"
             if not dispatch_attempt.exists():
@@ -157,17 +162,19 @@ def validate_attempt(
                 violations.append(f"{task_dir.name}: .dispatch-lock attempt_id does not match STATUS current_attempt_id")
             pid_path = dispatch_lock / "pid"
             if not pid_path.exists():
-                violations.append(f"{task_dir.name}: .dispatch-lock missing pid while STATUS is running")
+                violations.append(f"{task_dir.name}: .dispatch-lock missing pid while STATUS is {state}")
             else:
                 pid_text = pid_path.read_text(encoding="utf-8", errors="replace").strip()
                 try:
                     pid = int(pid_text)
                 except ValueError:
-                    violations.append(f"{task_dir.name}: .dispatch-lock pid is not an integer while STATUS is running: {pid_text!r}")
+                    violations.append(
+                        f"{task_dir.name}: .dispatch-lock pid is not an integer while STATUS is {state}: {pid_text!r}"
+                    )
                 else:
                     dispatch_pid_alive = pid_is_alive(pid)
                     if not dispatch_pid_alive:
-                        violations.append(f"{task_dir.name}: .dispatch-lock pid is not alive while STATUS is running: {pid}")
+                        violations.append(f"{task_dir.name}: .dispatch-lock pid is not alive while STATUS is {state}: {pid}")
             if runtime.get("backend") == "tmux" and attempt_state == "running":
                 exit_code_path = attempt_path.parent / "exit_code"
                 if exit_code_path.exists():
@@ -183,7 +190,21 @@ def validate_attempt(
                         )
     elif dispatch_lock.exists():
         violations.append(f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}")
-    if state == "review":
+    if state == "strategy_review":
+        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "strategy_review":
+            violations.append(
+                f"{task_dir.name}: STATUS strategy_review requires completed attempt with handoff_state=strategy_review"
+            )
+        if attempt.get("exit_code") != 0:
+            violations.append(f"{task_dir.name}: STATUS strategy_review requires worker exit_code=0")
+        request, request_reasons = load_handoff_request(task_dir)
+        for reason in request_reasons:
+            violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
+        if isinstance(request, dict) and request.get("requested_state") != "strategy_review":
+            violations.append(
+                f"{task_dir.name}: STATUS strategy_review requires HANDOFF.json requested_state=strategy_review"
+            )
+    elif state == "review":
         if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "review":
             violations.append(f"{task_dir.name}: STATUS review requires completed attempt with handoff_state=review")
         if attempt.get("exit_code") != 0:
@@ -211,6 +232,32 @@ def validate_attempt(
                 violations.append(f"{task_dir.name}: invalid_handoff blocked task requires blocker_type=needs_coordinator")
         else:
             violations.append(f"{task_dir.name}: STATUS blocked requires completed or invalid_handoff attempt")
+
+    if attempt.get("phase") == "execution":
+        try:
+            from strategy import canonical_digest, load_approved_strategy
+
+            if state == "strategy_review":
+                matching_review = False
+                for review_path in (task_dir / "strategy").glob("REVIEW-v*.json"):
+                    review = load_json(review_path)
+                    if (
+                        review.get("decision") == "approved"
+                        and review.get("strategy_sha256") == attempt.get("strategy_sha256")
+                    ):
+                        matching_review = True
+                        break
+                if not matching_review:
+                    violations.append(f"{task_dir.name}: revision attempt is not bound to a previously approved strategy")
+            else:
+                approved, review = load_approved_strategy(task_dir)
+                digest = canonical_digest(approved)
+                if attempt.get("strategy_id") != approved.get("strategy_id"):
+                    violations.append(f"{task_dir.name}: execution attempt strategy_id does not match approved strategy")
+                if attempt.get("strategy_sha256") != digest or review.get("strategy_sha256") != digest:
+                    violations.append(f"{task_dir.name}: execution attempt strategy digest does not match approval")
+        except Exception as exc:
+            violations.append(f"{task_dir.name}: execution attempt has no valid approved strategy: {exc}")
 
     return violations, warnings, attempt
 

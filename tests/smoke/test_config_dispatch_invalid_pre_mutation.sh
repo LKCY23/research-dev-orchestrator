@@ -5,7 +5,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 repo="$(setup_smoke_repo)"
 cd "${repo}"
-init_run_and_task smoke-run T001-invalid-config invalid
+init_raw_run_and_task smoke-run T001-invalid-config invalid
 cat > .agent-collab/rdo.toml <<'TOML'
 [runtime]
 backend = "daemon"

@@ -22,6 +22,8 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - `scripts/protocol.py` is the script-internal source for protocol constants and low-level helpers. `scripts/validation.py` owns shared protocol validation rules used by online dispatch gates and offline status audit. Neither file is a user interface or public SDK.
 - `.agent-collab/rdo.toml` and `scripts/config.py` own operational defaults only. They must not configure protocol states, schema fields, events, blocker types, or protocol version.
 - Worker runtime backend is an execution detail. Default to `plain`; use `tmux` only when the user wants attachable long-running worker observation. Backend choice must not change protocol truth sources.
+- Before execution, use a read-only planning attempt and coordinator-reviewed immutable strategy revision. A strategy may contain multiple workflows and configurable budgets.
+- Treat backend-native tool timeouts as advisory. Attempt-local deterministic supervision owns the final process-group deadline and cleanup boundary.
 - Coordinator intents are structured natural-language requests for human control. They are not Codex slash commands and must still follow all protocol invariants.
 - Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
 
@@ -70,7 +72,7 @@ This is the canonical default progression. A stage-aware entry may begin later o
 4. Decompose work into task packets using `references/task-packet-template.md`.
 5. Create a run with `scripts/init_run.py` if no run exists.
 6. Create tasks with `scripts/create_task.py`.
-7. Dispatch worker tasks with `scripts/dispatch_agent.sh` only when task states allow dispatch. `scripts/dispatch_claude.sh` remains a compatibility entrypoint.
+7. Dispatch a planning attempt, review its strategy revision, then dispatch execution only when task state and approved strategy digest allow it.
 8. Collect state with `scripts/collect_status.py`; use `--json` for machine consumers and `--write-summary` for `SUMMARY.md`. Use `scripts/render_dashboard.py` when the user wants a visual run monitor.
 9. Review tasks manually using `references/review-rubric.md`.
 10. Only mark `approved` after diff review, evidence review, mergeability verification, and required integration smoke tests pass.
@@ -95,10 +97,14 @@ Read references only when they are needed:
 - `references/attempt-lifecycle.md`: use before dispatching workers or auditing running/review/blocked invariants.
 - `references/configuration.md`: use when changing `.agent-collab/rdo.toml`, config defaults, env overrides, stale thresholds, or task branch/worktree defaults.
 - `references/runtime-backends.md`: use before enabling `RDO_RUNTIME_BACKEND=tmux` or auditing backend-specific attempt metadata.
+- `references/execution-strategy.md`: use before planning, approving, revising, or running a multi-workflow strategy.
+- `references/attempt-supervision.md`: use before changing process deadlines, bounded execution, or cleanup behavior.
+- `references/tmux-control.md`: use before messaging, interrupting, or terminating a tmux worker.
 - `references/agent-backends.md`: use before changing worker backend registry definitions or backend-specific command contracts.
+- `references/backend-governance.md`: use before changing durable backend policy, strategy/backend binding, attempt profile compilation, backend settings, native-agent hooks, or stream monitors.
 - `references/protocol-constants.md`: use when changing script constants, exit codes, blocker types, or event types.
 - `references/command-surface.md`: use when the user invokes coordinator intent phrases such as `$research-dev-orchestrator dispatch ...`.
-- `references/lock-recovery.md`: use when `.dispatch-lock` is stale, mismatched, or present outside `running`.
+- `references/lock-recovery.md`: use when `.dispatch-lock` is stale, mismatched, or present outside active `planning|running`.
 - `references/review-rubric.md`: use before Codex review and merge decisions.
 - `references/summary-template.md`: use when updating or auditing `SUMMARY.md`.
 - `references/events-schema.md`: use when appending or auditing `EVENTS.ndjson`.
@@ -158,7 +164,7 @@ Read `references/command-surface.md` before acting on these intents. `review` do
 
 `dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; dispatch remains responsible for locks, worktrees, process supervision, and handoff validation.
 
-`dispatch_agent.sh` is the generic worker dispatch entrypoint. It may transition `pending|blocked|changes_requested -> running`, atomically acquire `.dispatch-lock`, write `LOCK` ownership metadata, create an attempt, call a configured worker CLI, and verify whether the worker wrote a valid `HANDOFF.json` terminal request. It loads operational defaults from config before any protocol mutation, but explicit env vars still win. It gives the worker absolute protocol file paths because the worker runs inside a task worktree while `.agent-collab` lives in the target repository root. It must update `ATTEMPT.json` lifecycle fields and applies validated `running -> review|blocked` terminal transitions. A `review` request requires worker `exit_code = 0`; `blocked` may have a nonzero exit code if blocker metadata and handoff are valid. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
+`dispatch_agent.sh` is the generic worker dispatch entrypoint. Automatic dispatch maps `pending|blocked|changes_requested -> planning`, and maps `strategy_review -> running` only when an immutable strategy revision has coordinator approval for the exact digest. A coordinator may explicitly dispatch `blocked -> running` to retry a still-approved strategy. Dispatch atomically acquires `.dispatch-lock`, creates a phase-tagged attempt, runs the worker through the attempt supervisor, and validates `HANDOFF.json`. Valid planning handoff produces `strategy_review`; valid execution handoff produces `review`, `blocked`, or a revised `strategy_review`. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
 
 Worker backend configuration:
 

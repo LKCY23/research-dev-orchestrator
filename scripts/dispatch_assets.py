@@ -25,7 +25,28 @@ def render_worker_prompt(
     attempt_dir: Path,
     worker_backend: str = "claude-code",
     agent_name: str = "",
+    phase: str = "execution",
+    strategy_path: str = "",
 ) -> str:
+    if phase == "planning":
+        phase_rules = [
+            "## Planning Phase",
+            "",
+            "- Inspect the task and worktree read-only. Do not edit, commit, or run implementation workflows.",
+            "- Design all anticipated workflows, subagents, permissions, dependencies, budgets, and completion gates.",
+            f"- Set strategy.backend_id to {worker_backend!r}; an approved strategy cannot execute through another backend.",
+            f"- Write the strategy JSON outside the worktree, then run: python3 {Path(__file__).resolve().parent / 'rdo.py'} strategy submit --task-dir {task_dir} --file <strategy-file>.",
+            "- Exit immediately after strategy submission; the coordinator reviews it in a separate step.",
+        ]
+    else:
+        phase_rules = [
+            "## Execution Phase",
+            "",
+            f"- Execute only the approved strategy at: {strategy_path}",
+            f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} workflow start|heartbeat|complete for workflow instances.",
+            f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> [--acceptance] -- <command> for bounded commands.",
+            "- A new workflow kind, larger budget, wider permission, or exhaustive search requires a strategy revision and checkpoint.",
+        ]
     return "\n".join(
         [
             "# Worker Task Prompt",
@@ -54,12 +75,14 @@ def render_worker_prompt(
             "## Protocol Reminders",
             "",
             "- Do not edit STATUS.json. Dispatch owns task state transitions.",
-            "- Request terminal state by writing HANDOFF.json with requested_state=review or requested_state=blocked.",
+            "- Use the provided rdo command for strategy submission or final handoff; do not hand-edit task state.",
             "- If blocked, blocker_type must be one of: needs_coordinator, needs_user, environment, budget, irrecoverable.",
             "- Remove RDO_TEMPLATE markers from EVIDENCE.md or HANDOFF.md before ending.",
             "- Write substantive EVIDENCE.md and HANDOFF.md before ending.",
             "- HANDOFF.json is required for handoff. Set _template=false and keep HANDOFF.md as the human-readable source.",
             "- Keep code changes inside allowed_paths.",
+            "",
+            *phase_rules,
             "",
             "## TASK.md",
             read_text(task_dir / "TASK.md"),
@@ -157,6 +180,8 @@ def cmd_render_prompt(args: argparse.Namespace) -> int:
             attempt_dir=Path(args.attempt_dir),
             worker_backend=args.worker_backend,
             agent_name=args.agent_name,
+            phase=args.phase,
+            strategy_path=args.strategy_path,
         ),
         encoding="utf-8",
     )
@@ -196,6 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
     prompt.add_argument("--attempt-dir", required=True)
     prompt.add_argument("--worker-backend", default="claude-code")
     prompt.add_argument("--agent-name", default="")
+    prompt.add_argument("--phase", choices=["planning", "execution"], required=True)
+    prompt.add_argument("--strategy-path", default="")
     prompt.set_defaults(func=cmd_render_prompt)
 
     runner = sub.add_parser("render-tmux-runner")

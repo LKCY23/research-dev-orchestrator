@@ -1,6 +1,8 @@
 {
   "states": [
     "pending",
+    "planning",
+    "strategy_review",
     "running",
     "blocked",
     "review",
@@ -12,13 +14,24 @@
   "terminal_states": ["merged", "failed"],
   "transitions": {
     "pending": {
-      "running": ["dispatch"]
+      "planning": ["dispatch"]
+    },
+    "planning": {
+      "strategy_review": ["dispatch"],
+      "blocked": ["dispatch"]
+    },
+    "strategy_review": {
+      "changes_requested": ["coordinator"],
+      "running": ["dispatch"],
+      "failed": ["coordinator"]
     },
     "running": {
       "review": ["dispatch"],
-      "blocked": ["dispatch"]
+      "blocked": ["dispatch"],
+      "strategy_review": ["dispatch"]
     },
     "blocked": {
+      "planning": ["dispatch"],
       "running": ["dispatch"],
       "failed": ["coordinator"]
     },
@@ -28,7 +41,7 @@
       "failed": ["coordinator"]
     },
     "changes_requested": {
-      "running": ["dispatch"]
+      "planning": ["dispatch"]
     },
     "approved": {
       "merged": ["coordinator"]

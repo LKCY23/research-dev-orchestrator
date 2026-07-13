@@ -28,8 +28,8 @@ LOCK           = human-readable ownership/audit metadata
 Run a Lock Recovery Review when any of these appear:
 
 ```text
-STATUS.state != running but .dispatch-lock exists
-STATUS.state = running but .dispatch-lock/attempt_id does not match current_attempt_id
+STATUS.state not in planning|running but .dispatch-lock exists
+STATUS.state in planning|running but .dispatch-lock/attempt_id does not match current_attempt_id
 STATUS.state = running but ATTEMPT.state is completed or invalid_handoff
 .dispatch-lock age exceeds the stale threshold
 .dispatch-lock/pid is missing

@@ -46,6 +46,7 @@ def cmd_command(args: argparse.Namespace) -> int:
         cwd=args.cwd,
         prompt=prompt,
         agent_name=args.agent_name,
+        backend_profile=args.backend_profile,
     )
     if args.json:
         print(json.dumps(rendered.__dict__, indent=2))
@@ -73,6 +74,7 @@ def main() -> int:
     command.add_argument("--prompt", default="")
     command.add_argument("--prompt-path", default="")
     command.add_argument("--agent-name", default="")
+    command.add_argument("--backend-profile", default="")
     command.add_argument("--json", action="store_true")
     command.set_defaults(func=cmd_command)
 

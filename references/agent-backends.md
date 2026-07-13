@@ -2,6 +2,11 @@
 
 Agent backends are concrete CLI adapters. They are separate from protocol roles and runtime supervision.
 
+The registry defines launch commands, permission-mode mappings, verified
+capabilities, and adapter-owned governance fields. Claude Code, Codex, OpenCode,
+and Kimi Code each compile their own verified governance surfaces. See
+`references/backend-governance.md`.
+
 ```text
 coordinator backend = who makes intent/review decisions
 worker backend      = which CLI executes one task attempt
@@ -36,6 +41,23 @@ tmux + human
 `plain + machine` is for non-interactive dispatch and transcript capture.
 
 `tmux + human` is for attachable observation. It is still supervised by dispatch; tmux is not a protocol source of truth.
+
+Codex native-subagent strategies support both runtime/IO pairs. Native thread
+and depth limits apply in either mode. If project policy explicitly enables the
+optional cumulative spawn limit, the adapter requires `plain + machine` so its
+JSONL supervisor can enforce that additional control.
+
+For Codex, RDO `auto` means the Codex **Approve for me** profile:
+`approval_policy=on-request`, `sandbox=workspace-write`, and the guardian
+approval reviewer. It is distinct from `yolo`, which bypasses both approvals and
+the sandbox. `approval_policy=never` is not used for `auto`: it merely prevents
+approval requests and returns denied escalations to the model.
+
+Kimi supports both runtime/IO pairs through an attempt-local configuration
+overlay. Its native swarm limit and background-task limit are combined with
+lifecycle hooks. OpenCode supports both pairs through a per-attempt local server:
+machine mode streams server events, while human mode attaches the TUI to the
+same supervised session.
 
 ## Prompt Transport
 
@@ -76,3 +98,8 @@ yolo
 If a backend does not support a requested permission mode, dispatch must fail before acquiring locks, creating attempts, or mutating `STATUS.json`.
 
 OpenCode currently supports `default` and `auto`; `yolo` is intentionally unsupported in its backend definition.
+
+Backend governance relies on documented upstream surfaces: [Kimi configuration](https://moonshotai.github.io/kimi-code/en/configuration/config-files.html),
+[Kimi hooks](https://moonshotai.github.io/kimi-code/en/customization/hooks.html),
+[OpenCode agents](https://opencode.ai/docs/agents/), and
+[OpenCode server API](https://opencode.ai/docs/server/).

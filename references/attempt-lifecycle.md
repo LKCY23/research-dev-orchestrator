@@ -7,6 +7,7 @@
 ```text
 Task FSM stays about task progress only.
 ATTEMPT.json owns worker execution lifecycle.
+Strategy revisions own reviewed execution intent; runtime workflow events own activity inside an execution attempt.
 collect_status.py validates invariants across STATUS, ATTEMPT, LOCK, EVENTS, EVIDENCE, and HANDOFF.
 No destructive overwrite; use a new run, new attempt, or revision task.
 ```
@@ -22,7 +23,7 @@ LOCK           = human-readable ownership metadata
 
 Release `.dispatch-lock` after the worker process exits and handoff validation finishes, including invalid handoff. Keep `LOCK` for audit until Codex review or triage.
 
-If `.dispatch-lock` exists while `STATUS.state` is not `running`, report a protocol violation. A stale execution mutex can block future dispatch even when the task appears ready for review or triage.
+If `.dispatch-lock` exists while `STATUS.state` is neither `planning` nor `running`, report a protocol violation. A stale execution mutex can block future dispatch even when the task appears ready for review or triage.
 
 ## ATTEMPT.json Schema
 
@@ -31,6 +32,11 @@ If `.dispatch-lock` exists while `STATUS.state` is not `running`, report a proto
   "attempt_id": "A001-claude-x4p9a",
   "task_id": "T001-name",
   "role": "worker",
+  "phase": "execution",
+  "strategy_id": "T001-S001",
+  "strategy_sha256": "...",
+  "backend_profile_sha256": "...",
+  "backend_settings_sha256": "...",
   "backend_id": "claude-code",
   "agent": "claude-code",
   "agent_name": "claude-worker-1",
@@ -66,6 +72,10 @@ agent: legacy backend alias; non-empty string
 agent_name: non-empty string
 session_id: string; may be empty only if runtime cannot provide one
 state: created|running|completed|invalid_handoff
+phase: planning|execution
+strategy_id/strategy_sha256: required for execution, null for planning
+backend_profile_sha256: digest of the pure compiled backend profile
+backend_settings_sha256: digest of generated native settings when the backend uses them
 started_at: non-empty valid ISO timestamp
 ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff
 exit_code: null for created/running; integer for completed; integer or null for invalid_handoff
@@ -98,7 +108,7 @@ Do not use attempt state to represent task success. `completed` means the attemp
 `handoff_valid` must be:
 
 ```text
-true   when dispatch validated HANDOFF.json and applied STATUS.state to review or blocked
+true   when dispatch validated HANDOFF.json and applied STATUS.state to strategy_review, review, or blocked
 false  when the worker exited without a legal handoff
 null   before handoff validation
 ```
@@ -106,6 +116,7 @@ null   before handoff validation
 `handoff_state` must be:
 
 ```text
+strategy_review
 review
 blocked
 null
@@ -123,7 +134,13 @@ LOCK exists
 LOCK.attempt_id == current_attempt_id
 .dispatch-lock exists and matches current_attempt_id
 .dispatch-lock pid exists, is an integer, and is alive
+the current attempt phase is execution
+the referenced strategy revision has an approved matching SHA-256 review
 ```
+
+`STATUS.state = planning` has the same active-attempt and lock invariants, but requires `ATTEMPT.phase = planning`. A planning attempt may not mutate the task worktree.
+
+`STATUS.state = strategy_review` requires no active `.dispatch-lock`, a completed planning or revision-request attempt, and a valid immutable strategy revision awaiting or holding coordinator review.
 
 `STATUS.state = review` requires:
 
@@ -154,8 +171,8 @@ or:
   ATTEMPT.handoff_valid = false
   blocker_type = needs_coordinator
   blocking_reason explains the invalid handoff
-STATUS.state_history ends with running -> blocked by actor dispatch
-STATUS.previous_state = running
+STATUS.state_history ends with planning|running -> blocked by actor dispatch
+STATUS.previous_state = planning|running
 blocker_type in [needs_coordinator, needs_user, environment, budget, irrecoverable]
 blocking_reason non-empty
 ```

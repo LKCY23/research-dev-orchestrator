@@ -2,6 +2,21 @@ id = "claude-code"
 display_name = "Claude Code"
 roles = ["coordinator", "worker"]
 
+[capabilities]
+session_settings = true
+pre_tool_hooks = true
+subagent_lifecycle_hooks = true
+tool_stream_events = true
+native_subagents = true
+agent_teams = true
+process_level_native_agent_control = false
+
+[governance]
+disabled_plugins = ["superpowers@claude-plugins-official"]
+enable_agent_teams = true
+max_tool_use_concurrency = 4
+enforce_spawn_limit = false
+
 [prompt]
 machine_transport = "arg"
 human_transport = "arg"

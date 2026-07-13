@@ -69,14 +69,18 @@ flowchart TB
     direction TB
     P["Planning"]:::planning
     T["Task Contract"]:::planning
+    ES["Execution Strategy<br/>不可变 + digest 审查"]:::planning
     P --> T
+    T --> ES
   end
 
   subgraph L3["Execution Layer"]
     direction TB
     D["Dispatcher"]:::exec
+    X["Attempt Supervisor"]:::exec
     W["Worker<br/>isolated worktree + backend"]:::exec
-    D -- "launch" --> W
+    D -- "launch" --> X
+    X -- "bounded execution" --> W
   end
 
   subgraph L4["Run Store"]
@@ -94,7 +98,7 @@ flowchart TB
   end
 
   C --> P
-  T --> D
+  ES --> D
   W -- "handoff" --> S
   S --> V
 
@@ -138,7 +142,9 @@ requirements
 -> design method selection
 -> architecture / experiment design
 -> task packet
--> dispatch
+-> 只读策略规划
+-> coordinator 策略审查
+-> supervisor 监管的执行派发
 -> worker handoff
 -> collect status
 -> Codex review
@@ -147,6 +153,14 @@ requirements
 ```
 
 一个 run 会记录完整生命周期：需求、设计笔记、实验计划、任务、attempt、review、结果、诊断和记忆。
+
+## Execution Strategy 与监督
+
+新任务默认使用 `strategy_required=true`。Planning worker 可以读取仓库，但不能修改 task worktree；它提交版本化的 `STRATEGY-vNNN.json`，声明可配置的 workflow 定义、依赖、权限、实例/并发上限、时间预算和完成条件。Coordinator 批准的是 strategy 的精确 digest，而不是一个可变文件名。
+
+Execution worker 可以在批准的 envelope 内灵活启动多个 workflow instance 并使用已声明的 subagent；新增 workflow 类型、扩大路径或权限、提高预算，或启动无界搜索时，必须提交新的 strategy revision。`supervise_attempt.py` 独立于模型自身 timeout，负责 attempt 总时限和进程清理；`rdo.py exec` 负责 command budget。详见 [execution strategy](references/execution-strategy.md)、[attempt supervision](references/attempt-supervision.md) 与 [tmux control](references/tmux-control.md)。
+
+Backend governance 是长期且由各 adapter 独立定义的。Strategy schema v2 将执行绑定到一个 backend；dispatch 在获取 task lock 前，将 backend policy、task 上限和已批准 strategy 纯编译为单次 attempt profile。Claude Code 使用 attempt-local settings 和 Hook；Codex 使用单次 invocation 的 multi-agent 设置；Kimi Code 使用临时治理 home；OpenCode 使用单次 attempt 的 permission/session supervisor。Claude/Codex 的累计启动限制可选且默认关闭，Kimi/OpenCode 不施加累计启动限制。所有路径都不修改用户的全局 CLI 配置。详见 [backend governance](references/backend-governance.md)。
 
 ## Protocol Files
 
@@ -171,6 +185,11 @@ requirements
           CONTEXT.md
           ACCEPTANCE.md
           STATUS.json
+          EXECUTION_POLICY.json
+          strategy/
+            STRATEGY-v001.json
+            REVIEW-v001.json
+            CURRENT.json
           EVIDENCE.md
           HANDOFF.md
           HANDOFF.json
@@ -192,7 +211,7 @@ requirements
 - `dashboard.html`：由 `render_dashboard.py` 生成的人类可读 derived monitor。
 - `EVIDENCE.md`：commands、tests、metrics、outputs 和 logs。
 - `HANDOFF.md`：worker handoff summary 和 known limitations。
-- `HANDOFF.json`：worker 请求进入 `review` 或 `blocked` 的机器可读 handoff request。
+- `HANDOFF.json`：worker 请求进入 `strategy_review`、`review` 或 `blocked` 的机器可读 handoff request。
 
 协议细节见 [references/state-machine.md](references/state-machine.md)、[references/status-schema.md](references/status-schema.md)、[references/attempt-lifecycle.md](references/attempt-lifecycle.md) 和 [references/events-schema.md](references/events-schema.md)。
 
@@ -202,7 +221,7 @@ requirements
 
 Task 是持久化工作项：intent、constraints、acceptance criteria，以及 coordinator-owned progress。Attempt 是某个 task 下的一次有边界 worker execution trajectory，以 attempt directory 的形式物化，包含 prompt、runtime metadata、transcript、result、evidence 和 handoff request。
 
-Dispatch 是 worker execution 和 task state 之间的边界：attempt 可以请求进入 `review` 或 `blocked`，但必须由 dispatch 校验后才能修改 `STATUS.json`。Coordinator review 则是后续 `review -> approved|changes_requested|failed` 的边界。
+Dispatch 是 worker execution 与 task state 的边界。系统先启动只读 planning attempt，提交不可变的多 workflow strategy；coordinator 审查并批准其精确 SHA-256 digest，之后新的 execution attempt 才能在 attempt-local deterministic supervisor 下运行。Execution 可以请求 `review`、`blocked` 或新的 `strategy_review`，但状态只能由 dispatch 校验后修改。
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"},"flowchart":{"curve":"basis"}}}%%
@@ -236,14 +255,17 @@ flowchart TB
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","clusterBkg":"#ffffff","clusterBorder":"#cbd5e1"}}}%%
 flowchart LR
   subgraph TaskFSM["Task FSM: work progress"]
-    P["pending"]:::task --> R["running"]:::task
+    P["pending"]:::task --> PL["planning"]:::task
+    PL --> SR["strategy_review"]:::warn
+    SR --> R["running"]:::task
     R --> V["review"]:::task
     R --> B["blocked"]:::warn
     V --> A["approved"]:::ok
     V --> CR["changes_requested"]:::warn
     A --> M["merged"]:::ok
-    CR --> R
-    B --> R
+    CR --> PL
+    B --> PL
+    B -. "重试已批准 strategy" .-> R
     B --> F["failed"]:::bad
     V --> F
   end
@@ -265,7 +287,7 @@ Worker 失败会先影响 attempt，而不是直接让 task 失败。Completed a
 
 ## Agent And Runtime Backends
 
-v0.3 把 agent 身份和进程监督方式拆开：
+v0.4 把 agent 身份和进程监督方式拆开，并加入经过审查的 execution strategy：
 
 ```text
 worker backend  = claude-code | codex | opencode | kimi-code

@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import sys
 from pathlib import Path
 
 from config import load_config
-from protocol import append_event, render_template, repo_root, utc_now
+from protocol import append_event, render_template, repo_root, utc_now, write_json
+from strategy import DEFAULT_EXECUTION_POLICY
 
 
 def validate_task_id(task_id: str) -> None:
@@ -54,6 +56,7 @@ def main() -> int:
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "logs").mkdir(exist_ok=True)
     (task_dir / "attempts").mkdir(exist_ok=True)
+    (task_dir / "strategy").mkdir(exist_ok=True)
 
     config = config_result.config
     branch = args.branch or f"{config.task_branch_prefix}{args.task_id}"
@@ -83,6 +86,10 @@ def main() -> int:
     }
 
     (task_dir / "STATUS.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+    execution_policy = copy.deepcopy(DEFAULT_EXECUTION_POLICY)
+    execution_policy["allowed_paths"] = list(args.allowed_paths)
+    execution_policy["forbidden_paths"] = list(args.forbidden_paths)
+    write_json(task_dir / "EXECUTION_POLICY.json", execution_policy)
     task_values = {
         "TASK_ID": args.task_id,
         "GOAL": args.goal,

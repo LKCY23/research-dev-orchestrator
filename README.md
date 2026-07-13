@@ -31,6 +31,8 @@ This project turns that long-running workflow into durable files inside the targ
 - choose a design method and record architecture decisions;
 - create task packets with acceptance criteria and allowed paths;
 - dispatch CLI coding agents such as Claude Code into isolated Git worktrees;
+- review versioned worker execution strategies before code-writing attempts;
+- supervise attempt process groups and bounded workflow/command budgets without a daemon;
 - validate worker handoffs using deterministic protocol gates;
 - collect status, evidence, diagnostics, and long-term memory;
 - support evidence-based Codex/human review before merge.
@@ -69,14 +71,18 @@ flowchart TB
     direction TB
     P["Planning"]:::planning
     T["Task Contract"]:::planning
+    ES["Execution Strategy<br/>immutable + reviewed digest"]:::planning
     P --> T
+    T --> ES
   end
 
   subgraph L3["Execution Layer"]
     direction TB
     D["Dispatcher"]:::exec
+    X["Attempt Supervisor"]:::exec
     W["Worker<br/>isolated worktree + backend"]:::exec
-    D -- "launch" --> W
+    D -- "launch" --> X
+    X -- "bounded execution" --> W
   end
 
   subgraph L4["Run Store"]
@@ -94,7 +100,7 @@ flowchart TB
   end
 
   C --> P
-  T --> D
+  ES --> D
   W -- "handoff" --> S
   S --> V
 
@@ -117,7 +123,7 @@ flowchart TB
   style L5 fill:#fff8f9,stroke:#fecdd3,stroke-width:1px,color:#881337;
 ```
 
-The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Workers own bounded execution. Git isolates implementation changes. The Run Store is the repo-local system of record for task state, attempt lifecycle, handoff evidence, events, memory, results, and recovery context. Validation gates worker handoffs; monitoring scripts produce derived artifacts without becoming a long-running service. Monitor output informs coordinator review, and recovery writes only user-approved minimal mutations back into the Run Store.
+The architecture is organized around ownership boundaries. The coordinator owns intent and review decisions. Planning workers propose immutable multi-workflow strategies; execution workers operate under an approved strategy digest and a deterministic attempt-local supervisor. Git isolates implementation changes. The Run Store is the repo-local system of record for task state, attempt lifecycle, handoff evidence, events, memory, results, and recovery context.
 
 Implementation details are intentionally secondary in the diagram:
 
@@ -125,7 +131,7 @@ Implementation details are intentionally secondary in the diagram:
 | --- | --- | --- |
 | Coordinator | Requirements, design, task split, review, merge decisions | `SKILL.md`, `$research-dev-orchestrator` intent surface |
 | Planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
-| Execution | Worker dispatch, attempt supervision, Git-isolated execution | `dispatch_agent.sh`, `dispatch_claude.sh`, `dispatch_assets.py`, agent backend registry, plain/tmux runtimes, Git worktree |
+| Execution | Strategy-gated dispatch, attempt supervision, Git-isolated execution | `dispatch_agent.sh`, `dispatch_claude.sh`, `dispatch_assets.py`, agent backend registry, plain/tmux runtimes, Git worktree |
 | Run Store | Repo-local system of record for task state, attempt lifecycle, handoff evidence, event timeline, memory, results, and recovery context | `.agent-collab/runs/<run-id>/`, `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md`, `RESULT_LEDGER.md` |
 | Validation & recovery | Deterministic gates, read-only audit, derived reports, user-approved recovery | `validation.py`, `protocol_cli.py`, `collect_status.py`, `SUMMARY.md`, `diagnostics/` |
 
@@ -138,7 +144,9 @@ requirements
 -> design method selection
 -> architecture / experiment design
 -> task packet
--> dispatch
+-> read-only strategy planning
+-> coordinator strategy review
+-> supervised execution dispatch
 -> worker handoff
 -> collect status
 -> Codex review
@@ -147,6 +155,14 @@ requirements
 ```
 
 A run captures the full lifecycle: requirements, design notes, experiment plans, tasks, attempts, reviews, results, diagnostics, and memory.
+
+## Execution Strategy And Supervision
+
+Every new task defaults to `strategy_required=true`. A planning worker may inspect the repository but cannot modify the task worktree; it submits a versioned `STRATEGY-vNNN.json` containing configurable workflow definitions, dependencies, permissions, instance/concurrency limits, time budgets, and completion gates. Coordinator approval binds the exact strategy digest, not a mutable filename.
+
+Execution remains flexible inside that approved envelope. A worker may start multiple instances of approved workflows and use declared subagents, but new workflow kinds, wider paths or permissions, larger budgets, or unbounded search require a new strategy revision. `supervise_attempt.py` enforces the attempt wall clock and process cleanup independently of model timeout settings; `rdo.py exec` enforces command budgets. See [execution strategy](references/execution-strategy.md), [attempt supervision](references/attempt-supervision.md), and [tmux control](references/tmux-control.md).
+
+Backend governance is durable and adapter-specific. Strategy schema v2 binds execution to one backend; dispatch compiles backend policy, task limits, and the approved strategy before acquiring the task lock. Claude Code uses attempt-local settings and hooks; Codex uses per-invocation multi-agent settings; Kimi Code uses a temporary governed home; OpenCode uses a per-attempt permission/session supervisor. Cumulative launch enforcement is optional and disabled by default for Claude/Codex, and is not imposed on Kimi/OpenCode. User-global CLI configuration is not edited. See [backend governance](references/backend-governance.md).
 
 ## Protocol Files
 
@@ -171,6 +187,11 @@ The target repository gets a local `.agent-collab/` directory:
           CONTEXT.md
           ACCEPTANCE.md
           STATUS.json
+          EXECUTION_POLICY.json
+          strategy/
+            STRATEGY-v001.json
+            REVIEW-v001.json
+            CURRENT.json
           EVIDENCE.md
           HANDOFF.md
           HANDOFF.json
@@ -192,7 +213,7 @@ Key files:
 - `dashboard.html`: derived human monitor generated by `render_dashboard.py`.
 - `EVIDENCE.md`: commands, tests, metrics, outputs, and logs.
 - `HANDOFF.md`: worker handoff summary and known limitations.
-- `HANDOFF.json`: machine-readable worker request for `review` or `blocked`.
+- `HANDOFF.json`: machine-readable worker request for `strategy_review`, `review`, or `blocked`.
 
 See [references/state-machine.md](references/state-machine.md), [references/status-schema.md](references/status-schema.md), [references/attempt-lifecycle.md](references/attempt-lifecycle.md), and [references/events-schema.md](references/events-schema.md) for protocol details.
 
@@ -202,7 +223,7 @@ The execution state model separates work progress from worker execution.
 
 A task is the durable work item: intent, constraints, acceptance criteria, and coordinator-owned progress. An attempt is one bounded worker execution trajectory for that task, materialized as an attempt directory with prompt, runtime metadata, transcript, result, evidence, and handoff request.
 
-Dispatch is the boundary between worker execution and task state: an attempt can request `review` or `blocked`, but dispatch validates the request before mutating `STATUS.json`. Coordinator review is the later boundary for `review -> approved|changes_requested|failed`.
+Dispatch is the boundary between worker execution and task state. A read-only planning attempt first submits an immutable multi-workflow strategy. The coordinator approves its exact SHA-256 digest, then a fresh execution attempt runs under an attempt-local deterministic supervisor. Execution may request `review`, `blocked`, or a new `strategy_review`; dispatch validates the request before mutating `STATUS.json`.
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"},"flowchart":{"curve":"basis"}}}%%
@@ -236,14 +257,17 @@ flowchart TB
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","clusterBkg":"#ffffff","clusterBorder":"#cbd5e1"}}}%%
 flowchart LR
   subgraph TaskFSM["Task FSM: work progress"]
-    P["pending"]:::task --> R["running"]:::task
+    P["pending"]:::task --> PL["planning"]:::task
+    PL --> SR["strategy_review"]:::warn
+    SR --> R["running"]:::task
     R --> V["review"]:::task
     R --> B["blocked"]:::warn
     V --> A["approved"]:::ok
     V --> CR["changes_requested"]:::warn
     A --> M["merged"]:::ok
-    CR --> R
-    B --> R
+    CR --> PL
+    B --> PL
+    B -. "retry approved strategy" .-> R
     B --> F["failed"]:::bad
     V --> F
   end
@@ -265,7 +289,7 @@ Worker failure affects an attempt first, not the task directly. A completed atte
 
 ## Agent And Runtime Backends
 
-v0.3 separates agent identity from process supervision:
+v0.4 separates agent identity from process supervision and adds reviewed execution strategies:
 
 ```text
 worker backend  = claude-code | codex | opencode | kimi-code

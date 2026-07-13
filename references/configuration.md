@@ -59,7 +59,39 @@ stale_created_minutes = 10.0
 [task]
 branch_prefix = "agent/"
 worktree_root = ".agent-worktrees"
+
+[backends."claude-code"]
+disabled_plugins = []
+enable_agent_teams = true
+max_tool_use_concurrency = 4
+enforce_spawn_limit = false
+
+[backends.codex]
+enable_multi_agent = true
+max_agent_threads = 4
+max_agent_depth = 1
+enforce_spawn_limit = false
+
+[backends."kimi-code"]
+enable_native_subagents = true
+enable_agent_swarm = true
+max_parallel_subagents = 4
+max_agent_depth = 1
+
+[backends.opencode]
+enable_native_subagents = true
+allowed_subagent_types = ["general", "explore", "scout"]
+max_parallel_subagents = 4
+max_agent_depth = 1
+pure_mode = false
 ```
+
+`[backends."<id>"]` is durable backend governance for RDO-launched workers,
+not an attempt setting and not a user-global CLI setting. Each adapter validates
+its own fields. Deny lists are unioned with shipped restrictions, maxima can only
+tighten shipped limits, and one-off environment or dispatch arguments cannot
+remove these restrictions. The compiled result is stored under the attempt's
+`runtime/BACKEND_PROFILE.json`.
 
 Do not add persistent `session_id` to this file. Session id is runtime identity and should be passed with `RDO_BACKEND_SESSION_ID` when available.
 
@@ -91,6 +123,37 @@ RDO_WORKTREE_ROOT
 Boolean env values use the same parser as TOML booleans where applicable: `1/0`, `true/false`, `yes/no`, and `on/off`.
 
 `worker.command`, `RDO_WORKER_COMMAND`, and legacy `CLAUDE_CODE_CMD` are interpreted by the dispatch shell. Do not put secrets in them; prefer environment variables for credentials.
+
+A custom worker command is accepted only when the compiled backend profile has
+no hard native controls that require adapter injection. For example, a Claude
+Code profile with attempt-local settings must use the registered backend command;
+dispatch fails before lock acquisition rather than launching an ungoverned
+wrapper.
+
+Codex project policy may disable multi-agent or lower the shipped thread/depth
+limits. Execution attempts enable Codex multi-agent only when the approved
+strategy declares `native_subagents`. Cumulative spawn enforcement is disabled
+by default; setting `enforce_spawn_limit = true` activates the machine JSONL
+supervisor and consequently requires machine IO.
+
+The shared `permission_mode="auto"` compiles to Codex's **Approve for me**
+profile (`on-request` + `workspace-write` + guardian reviewer), not to
+`approval_policy=never`. `yolo` remains the only RDO mode that requests Codex's
+approval-and-sandbox bypass.
+
+Kimi project policy may disable `Agent` or `AgentSwarm`, and may lower the
+parallel or depth limit. RDO launches Kimi with a temporary `KIMI_CODE_HOME`
+that combines the user's provider configuration with attempt-local permission
+rules and hooks; the user's normal configuration is not edited. Kimi's hook
+contract is fail-open, so hook failures are recorded as hard violations rather
+than described as an absolute pre-action security boundary.
+
+OpenCode project policy selects the allowed subagent types, parallel bound,
+depth bound, and optional `--pure` server mode. RDO launches a per-attempt local
+OpenCode server and answers `task` permission requests through its supervisor.
+Child sessions without a matching approval, nested child sessions, and excess
+concurrency are rejected or aborted and recorded. There is no cumulative launch
+counter for Kimi or OpenCode.
 
 If the command path contains spaces, quote it inside TOML as a shell command string, for example:
 

@@ -21,26 +21,26 @@ from protocol import (
 from validation import HandoffValidationResult, validate_worker_handoff
 
 
-def reset_status_to_running(status: dict[str, Any]) -> None:
-    """Discard worker-written terminal state and restore dispatch-owned running state."""
+def reset_status_to_active(status: dict[str, Any], active_state: str) -> None:
+    """Discard worker-written state and restore the dispatch-owned active state."""
 
     history = status.get("state_history")
     if not isinstance(history, list):
         status["state_history"] = []
-        status["state"] = "running"
+        status["state"] = active_state
         status["previous_state"] = None
         return
     running_index = None
     for idx in range(len(history) - 1, -1, -1):
         item = history[idx]
-        if isinstance(item, dict) and item.get("to") == "running" and item.get("actor") == "dispatch":
+        if isinstance(item, dict) and item.get("to") == active_state and item.get("actor") == "dispatch":
             running_index = idx
             break
     if running_index is not None:
         del history[running_index + 1 :]
         item = history[running_index]
         status["previous_state"] = item.get("from")
-    status["state"] = "running"
+    status["state"] = active_state
 
 
 def apply_dispatch_terminal_transition(
@@ -57,9 +57,11 @@ def apply_dispatch_terminal_transition(
     status = load_json(status_path)
     if not isinstance(status, dict):
         raise ValueError("STATUS.json must be a JSON object")
-    reset_status_to_running(status)
+    current_state = status.get("state")
+    active_state = current_state if current_state in {"planning", "running"} else "running"
+    reset_status_to_active(status, active_state)
     now = utc_now()
-    status["previous_state"] = "running"
+    status["previous_state"] = active_state
     status["state"] = target_state
     status["updated_at"] = now
     status["owner"] = "worker"
@@ -74,7 +76,7 @@ def apply_dispatch_terminal_transition(
         evidence["commands_run"] = [str(command) for command in commands_run]
     status["evidence"] = evidence
     status.setdefault("state_history", []).append({
-        "from": "running",
+        "from": active_state,
         "to": target_state,
         "actor": actor,
         "at": now,
@@ -93,14 +95,21 @@ def cmd_check_dispatch_transition(args: argparse.Namespace) -> int:
     status = load_json(Path(args.status_path))
     fsm = load_json(Path(args.fsm_path))
     state = status.get("state")
-    allowed = fsm["transitions"].get(state, {}).get("running", [])
+    target = "planning" if args.phase == "planning" else "running"
+    allowed = fsm["transitions"].get(state, {}).get(target, [])
     if "dispatch" not in allowed:
-        raise SystemExit(f"illegal dispatch transition: {state!r} -> 'running'")
+        raise SystemExit(f"illegal dispatch transition: {state!r} -> {target!r}")
     return 0
 
 
 def cmd_append_event(args: argparse.Namespace) -> int:
-    dispatch_events = {"task_dispatched", "worker_exit_without_valid_status", "worker_blocked", "worker_review_ready"}
+    dispatch_events = {
+        "task_dispatched",
+        "worker_exit_without_valid_status",
+        "worker_blocked",
+        "worker_review_ready",
+        "strategy_review_ready",
+    }
     payload: dict[str, Any] = {
         "at": utc_now(),
         "actor": "dispatch" if args.event_name in dispatch_events else "coordinator",
@@ -132,6 +141,8 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
         "command": command,
         "cwd": args.cwd,
     }
+    if args.supervisor_command:
+        runtime["supervisor_command"] = args.supervisor_command
     if args.runtime_backend == "tmux":
         runtime["tmux_session"] = args.tmux_session
         runtime["attach_command"] = args.attach_command
@@ -140,6 +151,11 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
         "attempt_id": args.attempt_id,
         "task_id": args.task_id,
         "role": "worker",
+        "phase": args.phase,
+        "strategy_id": args.strategy_id or None,
+        "strategy_sha256": args.strategy_sha256 or None,
+        "backend_profile_sha256": args.backend_profile_sha256 or None,
+        "backend_settings_sha256": args.backend_settings_sha256 or None,
         "backend_id": args.worker_backend,
         "agent": args.worker_backend,
         "agent_name": args.agent_name,
@@ -164,12 +180,13 @@ def cmd_transition_running(args: argparse.Namespace) -> int:
     status = load_json(status_path)
     fsm = load_json(Path(args.fsm_path))
     state = status.get("state")
-    allowed = fsm["transitions"].get(state, {}).get("running", [])
+    target = "planning" if args.phase == "planning" else "running"
+    allowed = fsm["transitions"].get(state, {}).get(target, [])
     if "dispatch" not in allowed:
-        raise SystemExit(f"illegal dispatch transition: {state!r} -> 'running'")
+        raise SystemExit(f"illegal dispatch transition: {state!r} -> {target!r}")
     now = utc_now()
     status["previous_state"] = state
-    status["state"] = "running"
+    status["state"] = target
     status["owner"] = "worker"
     status["updated_at"] = now
     status["needs_coordinator"] = False
@@ -186,7 +203,7 @@ def cmd_transition_running(args: argparse.Namespace) -> int:
     }
     status.setdefault("state_history", []).append({
         "from": state,
-        "to": "running",
+        "to": target,
         "actor": "dispatch",
         "at": now,
     })
@@ -368,6 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check-dispatch-transition")
     check.add_argument("--status-path", required=True)
     check.add_argument("--fsm-path", required=True)
+    check.add_argument("--phase", choices=["planning", "execution"], required=True)
     check.set_defaults(func=cmd_check_dispatch_transition)
 
     event = sub.add_parser("append-event")
@@ -386,9 +404,15 @@ def build_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--session-id", default="")
     attempt.add_argument("--worker-backend", default="claude-code")
     attempt.add_argument("--execution-mode", default="start")
+    attempt.add_argument("--phase", choices=["planning", "execution"], required=True)
+    attempt.add_argument("--strategy-id", default="")
+    attempt.add_argument("--strategy-sha256", default="")
+    attempt.add_argument("--backend-profile-sha256", default="")
+    attempt.add_argument("--backend-settings-sha256", default="")
     attempt.add_argument("--permission-mode", default="auto")
     attempt.add_argument("--io-mode", default="machine")
     attempt.add_argument("--command", required=True)
+    attempt.add_argument("--supervisor-command", default="")
     attempt.add_argument("--cwd", required=True)
     attempt.add_argument("--backend", dest="runtime_backend", required=True)
     attempt.add_argument("--runtime-backend", dest="runtime_backend", default=None)
@@ -403,6 +427,7 @@ def build_parser() -> argparse.ArgumentParser:
     transition.add_argument("--agent-name", required=True)
     transition.add_argument("--session-id", default="")
     transition.add_argument("--worker-backend", default="claude-code")
+    transition.add_argument("--phase", choices=["planning", "execution"], required=True)
     transition.set_defaults(func=cmd_transition_running)
 
     set_running = sub.add_parser("set-attempt-running")

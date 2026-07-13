@@ -27,3 +27,31 @@ stale_created_minutes = 10.0
 [task]
 branch_prefix = "agent/"
 worktree_root = ".agent-worktrees"
+
+# Backend-specific policy applies only to workers launched by RDO. It does not
+# modify the user's global CLI configuration.
+[backends."claude-code"]
+disabled_plugins = []
+enable_agent_teams = true
+max_tool_use_concurrency = 4
+# Optional cumulative Agent/Task launch cap; concurrency remains enforced when false.
+enforce_spawn_limit = false
+
+[backends.codex]
+enable_multi_agent = true
+max_agent_threads = 4
+max_agent_depth = 1
+enforce_spawn_limit = false
+
+[backends."kimi-code"]
+enable_native_subagents = true
+enable_agent_swarm = true
+max_parallel_subagents = 4
+max_agent_depth = 1
+
+[backends.opencode]
+enable_native_subagents = true
+allowed_subagent_types = ["general", "explore", "scout"]
+max_parallel_subagents = 4
+max_agent_depth = 1
+pure_mode = false

@@ -58,6 +58,8 @@ REQUIRED_STATUS_FIELDS = {
 
 TASK_STATES = {
     "pending",
+    "planning",
+    "strategy_review",
     "running",
     "blocked",
     "review",
@@ -69,7 +71,7 @@ TASK_STATES = {
 
 BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "irrecoverable"}
 ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
-HANDOFF_STATES = {"review", "blocked", None}
+HANDOFF_STATES = {"strategy_review", "review", "blocked", None}
 RUNTIME_BACKENDS = {"plain", "tmux"}
 IO_MODES = {"machine", "human"}
 WORKER_BACKENDS = {"claude-code", "codex", "opencode", "kimi-code"}
@@ -83,6 +85,18 @@ CORE_EVENTS = {
     "adr_added",
     "task_created",
     "task_dispatched",
+    "strategy_submitted",
+    "strategy_reviewed",
+    "strategy_review_ready",
+    "strategy_revision_requested",
+    "workflow_started",
+    "workflow_heartbeat",
+    "workflow_completed",
+    "workflow_timed_out",
+    "worker_instruction_submitted",
+    "worker_interrupted",
+    "worker_terminated",
+    "attempt_timed_out",
     "worker_blocked",
     "worker_review_ready",
     "worker_exit_without_valid_status",
@@ -101,6 +115,10 @@ CORE_EVENTS = {
 TASK_EVENTS = {
     "task_created",
     "task_dispatched",
+    "strategy_submitted",
+    "strategy_reviewed",
+    "strategy_review_ready",
+    "strategy_revision_requested",
     "worker_blocked",
     "worker_review_ready",
     "worker_exit_without_valid_status",
@@ -113,7 +131,21 @@ TASK_EVENTS = {
     "task_failed",
 }
 
-ATTEMPT_EVENTS = {"task_dispatched", "worker_blocked", "worker_review_ready", "worker_exit_without_valid_status"}
+ATTEMPT_EVENTS = {
+    "task_dispatched",
+    "strategy_review_ready",
+    "workflow_started",
+    "workflow_heartbeat",
+    "workflow_completed",
+    "workflow_timed_out",
+    "worker_blocked",
+    "worker_review_ready",
+    "worker_exit_without_valid_status",
+    "attempt_timed_out",
+    "worker_instruction_submitted",
+    "worker_interrupted",
+    "worker_terminated",
+}
 
 TEMPLATE_MARKERS = {
     "EVIDENCE.md": "<!-- RDO_TEMPLATE: EVIDENCE -->",

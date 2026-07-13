@@ -2,6 +2,20 @@ id = "kimi-code"
 display_name = "Kimi Code"
 roles = ["worker"]
 
+[capabilities]
+tool_stream_events = true
+native_subagents = true
+native_agent_depth_limit = true
+native_swarm_parallel_limit = true
+pre_tool_hooks = true
+subagent_lifecycle_hooks = true
+
+[governance]
+enable_native_subagents = true
+enable_agent_swarm = true
+max_parallel_subagents = 4
+max_agent_depth = 1
+
 [prompt]
 machine_transport = "arg"
 human_transport = "tmux_send_keys"

@@ -6,7 +6,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 repo="$(setup_smoke_repo)"
 cd "${repo}"
 
-init_run_and_task smoke-run T001-permission permission
+init_raw_run_and_task smoke-run T001-permission permission
 set +e
 "${RDO_ROOT}/scripts/dispatch_agent.sh" smoke-run T001-permission \
   --worker opencode \

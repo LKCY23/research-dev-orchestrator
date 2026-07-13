@@ -24,14 +24,14 @@ attempt_id = "A001-claude-test"
 now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 status = json.load(open(task / "STATUS.json", encoding="utf-8"))
 status.update({
-    "previous_state": "pending",
+    "previous_state": "strategy_review",
     "state": "running",
     "owner": "claude-code",
     "updated_at": now,
     "current_attempt_id": attempt_id,
     "assigned_worker": {"agent": "claude-code", "agent_name": "test", "session_id": "", "role": "worker"},
 })
-status["state_history"] = [{"from": "pending", "to": "running", "actor": "dispatch", "at": now}]
+status["state_history"].append({"from": "strategy_review", "to": "running", "actor": "dispatch", "at": now})
 (task / "STATUS.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
 attempt_dir = task / "attempts" / attempt_id
 attempt_dir.mkdir(parents=True)
@@ -41,6 +41,9 @@ attempt = {
     "agent": "claude-code",
     "agent_name": "test",
     "session_id": "",
+    "phase": "execution",
+    "strategy_id": json.load(open(task / "strategy" / "CURRENT.json", encoding="utf-8"))["strategy_id"],
+    "strategy_sha256": json.load(open(task / "strategy" / "CURRENT.json", encoding="utf-8"))["strategy_sha256"],
     "state": "running",
     "handoff_valid": None,
     "handoff_state": None,

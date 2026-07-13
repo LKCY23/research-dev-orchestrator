@@ -70,6 +70,8 @@ invalid_handoff
 
 ```text
 pending
+planning
+strategy_review
 running
 blocked
 review
@@ -88,6 +90,18 @@ design_method_selected
 adr_added
 task_created
 task_dispatched
+strategy_submitted
+strategy_reviewed
+strategy_review_ready
+strategy_revision_requested
+workflow_started
+workflow_heartbeat
+workflow_completed
+workflow_timed_out
+worker_instruction_submitted
+worker_interrupted
+worker_terminated
+attempt_timed_out
 worker_blocked
 worker_review_ready
 worker_exit_without_valid_status

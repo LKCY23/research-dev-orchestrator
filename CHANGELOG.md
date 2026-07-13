@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - Unreleased
+
+### Added
+
+- Reviewed, immutable multi-workflow execution strategies and planning/strategy-review task states.
+- Deterministic attempt-local supervision and bounded command process-group cleanup.
+- Role-safe coordinator/worker commands, atomic handoff, and documented tmux control semantics.
+- Backend-specific capability and governance contracts with project-level tightening.
+- Strategy schema v2 backend binding and pre-lock attempt profile compilation.
+- Claude Code attempt-local plugin settings, Agent Team configuration, native-agent budget hooks, and governance-aware handoff validation.
+- Codex per-attempt multi-agent settings, native thread/depth limits, unobservable fanout disablement, JSONL spawn-budget supervision, and hard-violation process termination.
+
 ## [0.3.0] - 2026-07-08
 
 ### Added
