@@ -399,6 +399,11 @@ def merge_source_commit(path: Path, status: dict[str, Any], root: Path) -> tuple
         or metadata.get("handoff_state") != "verified"
     ):
         raise SystemExit("verified Direct task does not have a valid completed attempt")
+    verified_commit = metadata.get("verified_commit")
+    if not isinstance(verified_commit, str) or not verified_commit:
+        raise SystemExit("verified Direct task attempt is missing its verified Git commit")
+    if verified_commit != source_head:
+        raise SystemExit("Direct task branch HEAD changed after verified handoff")
     after_path = attempt / "runtime" / "worktree-after.json"
     if not after_path.exists():
         raise SystemExit("verified Direct task is missing worktree-after fingerprint")
@@ -446,35 +451,45 @@ def run_merge_verification(
                 raise SystemExit("post-merge verification command cannot be empty")
             log.write(f"\n[{utc_now()}] $ {shlex.join(argv)}\n")
             log.flush()
-            timed_out = False
             try:
-                completed = subprocess.run(
+                completed = run_supervised(
                     argv,
+                    timeout_seconds=timeout_seconds,
                     cwd=target_worktree,
-                    text=True,
+                    stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
-                    timeout=timeout_seconds,
-                    check=False,
+                    grace_seconds=0.5,
                 )
-                exit_code = int(completed.returncode)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                exit_code = 124
-                log.write(f"command timed out after {timeout_seconds:g} seconds\n")
+                exit_code = completed.exit_code
+                timed_out = completed.timed_out
+                surviving_pids = list(completed.surviving_pids)
+                elapsed_seconds = completed.elapsed_seconds
+                if timed_out:
+                    log.write(f"command timed out after {timeout_seconds:g} seconds\n")
+                if surviving_pids:
+                    log.write(f"command left surviving processes: {surviving_pids}\n")
             except OSError as exc:
                 exit_code = 127
+                timed_out = False
+                surviving_pids = []
+                elapsed_seconds = 0.0
                 log.write(f"command could not start: {exc}\n")
             result = {
                 "command": argv,
                 "exit_code": exit_code,
                 "timed_out": timed_out,
+                "elapsed_seconds": elapsed_seconds,
+                "surviving_pids": surviving_pids,
             }
             results.append(result)
-            if exit_code != 0:
+            if exit_code != 0 or surviving_pids:
                 break
     return {
-        "passed": all(item["exit_code"] == 0 for item in results),
+        "passed": all(
+            item["exit_code"] == 0 and not item["surviving_pids"]
+            for item in results
+        ),
         "results": results,
         "log": log_path.relative_to(path).as_posix(),
     }

@@ -810,6 +810,7 @@ python3 "${PROTOCOL_CLI}" validate-handoff \
   --task-dir "${TASK_DIR}" \
   --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
   --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+  --worktree "${WORKTREE_PATH}" \
   --exit-code-raw "${EXIT_CODE_RAW}"
 VALIDATION_CODE=$?
 set -e

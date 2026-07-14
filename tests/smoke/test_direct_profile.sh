@@ -14,7 +14,7 @@ python3 "${RDO_ROOT}/scripts/collect_status.py" --run-id direct-run --json > "${
 assert_json_expr "${repo}/direct-status.json" "payload['valid'] is True"
 
 python3 - "${repo}/.agent-collab/runs/direct-run/tasks/T001-direct" <<'PY'
-import json, sys
+import json, subprocess, sys
 from pathlib import Path
 task = Path(sys.argv[1])
 status = json.loads((task / "STATUS.json").read_text())
@@ -25,6 +25,10 @@ assert attempt["phase"] == "execution"
 assert attempt["strategy_id"] is None
 assert attempt["worker_id"] == status["assigned_worker"]["worker_id"]
 assert attempt["execution_mode"] == "start"
+task_head = subprocess.check_output(
+    ["git", "rev-parse", "HEAD"], cwd=attempt["runtime"]["cwd"], text=True
+).strip()
+assert attempt["verified_commit"] == task_head
 policy = json.loads((task / "EXECUTION_POLICY.json").read_text())
 assert policy["strategy_required"] is False
 PY

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -277,6 +278,32 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
             reasons=[status_error, *result.reasons],
         )
 
+    verified_commit = None
+    if result.valid and result.handoff_state == "verified":
+        if not args.worktree:
+            result = HandoffValidationResult(
+                valid=False,
+                handoff_state=None,
+                exit_code=result.exit_code,
+                reasons=["verified handoff is missing the task worktree needed to bind its Git commit"],
+            )
+        else:
+            try:
+                verified_commit = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=Path(args.worktree).resolve(),
+                    text=True,
+                    stderr=subprocess.STDOUT,
+                ).strip()
+            except (OSError, subprocess.CalledProcessError) as exc:
+                detail = exc.output.strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+                result = HandoffValidationResult(
+                    valid=False,
+                    handoff_state=None,
+                    exit_code=result.exit_code,
+                    reasons=[f"could not bind verified handoff to task worktree HEAD: {detail}"],
+                )
+
     try:
         attempt = load_json(attempt_path)
     except json.JSONDecodeError as exc:
@@ -363,6 +390,8 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
     attempt["state"] = "completed"
     attempt["handoff_valid"] = True
     attempt["handoff_state"] = result.handoff_state
+    if verified_commit is not None:
+        attempt["verified_commit"] = verified_commit
     write_json(attempt_path, attempt)
     request = result.request or {}
     if result.handoff_state == "blocked":
@@ -537,6 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--attempt-path", required=True)
     validate.add_argument("--exit-code-raw", required=True)
     validate.add_argument("--startup-path", default="")
+    validate.add_argument("--worktree", default="")
     validate.set_defaults(func=cmd_validate_handoff)
 
     diagnostics = sub.add_parser("write-dispatch-diagnostics")

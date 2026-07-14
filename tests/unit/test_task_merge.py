@@ -2,8 +2,11 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -190,6 +193,25 @@ class TaskMergeTests(unittest.TestCase):
         self.assertFalse(event["verification"]["passed"])
         self.assertEqual(event["verification"]["results"][0]["exit_code"], 3)
 
+    def test_timed_out_post_merge_verification_kills_descendants(self):
+        helper = self.task / "logs" / "spawn-descendant.py"
+        helper.write_text(
+            "import pathlib, subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', "
+            "\"import pathlib,time; time.sleep(0.8); pathlib.Path('late.txt').write_text('late')\"])\n"
+            "time.sleep(10)\n"
+        )
+        result = self.merge(
+            verify_command=[f"{sys.executable} {helper}"],
+            verification_timeout=0.2,
+        )
+        self.assertEqual(result, 1)
+        time.sleep(1.0)
+        self.assertFalse((self.root / "late.txt").exists())
+        verification = self.merged_events()[0]["verification"]["results"][0]
+        self.assertTrue(verification["timed_out"])
+        self.assertEqual(verification["surviving_pids"], [])
+
     def test_verified_direct_task_uses_attempt_fingerprint(self):
         status_path = self.task / "STATUS.json"
         status = json.loads(status_path.read_text())
@@ -199,12 +221,42 @@ class TaskMergeTests(unittest.TestCase):
         (attempt / "runtime").mkdir(parents=True)
         (attempt / "ATTEMPT.json").write_text(json.dumps({
             "state": "completed", "handoff_valid": True, "handoff_state": "verified",
+            "verified_commit": git(self.task_worktree, "rev-parse", "HEAD"),
         }))
         (attempt / "runtime" / "worktree-after.json").write_text(
             json.dumps(fingerprint(self.task_worktree))
         )
         self.assertEqual(self.merge(), 0)
         self.assertEqual(json.loads(status_path.read_text())["state"], "merged")
+
+    def test_verified_direct_task_rejects_mode_only_commit_after_handoff(self):
+        status_path = self.task / "STATUS.json"
+        status = json.loads(status_path.read_text())
+        status.update(profile="direct", state="verified", previous_state="running")
+        status_path.write_text(json.dumps(status))
+        attempt = self.task / "attempts" / "A001"
+        (attempt / "runtime").mkdir(parents=True)
+        verified_commit = git(self.task_worktree, "rev-parse", "HEAD")
+        (attempt / "ATTEMPT.json").write_text(json.dumps({
+            "state": "completed",
+            "handoff_valid": True,
+            "handoff_state": "verified",
+            "verified_commit": verified_commit,
+        }))
+        (attempt / "runtime" / "worktree-after.json").write_text(
+            json.dumps(fingerprint(self.task_worktree))
+        )
+
+        file_path = self.task_worktree / "file.txt"
+        os.chmod(file_path, file_path.stat().st_mode | 0o111)
+        git(self.task_worktree, "add", "file.txt")
+        git(self.task_worktree, "commit", "-m", "mode-only change after handoff")
+        self.assertEqual(
+            json.loads((attempt / "runtime" / "worktree-after.json").read_text())["sha256"],
+            fingerprint(self.task_worktree)["sha256"],
+        )
+        with self.assertRaisesRegex(SystemExit, "HEAD changed after verified handoff"):
+            self.merge()
 
 
 if __name__ == "__main__":
