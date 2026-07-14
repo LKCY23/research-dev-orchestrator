@@ -16,12 +16,20 @@ Worker-only commands:
 
 ```text
 rdo strategy submit|revise
-rdo workflow start|heartbeat|complete
+rdo workflow start|heartbeat|complete [--review-evidence REVIEWER_ID=ARTIFACT_PATH]
 rdo exec --attempt-dir <path> --workflow-id <id> --instance-id <id> --timeout <seconds> [--acceptance] -- <command>
-rdo handoff
+rdo finalize --task-dir <path> --state verified|review|blocked --summary <text>
 ```
 
 Workers may submit artifacts and runtime events, but may not approve strategy, mutate `STATUS.json`, or merge.
+`rdo strategy submit|revise` and `rdo finalize` commit an attempt-bound
+`COMPLETION.json` only after their handoff artifacts are durable. In
+`tmux + human`, this allows deterministic worker shutdown; it does not perform
+coordinator review or a task-state transition.
+
+`rdo handoff` remains a compatibility surface. New prompts use `rdo finalize`, which derives acceptance commands and changed files instead of requiring workers to hand-author three overlapping handoff artifacts.
+
+`--review-evidence` is accepted only when completing a strategy-declared independent review workflow. Repeat it once per reviewer; artifacts must be non-empty files under the current attempt's `runtime/reviews/`, and reviewer IDs must match observed backend agent lifecycle events.
 
 Use them in either of these forms:
 
@@ -89,10 +97,10 @@ Do not invent durable design decisions without user confirmation when the choice
 ### create-task
 
 ```text
-$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>]
+$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>] [profile=direct|delegated|full]
 ```
 
-Purpose: create a task packet from the current plan/design.
+Purpose: create a task packet with an explicit execution profile. Use Direct for small low-risk work, Delegated for independent coordinator review without strategy ceremony, and Full for strategy-gated work.
 
 Action: run `scripts/create_task.py`, then fill task context and acceptance details when needed.
 

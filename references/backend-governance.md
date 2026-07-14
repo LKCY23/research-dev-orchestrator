@@ -35,11 +35,13 @@ The design separates durable policy from task intent and attempt-local settings.
 | Approved execution intent | `STRATEGY-vNNN.json` and review digest | one strategy revision | worker proposes, coordinator approves |
 | Compiled backend profile | `attempts/<id>/runtime/BACKEND_PROFILE.json` | one attempt | dispatch |
 | Native CLI settings | attempt-local settings, environment, hooks, and argv | one attempt process | backend adapter |
-| Runtime facts | supervisor, workflow, command, and backend event logs | one attempt | supervisor and backend monitor |
+| Runtime facts | supervisor, workflow, command, usage, and backend event logs | one attempt | supervisor and backend monitor |
 
 No attempt artifact becomes a new policy source. It is an immutable or
 append-only record of how durable policy and approved task intent were compiled
 for one process launch.
+
+Attempt-local settings do not imply a fresh logical worker. Dispatch preserves a stable `worker_id` and resumes the backend's native session across ordinary attempts. Backend or worker replacement is explicit, starts a new session, and records lineage plus a reason.
 
 ## Existing Mechanisms
 
@@ -61,6 +63,8 @@ dispatch-time error rather than a silent fallback.
 ## Backend Contract
 
 Each backend definition has two separate sections.
+
+It also declares `usage_observability.machine` and `usage_observability.human`: the exact normalized metrics that adapter can extract from structured events. This is a capability contract, not a best-effort hint. A strategy hard budget that names an undeclared metric is rejected before dispatch.
 
 ### Capabilities
 
@@ -445,13 +449,14 @@ The target sequence is:
 3. Load backend capabilities, shipped governance, and project backend policy.
 4. For execution, load the exact approved strategy and verify its backend ID.
 5. Compile and validate the backend profile without mutating protocol state.
-6. Atomically acquire the dispatch lock and create the attempt.
-7. Atomically render attempt-local backend settings, hooks, environment, and
+6. Verify every configured hard resource metric is observable in the selected I/O mode.
+7. Atomically acquire the dispatch lock and create the attempt.
+8. Atomically render attempt-local backend settings, hooks, environment, and
    command from the already validated profile.
-8. Store the profile and digest in attempt metadata before worker launch.
-9. Launch through the existing attempt supervisor.
-10. Collect backend events, worktree checks, evidence, and handoff.
-11. Reject the handoff if a hard governance violation occurred.
+9. Store the profile and digest in attempt metadata before worker launch.
+10. Launch through the existing attempt supervisor.
+11. Collect backend usage/events, worktree checks, evidence, and handoff.
+12. Reject the handoff if a hard governance violation occurred.
 
 ## Implementation Status
 

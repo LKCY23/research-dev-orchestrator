@@ -6,8 +6,6 @@ Each task packet lives under `.agent-collab/runs/<run-id>/tasks/<task-id>/`.
 
 ```text
 TASK.md
-CONTEXT.md
-ACCEPTANCE.md
 STATUS.json
 HANDOFF.md
 HANDOFF.json
@@ -16,12 +14,15 @@ logs/
 attempts/
 ```
 
+`TASK.md` and `STATUS.json` are canonical. `CONTEXT.md` and `ACCEPTANCE.md` are optional normalization files when that information is not already complete in `TASK.md`. Handoff prose and evidence views support humans; `HANDOFF.json` remains the transition request.
+
 `LOCK` is human-readable ownership metadata. `.dispatch-lock/` is present only while an active planning or execution dispatch is held. `create_task.py` must not create either file.
 
 ## TASK.md
 
 ```yaml
 task_id:
+profile: direct|delegated|full
 goal:
 allowed_paths:
 forbidden_paths:
@@ -62,7 +63,7 @@ Treat this file as the review gate recipe. It should answer what the worker must
 
 ## EVIDENCE.md
 
-Workers must remove `<!-- RDO_TEMPLATE: EVIDENCE -->` and write:
+`rdo finalize` generates this human-readable evidence view from workflow and command records:
 
 ```text
 Commands Run
@@ -74,7 +75,7 @@ Known Limitations
 
 ## HANDOFF.md
 
-Workers must remove `<!-- RDO_TEMPLATE: HANDOFF -->` and write enough for Codex review or unblock:
+`rdo finalize` generates this human-readable summary from the worker's final summary and recorded evidence:
 
 ```text
 What changed
@@ -86,9 +87,9 @@ Suggested next action
 
 ## HANDOFF.json
 
-`HANDOFF.json` is the machine-readable transition request. It does not replace `HANDOFF.md`, but it is required for worker terminal handoff in protocol v0.2.
+`HANDOFF.json` is the canonical machine-readable transition request. `HANDOFF.md` is its generated human-readable companion.
 
-Workers must set `_template` to `false`, choose `requested_state = review|blocked`, and keep fields concise:
+Workers call `rdo finalize`; it sets `_template=false` and writes the request atomically. Direct requests `verified|blocked`; Delegated requests `review|blocked`; Full may request `strategy_review|review|blocked`.
 
 ```json
 {
@@ -104,10 +105,12 @@ Workers must set `_template` to `false`, choose `requested_state = review|blocke
 }
 ```
 
+Direct handoff additionally sets `self_review.passed = true` and records findings/fixes after inspecting the final diff.
+
 Dispatch validates this request and applies `STATUS.json` terminal transitions. Workers must not edit `STATUS.json` directly. `collect_status.py` may also display this index for dashboards and summaries.
 
 ## Fix Routing
 
-Use a new attempt in the same task for a small fix with the same acceptance criteria.
+Use a new attempt in the same task for a small fix with the same acceptance criteria. Resume the same logical worker and native backend session unless there is a recorded reason to replace it.
 
 Create a new task such as `T001R1-*` when scope, acceptance criteria, design, ownership, or allowed paths change.

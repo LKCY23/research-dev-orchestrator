@@ -11,6 +11,7 @@ Task state models task progress only. Worker/process lifecycle belongs in `ATTEM
 - `strategy_review`: dispatch validated a strategy revision and the coordinator must approve it or request changes before execution.
 - `running`: dispatch or a worker owns execution in a task worktree.
 - `blocked`: dispatch determined the task cannot continue without coordinator decision, user input, environment repair, budget decision, or failure triage. This may come from a valid worker `blocked` request or an invalid handoff that needs coordinator triage.
+- `verified`: a Direct worker completed implementation, tests, and structured self-review; only mechanical merge gates remain.
 - `review`: dispatch validated the worker's `review` request and evidence/handoff artifacts.
 - `changes_requested`: the coordinator reviewed the task and requires fixes before approval.
 - `approved`: the coordinator reviewed the diff and evidence, verified mergeability against the target branch, and passed required integration smoke tests. The task is ready to merge but has not yet been merged.
@@ -20,12 +21,13 @@ Task state models task progress only. Worker/process lifecycle belongs in `ATTEM
 ## Writer Boundaries
 
 - `create_task.py` only creates `pending`.
-- Planning dispatch may perform `pending|blocked|changes_requested -> planning`.
+- Full-profile planning dispatch may perform `pending -> planning`, or `blocked|changes_requested -> planning` only when the approved strategy is absent or invalidated.
+- Direct and Delegated dispatch perform `pending -> running` without a strategy ceremony.
 - Planning handoff may perform `planning -> strategy_review`.
-- Execution dispatch may perform `strategy_review -> running` only for an approved strategy digest. It may also perform an explicit `blocked -> running` retry when the coordinator chooses to reuse the still-approved strategy; automatic dispatch defaults blocked tasks to a new planning attempt.
+- Full execution dispatch performs `strategy_review -> running` only for an approved strategy digest. `blocked|changes_requested -> running` resumes execution when that strategy remains valid.
 - Execution may request `running -> strategy_review` with a checkpoint and valid new strategy revision.
-- Workers must not mutate `STATUS.json` terminal state. They request `review` or `blocked` by writing `HANDOFF.json`, `HANDOFF.md`, and `EVIDENCE.md`.
-- Dispatch applies validated `running -> review` or `running -> blocked` transitions after worker exit.
+- Workers must not mutate `STATUS.json` terminal state. Direct workers request `verified`; Delegated and Full workers request `review`; any profile may request `blocked`.
+- Dispatch applies validated `running -> verified|review|blocked` transitions after worker exit.
 - Coordinator review may perform `review -> approved`, `review -> changes_requested`, `review -> failed`, `blocked -> failed`, and `approved -> merged`.
 - `collect_status.py` is read-only and must never mutate state.
 
@@ -39,7 +41,7 @@ Do not add worker/process failure states to the task FSM. A worker that exits wi
 
 ## Changes Requested
 
-Use a new planning attempt and strategy revision after `changes_requested`. Use a new execution attempt after strategy approval.
+Resume the assigned worker in a new execution attempt after ordinary implementation feedback. Return to planning and create a strategy revision only when scope, design, backend binding, workflow kind, or budget changes invalidate the approved strategy.
 
 Create a new task such as `T001R1-*` when scope, acceptance criteria, design, or ownership changes.
 

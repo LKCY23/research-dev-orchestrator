@@ -14,6 +14,8 @@ runtime backend     = how dispatch supervises the process
 io mode             = machine or human interaction shape
 ```
 
+Attempts are supervision slices, not conversation boundaries. When dispatch records `execution_mode=resume`, the adapter reuses the assigned worker's native session ID: Claude Code `--resume`, Codex `exec resume`, OpenCode `run --session`, and Kimi `--session`. A first attempt uses `start`; an intentional backend/worker replacement uses `replace` and starts a new session while retaining attempt lineage.
+
 ## Supported Backends
 
 ```text

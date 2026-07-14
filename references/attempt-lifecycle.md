@@ -2,6 +2,10 @@
 
 `ATTEMPT.json` is the worker execution source of truth for one task attempt. Keep task progress in `STATUS.json`; keep worker/process lifecycle in `ATTEMPT.json`.
 
+An attempt is one bounded supervision and audit slice, not a worker identity. Ordinary retries and coordinator feedback create a new attempt while reusing the task's logical worker, worktree, and native backend session. See `execution-profiles.md`.
+
+Session continuity and work continuity are independent. Backend replacement starts a new native session, but an approved Full strategy may still carry compatible workflow checkpoints from a terminal prior attempt. Dispatch records those mappings in `runtime/RESUME_CONTEXT.json` and `workflow_carried_forward` events.
+
 ## Principles
 
 ```text
@@ -47,9 +51,14 @@ If `.dispatch-lock` exists while `STATUS.state` is neither `planning` nor `runni
   "backend_id": "claude-code",
   "agent": "claude-code",
   "agent_name": "claude-worker-1",
+  "worker_id": "W-claude-code-T001-name",
+  "parent_attempt_id": null,
   "backend_session_id": "s8d21",
   "session_id": "s8d21",
   "execution_mode": "start",
+  "resume_context_sha256": "...",
+  "carried_forward_workflows": ["WF-implementation"],
+  "remaining_workflows": ["WF-acceptance"],
   "permission_mode": "auto",
   "state": "completed",
   "handoff_valid": true,
@@ -77,10 +86,15 @@ task_id: non-empty string
 backend_id: non-empty string, one of supported worker backends
 agent: legacy backend alias; non-empty string
 agent_name: non-empty string
+worker_id: stable logical worker identifier for ordinary attempts on the task
+parent_attempt_id: previous attempt ID for resume/replace lineage; null for the first attempt
 session_id: string; may be empty only if runtime cannot provide one
+execution_mode: start|resume|replace
+resume_context_sha256: digest of derived runtime/RESUME_CONTEXT.json when Full execution materializes resume context
+carried_forward_workflows/remaining_workflows: workflow ID lists compiled by dispatch; empty/absent outside Full execution
 state: created|running|completed|invalid_handoff
 phase: planning|execution
-strategy_id/strategy_sha256: required for execution, null for planning
+strategy_id/strategy_sha256: required for Full execution; null for planning and Direct/Delegated execution
 backend_profile_sha256: digest of the pure compiled backend profile
 backend_settings_sha256: digest of generated native settings when the backend uses them
 started_at: non-empty valid ISO timestamp
@@ -115,7 +129,7 @@ Do not use attempt state to represent task success. `completed` means the attemp
 `handoff_valid` must be:
 
 ```text
-true   when dispatch validated HANDOFF.json and applied STATUS.state to strategy_review, review, or blocked
+true   when dispatch validated HANDOFF.json and applied STATUS.state to strategy_review, verified, review, or blocked
 false  when the worker exited without a legal handoff
 null   before handoff validation
 ```
@@ -124,10 +138,36 @@ null   before handoff validation
 
 ```text
 strategy_review
+verified
 review
 blocked
 null
 ```
+
+## Interactive Completion Signal
+
+`COMPLETION.json` is an attempt-local commit marker used only to end a
+`tmux + human` worker that may otherwise remain at its TUI input prompt:
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "T001-name",
+  "attempt_id": "A001-claude-x4p9a",
+  "phase": "planning",
+  "requested_state": "strategy_review",
+  "handoff_sha256": "...",
+  "strategy_sha256": "...",
+  "completed_at": "2026-07-14T00:00:00Z"
+}
+```
+
+It is written atomically and last by `rdo strategy submit|revise` or `rdo
+handoff`. It is not task state, approval, or final handoff validation. A valid
+signal lets the attempt supervisor stop the interactive process; dispatch still
+owns worktree checks, `HANDOFF.json` validation, `ATTEMPT.json` completion, and
+the task FSM transition. A previous attempt's signal cannot complete a newer
+attempt.
 
 ## Task State Invariants
 
@@ -142,7 +182,7 @@ LOCK.attempt_id == current_attempt_id
 .dispatch-lock exists and matches current_attempt_id
 .dispatch-lock pid exists, is an integer, and is alive
 the current attempt phase is execution
-the referenced strategy revision has an approved matching SHA-256 review
+for Full tasks, the referenced strategy revision has an approved matching SHA-256 review
 ```
 
 `STATUS.state = planning` has the same active-attempt and lock invariants, but requires `ATTEMPT.phase = planning`. A planning attempt may not mutate the task worktree.
@@ -162,6 +202,8 @@ worker exit_code = 0
 EVIDENCE.md has substantive content
 HANDOFF.md has substantive content
 ```
+
+`STATUS.state = verified` requires a Direct task, the same completed/valid/zero-exit invariants, `ATTEMPT.handoff_state = verified`, `HANDOFF.json.requested_state = verified`, and `HANDOFF.json.self_review.passed = true`.
 
 `STATUS.state = blocked` requires:
 
@@ -219,4 +261,4 @@ JOURNAL.md
 reviews/*
 ```
 
-Use a new attempt for implementation retries. Use a revision task such as `T001R1-*` when task scope, acceptance criteria, or design changes.
+Use a new attempt for implementation retries, normally with `execution_mode=resume` and the same worker/session. Use a revision task such as `T001R1-*` when task scope, acceptance criteria, profile, or design changes.

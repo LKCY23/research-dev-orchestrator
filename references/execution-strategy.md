@@ -57,6 +57,15 @@ Each `STRATEGY-vNNN.json` contains:
     "max_subagents": 4,
     "max_parallel_subagents": 2
   },
+  "resource_budget": {
+    "max_model_turns": 60,
+    "max_input_tokens": 500000,
+    "max_output_tokens": 50000,
+    "max_cost_usd": 5.0,
+    "max_context_tokens": 200000,
+    "first_workflow_start_seconds": 180,
+    "max_no_progress_turns": 12
+  },
   "workflows": [
     {
       "workflow_id": "WF-implementation",
@@ -78,6 +87,11 @@ Each `STRATEGY-vNNN.json` contains:
         "max_instances": 1
       },
       "completion": {"evidence": "acceptance commands pass"},
+      "resume": {
+        "from_attempt": "A002-claude-ab12cd",
+        "from_workflow": "WF-previous-implementation",
+        "mode": "reuse"
+      },
       "on_timeout": "block"
     }
   ],
@@ -97,7 +111,24 @@ Each `STRATEGY-vNNN.json` contains:
 
 Each workflow definition has a stable `workflow_id`, `kind`, `purpose`, `depends_on`, `required`, `executor`, `budget`, `completion`, and `on_timeout`. `budget.max_instances` bounds runtime instances of that definition. Counts and durations are policy values, never protocol constants.
 
+`resource_budget` is optional. Every configured field is a hard limit. Dispatch rejects the attempt before worker launch when the selected backend and I/O mode cannot expose a required metric. Structured events are normalized to `runtime/USAGE.ndjson`; an exceeded limit writes a hard violation and terminates the worker with protocol exit 125. `first_workflow_start_seconds` and `max_no_progress_turns` measure protocol progress in workflow, command, and completion records, not free-form narration. No implicit model/cost defaults are added to existing strategies.
+
+`resume` is optional and allowed only on revision 2 or later. Its mode is:
+
+- `reuse`: the source output satisfies the target workflow; dispatch writes `workflow_carried_forward`.
+- `revalidate`: the source output is useful context, but the target workflow remains pending and must run its checks.
+
+The coordinator approves the explicit source-to-target mapping. At dispatch, RDO requires the source attempt to be terminal, the source workflow to be completed or previously carried forward, and the source `worktree-after` digest to equal the new attempt's `worktree-before` digest. A mismatch fails before worker launch. RDO then writes derived `runtime/RESUME_CONTEXT.json`; workers must execute only `remaining_workflows`.
+
+Acceptance command records are deliberately attempt-local. A strategy whose required workflows are all `reuse` is rejected when `acceptance_commands_pass=true`; at least one required workflow must remain or use `revalidate` to produce current acceptance evidence.
+
+An independent review workflow must declare `kind: "review"` and `review: {"mode": "independent", "required_reviewers": N}`. It must use read-only `native_subagents` with `max_agents >= N`. Each reviewer writes a non-empty artifact under `runtime/reviews/`; completion supplies `--review-evidence REVIEWER_ID=ARTIFACT_PATH`. RDO accepts completion only when the reviewer IDs are distinct and appear in backend lifecycle events. A primary worker cannot declare its own scan to be independent review.
+
 Commands run through `rdo exec` are bounded and audited. Only commands explicitly marked `--acceptance` participate in `completion_gate.acceptance_commands_pass`; exploratory failures remain evidence but do not permanently poison a later valid handoff.
+
+Completion gates are enforced at the earliest deterministic boundary. When completing a workflow would satisfy all required workflows, `rdo workflow complete` validates required workflow completion, acceptance command records, command outcomes, and timeout policy before appending `workflow_completed`. A failed gate leaves the workflow instance active so the worker may add the missing acceptance record and retry completion without consuming another `max_instances` slot.
+
+After the final required workflow completes, RDO writes attempt-local `runtime/FINALIZATION.json`. The worker must call `rdo finalize` once; it derives command evidence and changed paths, then atomically writes `EVIDENCE.md`, `HANDOFF.md`, `HANDOFF.json`, and `COMPLETION.json`.
 
 ## Multiple Workflows
 

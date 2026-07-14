@@ -43,7 +43,10 @@ Dispatch remains synchronous from the protocol perspective:
 
 ```text
 dispatch starts worker
-dispatch waits for completion artifact
+worker command commits attempt-bound COMPLETION.json
+attempt supervisor quiesces an interactive process after validating that signal
+runner writes exit_code after the process is quiescent
+dispatch waits for exit_code
 dispatch records worker exit_code
 dispatch validates handoff
 dispatch updates ATTEMPT.json and EVENTS.ndjson
@@ -168,11 +171,17 @@ Generated tmux session names must be sanitized to avoid tmux target separators s
 
 Do not rely only on `tmux wait-for`. It can miss fast signals if dispatch starts waiting after the runner signals completion.
 
-The completion source of truth is:
+There are two deliberately separate artifacts:
 
 ```text
-attempts/<attempt-id>/exit_code
+COMPLETION.json  worker request to quiesce an interactive process
+exit_code        runner proof that the supervised process has ended
 ```
+
+`COMPLETION.json` is valid only when its task, current attempt, phase, requested
+state, and `HANDOFF.json` digest match. It cannot advance the FSM. The runner's
+attempt-local `exit_code` remains the dispatch synchronization source of truth;
+full handoff and worktree validation happen only after it exists.
 
 Runner behavior:
 

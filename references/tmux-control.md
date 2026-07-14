@@ -13,6 +13,19 @@ common workspace-trust, login, and explicit confirmation prompts. It records
 `worker_waiting_for_user` and prints the attach command. It never answers the
 prompt automatically and cannot recognize every backend-specific TUI screen.
 
+## Completion
+
+An interactive CLI may return to its input prompt after a worker has submitted
+strategy or handoff artifacts. RDO does not require the model to type `/exit`.
+The worker command atomically writes an attempt-bound `COMPLETION.json`; the
+attempt supervisor validates it, allows a short grace period, and then
+quiesces the recorded worker process group. This path does not approve the
+strategy or task. Coordinator review remains a separate FSM action.
+
+With `RDO_TMUX_KEEP_SESSION=1`, the runner leaves a login shell in the pane after
+the worker process has been quiesced, so an attached observer can still inspect
+the attempt. Otherwise dispatch cleans up the tmux session after validation.
+
 ## Attach And Detach
 
 ```bash

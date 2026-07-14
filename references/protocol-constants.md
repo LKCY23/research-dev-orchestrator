@@ -66,6 +66,22 @@ completed
 invalid_handoff
 ```
 
+## Execution Profiles
+
+```text
+direct
+delegated
+full
+```
+
+## Execution Modes
+
+```text
+start
+resume
+replace
+```
+
 ## Task States
 
 ```text
@@ -74,6 +90,7 @@ planning
 strategy_review
 running
 blocked
+verified
 review
 changes_requested
 approved
@@ -102,6 +119,7 @@ strategy_revision_requested
 workflow_started
 workflow_heartbeat
 workflow_completed
+workflow_carried_forward
 workflow_timed_out
 worker_instruction_submitted
 worker_interrupted
@@ -109,6 +127,7 @@ worker_terminated
 attempt_timed_out
 worker_blocked
 worker_review_ready
+worker_verified
 worker_exit_without_valid_status
 dispatch_lock_removed
 coordinator_reviewed
