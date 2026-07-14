@@ -87,6 +87,8 @@ def load_handoff_request(task_dir: Path) -> tuple[dict[str, Any] | None, list[st
         commands = request.get("commands_run")
         if not isinstance(commands, list) or not any(is_non_empty_string(item) for item in commands):
             reasons.append("verified handoff requires at least one recorded acceptance command")
+        if not is_non_empty_string(request.get("source_commit")):
+            reasons.append("verified handoff requires source_commit frozen by rdo finalize")
     return request, reasons
 
 
@@ -456,6 +458,18 @@ def validate_worker_handoff(
                 self_review = request.get("self_review") if isinstance(request, dict) else None
                 if not isinstance(self_review, dict) or self_review.get("passed") is not True:
                     reasons.append("verified handoff requires self_review.passed=true")
+                try:
+                    from completion import validate_completion
+
+                    completion = validate_completion(
+                        task_dir / "attempts" / attempt_id / "COMPLETION.json",
+                        task_dir=task_dir,
+                        attempt_id=attempt_id,
+                    )
+                except Exception as exc:
+                    reasons.append(f"verified completion validation failed: {exc}")
+                else:
+                    reasons.extend(f"verified completion: {reason}" for reason in completion.reasons)
             if task_profile != "full":
                 raise StopIteration
             from strategy import load_approved_strategy

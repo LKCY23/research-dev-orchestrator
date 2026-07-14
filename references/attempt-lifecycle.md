@@ -69,6 +69,7 @@ If `.dispatch-lock` exists while `STATUS.state` is neither `planning` nor `runni
   "state": "completed",
   "handoff_valid": true,
   "handoff_state": "review",
+  "verified_commit": null,
   "started_at": "2026-07-03T12:10:00Z",
   "ended_at": "2026-07-03T12:20:00Z",
   "exit_code": 0,
@@ -115,6 +116,7 @@ runtime.cwd: non-empty string
 runtime.model: optional/null
 runtime.tmux_session: required when runtime.backend = tmux
 runtime.attach_command: required when runtime.backend = tmux
+verified_commit: exact finalize-time Git HEAD for a completed Direct verified attempt; absent otherwise
 ```
 
 ## Attempt States
@@ -164,6 +166,7 @@ null
   "requested_state": "strategy_review",
   "handoff_sha256": "...",
   "strategy_sha256": "...",
+  "source_commit": null,
   "completed_at": "2026-07-14T00:00:00Z"
 }
 ```
@@ -174,6 +177,12 @@ signal lets the attempt supervisor stop the interactive process; dispatch still
 owns worktree checks, `HANDOFF.json` validation, `ATTEMPT.json` completion, and
 the task FSM transition. A previous attempt's signal cannot complete a newer
 attempt.
+
+For a Direct `verified` handoff, `rdo finalize` freezes the clean task branch
+HEAD in both `HANDOFF.json.source_commit` and `COMPLETION.json.source_commit`.
+The completion digest binds the handoff, and dispatch requires the worktree HEAD
+after worker exit to remain equal to that frozen commit before it records
+`ATTEMPT.json.verified_commit` or grants `STATUS.state = verified`.
 
 ## Task State Invariants
 

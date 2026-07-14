@@ -280,16 +280,24 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
 
     verified_commit = None
     if result.valid and result.handoff_state == "verified":
-        if not args.worktree:
+        frozen_commit = result.request.get("source_commit") if isinstance(result.request, dict) else None
+        if not isinstance(frozen_commit, str) or not frozen_commit:
             result = HandoffValidationResult(
                 valid=False,
                 handoff_state=None,
                 exit_code=result.exit_code,
-                reasons=["verified handoff is missing the task worktree needed to bind its Git commit"],
+                reasons=["verified handoff is missing its finalize-time source_commit"],
+            )
+        elif not args.worktree:
+            result = HandoffValidationResult(
+                valid=False,
+                handoff_state=None,
+                exit_code=result.exit_code,
+                reasons=["verified handoff is missing the task worktree needed to check its Git commit"],
             )
         else:
             try:
-                verified_commit = subprocess.check_output(
+                actual_commit = subprocess.check_output(
                     ["git", "rev-parse", "HEAD"],
                     cwd=Path(args.worktree).resolve(),
                     text=True,
@@ -301,8 +309,18 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
                     valid=False,
                     handoff_state=None,
                     exit_code=result.exit_code,
-                    reasons=[f"could not bind verified handoff to task worktree HEAD: {detail}"],
+                    reasons=[f"could not check verified handoff against task worktree HEAD: {detail}"],
                 )
+            else:
+                if actual_commit != frozen_commit:
+                    result = HandoffValidationResult(
+                        valid=False,
+                        handoff_state=None,
+                        exit_code=result.exit_code,
+                        reasons=["task branch HEAD changed after rdo finalize"],
+                    )
+                else:
+                    verified_commit = frozen_commit
 
     try:
         attempt = load_json(attempt_path)

@@ -870,6 +870,9 @@ def handoff(args: argparse.Namespace) -> int:
     attempt_path = path / "attempts" / attempt_id
     commands = list(args.command)
     files = list(args.file)
+    source_commit = None
+    if profile == "direct" and args.state == "verified" and not getattr(args, "auto_derive", False):
+        raise SystemExit("direct verified handoff requires rdo finalize")
     if getattr(args, "auto_derive", False):
         recorded = [item for item in command_events(attempt_path) if item.get("acceptance") is True]
         if recorded:
@@ -879,6 +882,8 @@ def handoff(args: argparse.Namespace) -> int:
         if isinstance(cwd, str) and cwd:
             cwd_path = Path(cwd).resolve()
             require_clean_task_worktree(cwd_path, str(status.get("branch") or ""))
+            if profile == "direct" and args.state == "verified":
+                source_commit = git_output(cwd_path, "rev-parse", "HEAD")
             derived_files = derive_task_changed_files(path, attempt_path, cwd_path)
             if files and sorted(set(files)) != derived_files:
                 raise SystemExit(
@@ -914,6 +919,8 @@ def handoff(args: argparse.Namespace) -> int:
         "blocker_type": args.blocker_type,
         "blocking_reason": args.blocking_reason,
     }
+    if source_commit is not None:
+        request["source_commit"] = source_commit
     temporary = path / "HANDOFF.json.tmp"
     write_json(temporary, request)
     os.replace(temporary, path / "HANDOFF.json")
@@ -924,6 +931,7 @@ def handoff(args: argparse.Namespace) -> int:
         phase=str(attempt_metadata.get("phase")),
         requested_state=args.state,
         strategy_sha256=attempt_metadata.get("strategy_sha256"),
+        source_commit=source_commit,
     )
     print(json.dumps(request))
     return 0

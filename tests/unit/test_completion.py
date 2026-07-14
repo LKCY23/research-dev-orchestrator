@@ -92,6 +92,37 @@ class CompletionTests(unittest.TestCase):
             result = validate_completion(path, task_dir=task, attempt_id="A001")
             self.assertTrue(result.valid, result.reasons)
 
+    def test_verified_completion_binds_finalize_time_source_commit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task, attempt = self.make_task(Path(temporary))
+            status = json.loads((task / "STATUS.json").read_text(encoding="utf-8"))
+            status.update(state="running", profile="direct")
+            (task / "STATUS.json").write_text(json.dumps(status), encoding="utf-8")
+            metadata = json.loads((attempt / "ATTEMPT.json").read_text(encoding="utf-8"))
+            metadata["phase"] = "execution"
+            (attempt / "ATTEMPT.json").write_text(json.dumps(metadata), encoding="utf-8")
+            (task / "HANDOFF.json").write_text(
+                json.dumps({"requested_state": "verified", "source_commit": "commit-a"}),
+                encoding="utf-8",
+            )
+            path = write_completion(
+                task,
+                attempt_id="A001",
+                phase="execution",
+                requested_state="verified",
+                source_commit="commit-a",
+            )
+            result = validate_completion(path, task_dir=task, attempt_id="A001")
+            self.assertTrue(result.valid, result.reasons)
+            self.assertEqual(result.payload["source_commit"], "commit-a")
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["source_commit"] = "commit-b"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            result = validate_completion(path, task_dir=task, attempt_id="A001")
+            self.assertFalse(result.valid)
+            self.assertTrue(any("source_commit" in reason for reason in result.reasons))
+
 
 if __name__ == "__main__":
     unittest.main()

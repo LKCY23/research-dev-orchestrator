@@ -35,6 +35,7 @@ def write_completion(
     phase: str,
     requested_state: str,
     strategy_sha256: str | None = None,
+    source_commit: str | None = None,
 ) -> Path:
     """Commit completion last, after all handoff artifacts are durable."""
 
@@ -47,6 +48,7 @@ def write_completion(
         "requested_state": requested_state,
         "handoff_sha256": file_sha256(handoff_path),
         "strategy_sha256": strategy_sha256 or None,
+        "source_commit": source_commit or None,
         "completed_at": utc_now(),
     }
     path = completion_path(task_dir, attempt_id)
@@ -113,6 +115,12 @@ def validate_completion(path: Path, *, task_dir: Path, attempt_id: str) -> Compl
             reasons.append("strategy completion requires strategy_sha256")
         elif strategy_digest != handoff.get("strategy_sha256"):
             reasons.append("completion strategy_sha256 does not match HANDOFF.json")
+    if requested_state == "verified":
+        source_commit = payload.get("source_commit")
+        if not isinstance(source_commit, str) or not source_commit:
+            reasons.append("verified completion requires source_commit")
+        elif source_commit != handoff.get("source_commit"):
+            reasons.append("completion source_commit does not match HANDOFF.json")
     if parse_iso(payload.get("completed_at")) is None:
         reasons.append("completion completed_at must be an ISO timestamp")
 
