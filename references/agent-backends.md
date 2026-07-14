@@ -69,7 +69,9 @@ Kimi supports both runtime/IO pairs through an attempt-local configuration
 overlay. Its native swarm limit and background-task limit are combined with
 lifecycle hooks. OpenCode supports both pairs through a per-attempt local server:
 machine mode streams server events, while human mode attaches the TUI to the
-same supervised session.
+same supervised session. Human attempts record a password-redacted
+`runtime/ATTACH.json`; the initial prompt is still sent exactly once through the
+server API before attachment.
 
 ## Prompt Transport
 

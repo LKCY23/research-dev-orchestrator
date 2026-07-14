@@ -263,6 +263,23 @@ def opencode_config(settings: dict[str, Any]) -> dict[str, Any]:
     return {"permission": {"task": task_rules}, "agent": agents}
 
 
+def opencode_attach_command(
+    base_url: str, cwd: str, session_id: str, password: str
+) -> list[str]:
+    # OpenCode 1.17 parses the positional URL reliably when it follows options.
+    return [
+        "opencode",
+        "attach",
+        "--dir",
+        cwd,
+        "--session",
+        session_id,
+        "--password",
+        password,
+        base_url,
+    ]
+
+
 def wait_for_server(api: Api, process: subprocess.Popen[Any]) -> None:
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -356,9 +373,35 @@ def main() -> int:
             "parts": [{"type": "text", "text": args.prompt}]
         })
         if args.io_mode == "human":
+            attach_command = opencode_attach_command(
+                base_url, args.cwd, root_id, password
+            )
+            (runtime / "ATTACH.json").write_text(
+                json.dumps(
+                    {
+                        "backend_id": "opencode",
+                        "url": base_url,
+                        "cwd": args.cwd,
+                        "session_id": root_id,
+                        "password_redacted": True,
+                        "argv_shape": [
+                            "opencode",
+                            "attach",
+                            "--dir",
+                            args.cwd,
+                            "--session",
+                            root_id,
+                            "--password",
+                            "<redacted>",
+                            base_url,
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             attach = subprocess.run(
-                ["opencode", "attach", base_url, "--dir", args.cwd, "--session", root_id,
-                 "--password", password],
+                attach_command,
                 cwd=args.cwd,
                 env=environment,
                 check=False,

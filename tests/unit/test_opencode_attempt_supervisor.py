@@ -2,7 +2,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from opencode_attempt_supervisor import Guardian, opencode_config
+from opencode_attempt_supervisor import (
+    Guardian,
+    opencode_attach_command,
+    opencode_config,
+)
 
 
 class FakeApi:
@@ -77,6 +81,14 @@ class OpenCodeGuardianTests(unittest.TestCase):
         })
         self.assertEqual(config["permission"]["task"], {"*": "ask"})
         self.assertEqual(config["agent"]["explore"]["permission"]["task"], "deny")
+
+    def test_attach_url_is_the_final_positional_argument(self):
+        command = opencode_attach_command(
+            "http://127.0.0.1:4096", "/tmp/worktree", "ses_root", "secret"
+        )
+        self.assertEqual(command[-1], "http://127.0.0.1:4096")
+        self.assertEqual(command[0:2], ["opencode", "attach"])
+        self.assertEqual(command[command.index("--password") + 1], "secret")
 
     def test_usage_budget_aborts_root_session(self):
         self.guardian.usage.budget = {"max_model_turns": 1}
