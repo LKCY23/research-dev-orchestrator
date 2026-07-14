@@ -173,6 +173,24 @@ review does not automatically approve.
 Only mutate review -> approved, review -> changes_requested, or review -> failed when the user explicitly asks and review gates support it.
 ```
 
+After that explicit decision, use the coordinator command rather than editing
+`STATUS.json`:
+
+```bash
+python scripts/rdo.py task review \
+  --task-dir <task-dir> \
+  --decision approved|changes_requested|failed \
+  --reviewer <coordinator-id> \
+  --findings-file <task-local-review-file>
+```
+
+The command binds the non-empty task-local findings file by SHA-256, writes an
+immutable `reviews/DECISION-vNNN.json`, updates
+`reviews/CURRENT_TASK_REVIEW.json`, performs the legal coordinator FSM
+transition, and appends review events. When the decision is
+`changes_requested`, subsequent planning and execution prompts include the
+digest-verified findings until a newer task review decision supersedes them.
+
 ### recover-lock
 
 ```text

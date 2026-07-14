@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -83,6 +84,62 @@ class DispatchAssetsTests(unittest.TestCase):
             )
 
             self.assertNotIn("Minimal Valid Strategy Skeleton", prompt)
+
+    def test_prompt_embeds_digest_bound_changes_requested_feedback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary)
+            (task / "strategy").mkdir()
+            reviews = task / "reviews"
+            reviews.mkdir()
+            findings = "# Findings\n\nCorrect the documented API status names.\n"
+            findings_path = reviews / "coordinator-findings.md"
+            findings_path.write_text(findings, encoding="utf-8")
+            decision_path = reviews / "DECISION-v001.json"
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        "revision": 1,
+                        "decision": "changes_requested",
+                        "reviewer": "codex",
+                        "findings_path": "reviews/coordinator-findings.md",
+                        "findings_sha256": hashlib.sha256(
+                            findings.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (reviews / "CURRENT_TASK_REVIEW.json").write_text(
+                json.dumps(
+                    {
+                        "revision": 1,
+                        "decision_path": "reviews/DECISION-v001.json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task / "STATUS.json").write_text(
+                json.dumps({"task_id": "T101-example", "state": "changes_requested"}),
+                encoding="utf-8",
+            )
+            (task / "EXECUTION_POLICY.json").write_text(
+                json.dumps(DEFAULT_EXECUTION_POLICY), encoding="utf-8"
+            )
+            for name in ("TASK.md", "CONTEXT.md", "ACCEPTANCE.md"):
+                (task / name).write_text(name, encoding="utf-8")
+
+            prompt = render_worker_prompt(
+                worktree_path="/tmp/worktree",
+                task_dir=task,
+                status_path=task / "STATUS.json",
+                attempt_dir=task / "attempts" / "A002",
+                worker_backend="opencode",
+                phase="planning",
+            )
+
+            self.assertIn("## Coordinator Feedback", prompt)
+            self.assertIn("Correct the documented API status names.", prompt)
+            self.assertIn("Reviewer: codex", prompt)
 
 
 if __name__ == "__main__":

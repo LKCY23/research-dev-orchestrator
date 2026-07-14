@@ -8,6 +8,7 @@ attempt-local files used by dispatch_claude.sh.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -97,6 +98,33 @@ def render_worker_prompt(
 ) -> str:
     status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
     profile = status.get("profile", "full")
+    coordinator_feedback = ""
+    review_pointer = task_dir / "reviews" / "CURRENT_TASK_REVIEW.json"
+    if review_pointer.exists():
+        pointer = json.loads(review_pointer.read_text(encoding="utf-8"))
+        decision_path = (task_dir / str(pointer["decision_path"])).resolve()
+        if task_dir.resolve() not in decision_path.parents:
+            raise ValueError("task review decision path escapes the task directory")
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        if decision.get("decision") == "changes_requested":
+            findings_path = (task_dir / str(decision["findings_path"])).resolve()
+            if task_dir.resolve() not in findings_path.parents:
+                raise ValueError("task review findings path escapes the task directory")
+            findings = findings_path.read_text(encoding="utf-8")
+            digest = hashlib.sha256(findings.encode("utf-8")).hexdigest()
+            if digest != decision.get("findings_sha256"):
+                raise ValueError("task review findings digest does not match the decision")
+            coordinator_feedback = "\n".join(
+                [
+                    "## Coordinator Feedback",
+                    "",
+                    f"Decision revision: {decision.get('revision')}",
+                    f"Reviewer: {decision.get('reviewer')}",
+                    "",
+                    findings,
+                    "",
+                ]
+            )
     if phase == "planning":
         strategy_action = "revise" if any((task_dir / "strategy").glob("STRATEGY-v*.json")) else "submit"
         phase_rules = [
@@ -181,6 +209,7 @@ def render_worker_prompt(
             "",
             *phase_rules,
             "",
+            coordinator_feedback,
             "## TASK.md",
             read_text(task_dir / "TASK.md"),
             "",

@@ -51,6 +51,15 @@ def transition(path: Path, target: str, actor: str) -> None:
     write_json(status_path, status)
 
 
+def validate_transition(path: Path, target: str, actor: str) -> str:
+    status = load_json(path / "STATUS.json")
+    source = status.get("state")
+    fsm = load_json(SKILL_ROOT / "references" / "state-machine.json")
+    if actor not in fsm.get("transitions", {}).get(source, {}).get(target, []):
+        raise SystemExit(f"illegal transition: {source!r} -> {target!r} by {actor}")
+    return str(source)
+
+
 def atomic_text(path: Path, text: str) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(text, encoding="utf-8")
@@ -121,6 +130,80 @@ def strategy_review(args: argparse.Namespace) -> int:
     if decision == "changes_requested":
         transition(path, "changes_requested", "coordinator")
     print(json.dumps(review))
+    return 0
+
+
+def task_review(args: argparse.Namespace) -> int:
+    path = task_dir(args.task_dir)
+    if load_json(path / "STATUS.json").get("state") != "review":
+        raise SystemExit("task review requires review state")
+
+    target_by_decision = {
+        "approved": "approved",
+        "changes_requested": "changes_requested",
+        "failed": "failed",
+    }
+    event_by_decision = {
+        "approved": "task_approved",
+        "changes_requested": "changes_requested",
+        "failed": "task_failed",
+    }
+    target = target_by_decision[args.decision]
+    validate_transition(path, target, "coordinator")
+
+    findings_path = Path(args.findings_file).resolve()
+    try:
+        findings_relative = findings_path.relative_to(path)
+    except ValueError as exc:
+        raise SystemExit("findings file must be inside the task directory") from exc
+    if not findings_path.is_file():
+        raise SystemExit(f"findings file does not exist: {findings_path}")
+    findings = findings_path.read_text(encoding="utf-8")
+    if not findings.strip():
+        raise SystemExit("findings file must be non-empty")
+
+    reviews = path / "reviews"
+    reviews.mkdir(parents=True, exist_ok=True)
+    revision = len(list(reviews.glob("DECISION-v*.json"))) + 1
+    decision_path = reviews / f"DECISION-v{revision:03d}.json"
+    if decision_path.exists():
+        raise SystemExit(f"refusing to overwrite task review decision: {decision_path}")
+    payload = {
+        "schema_version": 1,
+        "task_id": load_json(path / "STATUS.json")["task_id"],
+        "revision": revision,
+        "decision": args.decision,
+        "reviewer": args.reviewer,
+        "reviewed_at": utc_now(),
+        "findings_path": findings_relative.as_posix(),
+        "findings_sha256": hashlib.sha256(findings.encode("utf-8")).hexdigest(),
+        "notes": args.note,
+    }
+    write_json(decision_path, payload)
+    write_json(
+        reviews / "CURRENT_TASK_REVIEW.json",
+        {
+            "revision": revision,
+            "decision_path": decision_path.relative_to(path).as_posix(),
+        },
+    )
+    transition(path, target, "coordinator")
+    event(
+        path,
+        "coordinator_reviewed",
+        "coordinator",
+        decision=args.decision,
+        review_revision=revision,
+        findings_path=findings_relative.as_posix(),
+    )
+    event(
+        path,
+        event_by_decision[args.decision],
+        "coordinator",
+        review_revision=revision,
+        findings_path=findings_relative.as_posix(),
+    )
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -560,6 +643,8 @@ def build_parser() -> argparse.ArgumentParser:
         command = strategy.add_parser(name); command.add_argument("--task-dir", required=True); command.add_argument("--file", required=True); command.set_defaults(func=strategy_submit)
     for name in ("approve", "changes"):
         command = strategy.add_parser(name); command.add_argument("--task-dir", required=True); command.add_argument("--revision", type=int, required=True); command.add_argument("--reviewer", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=strategy_review)
+    tasks = areas.add_parser("task").add_subparsers(dest="task_action", required=True)
+    command = tasks.add_parser("review"); command.add_argument("--task-dir", required=True); command.add_argument("--decision", choices=("approved", "changes_requested", "failed"), required=True); command.add_argument("--reviewer", required=True); command.add_argument("--findings-file", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=task_review)
     workflows = areas.add_parser("workflow").add_subparsers(dest="workflow_action", required=True)
     for name in ("start", "heartbeat", "complete"):
         command = workflows.add_parser(name); command.add_argument("--attempt-dir", required=True); command.add_argument("--workflow-id", required=True); command.add_argument("--instance-id", required=True); command.add_argument("--review-evidence", action="append", default=[]); command.set_defaults(func=workflow_action)

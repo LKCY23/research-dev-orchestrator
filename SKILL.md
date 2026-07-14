@@ -165,6 +165,12 @@ Read `references/command-surface.md` before acting on these intents. `review` do
 
 `protocol_cli.py` is a narrow internal bridge for dispatch scripts. It performs mechanical protocol operations such as attempt creation, transition to running, event append, handoff validation, and diagnostics writing. It must not implement coordinator-only decisions such as approve, merge, auto-review, or auto-recover.
 
+`rdo.py task review` is the narrow coordinator-owned task review mutation. It
+requires an explicit user-authorized decision and a non-empty task-local
+findings file, records an immutable digest-bound decision, performs only the
+legal `review -> approved|changes_requested|failed` transition, and makes
+`changes_requested` feedback available to later worker prompts.
+
 `dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; dispatch remains responsible for locks, worktrees, process supervision, and handoff validation.
 
 `dispatch_agent.sh` is the generic worker dispatch entrypoint. Direct and Delegated tasks map `pending|blocked|changes_requested -> running`. Full tasks map `pending -> planning`, `strategy_review -> running` after exact-digest approval, and ordinary `blocked|changes_requested -> running` while the strategy remains valid. Each dispatch creates a new bounded attempt but normally resumes the same logical worker and native backend session. Valid Direct execution produces `verified`; Delegated execution produces `review`; Full planning/execution produces `strategy_review`, `review`, or `blocked`. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
