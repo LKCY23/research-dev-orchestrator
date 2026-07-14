@@ -6,6 +6,12 @@ An attempt is one bounded supervision and audit slice, not a worker identity. Or
 
 Session continuity and work continuity are independent. Backend replacement starts a new native session, but an approved Full strategy may still carry compatible workflow checkpoints from a terminal prior attempt. Dispatch records those mappings in `runtime/RESUME_CONTEXT.json` and `workflow_carried_forward` events.
 
+For a Full task in `blocked` or `changes_requested`, automatic dispatch uses an
+approved strategy only when the current strategy still validates under the
+installed protocol. A missing or invalid strategy routes to a new read-only
+planning attempt; it must not fail before attempt creation merely because an
+older `CURRENT.json` pointer exists.
+
 ## Principles
 
 ```text

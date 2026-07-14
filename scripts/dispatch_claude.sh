@@ -170,6 +170,15 @@ import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8")).get("profile", "full"))
 PY
 )"
+approved_strategy_valid() {
+  PYTHONPATH="${SCRIPT_DIR}" python3 - "${TASK_DIR}" >/dev/null 2>&1 <<'PY'
+import sys
+from pathlib import Path
+from strategy import load_approved_strategy
+
+load_approved_strategy(Path(sys.argv[1]))
+PY
+}
 case "${TASK_PROFILE}" in
   direct|delegated|full) ;;
   *) echo "invalid task profile: ${TASK_PROFILE}" >&2; exit 2 ;;
@@ -180,7 +189,7 @@ if [[ "${RDO_ATTEMPT_PHASE}" == "auto" ]]; then
       pending) RDO_ATTEMPT_PHASE="planning" ;;
       strategy_review) RDO_ATTEMPT_PHASE="execution" ;;
       blocked|changes_requested)
-        if [[ -f "${TASK_DIR}/strategy/CURRENT.json" ]]; then
+        if [[ -f "${TASK_DIR}/strategy/CURRENT.json" ]] && approved_strategy_valid; then
           RDO_ATTEMPT_PHASE="execution"
         else
           RDO_ATTEMPT_PHASE="planning"
