@@ -145,6 +145,10 @@ Full:      strategy planning -> coordinator strategy review -> execution -> coor
 
 三个 profile 都保留 Git 隔离、有界 attempt supervision、evidence 和 handoff 校验。详见 [execution profiles](references/execution-profiles.md)。
 
+合并通过 coordinator-only 的 `rdo task merge` 公开命令完成。Task approval
+会绑定被 review 的精确 commit；merge 要求 worktree 干净、只允许 fast-forward、
+可幂等重放，并直接根据 Git ancestry 恢复，不新增 `MERGE.json` 协议文件。
+
 一个 run 会记录完整生命周期：需求、设计笔记、实验计划、任务、attempt、review、结果、诊断和记忆。
 
 ## Execution Strategy 与监督

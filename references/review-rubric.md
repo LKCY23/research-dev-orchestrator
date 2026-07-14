@@ -14,6 +14,7 @@ Use this rubric before Codex changes a task from `review` to `approved`, `change
 8. Verify mergeability against the target branch.
 9. Run required integration smoke tests before `approved`.
 10. If merged, record post-merge smoke results when required by `ACCEPTANCE.md`.
+11. Bind an approved decision to the exact clean task-branch commit and current evidence/handoff digests.
 
 ## Outcomes
 

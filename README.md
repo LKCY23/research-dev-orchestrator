@@ -147,6 +147,11 @@ Full:      strategy planning -> coordinator strategy review -> execution -> coor
 
 Every profile keeps Git isolation, bounded attempt supervision, evidence, and validated handoff. See [execution profiles](references/execution-profiles.md).
 
+Merge is exposed through the coordinator-only `rdo task merge` command. Task
+approval binds the exact reviewed commit; merge is clean, fast-forward-only,
+idempotent, and recoverable from Git ancestry without adding a `MERGE.json`
+protocol artifact.
+
 A run captures the full lifecycle: requirements, design notes, experiment plans, tasks, attempts, reviews, results, diagnostics, and memory.
 
 ## Execution Strategy And Supervision

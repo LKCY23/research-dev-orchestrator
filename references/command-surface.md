@@ -8,7 +8,7 @@ Coordinator-only commands:
 
 ```text
 rdo strategy approve|changes
-rdo task review
+rdo task review|merge
 rdo worker message|interrupt|terminate
 rdo status
 ```
@@ -191,6 +191,44 @@ immutable `reviews/DECISION-vNNN.json`, updates
 transition, and appends review events. When the decision is
 `changes_requested`, subsequent planning and execution prompts include the
 digest-verified findings until a newer task review decision supersedes them.
+
+An `approved` decision also binds the exact clean task-branch commit, source
+branch, run target branch/commit, and current evidence/handoff digests. Merge
+rejects any task commit or reviewed artifact changed after approval.
+
+### merge
+
+```bash
+python scripts/rdo.py task merge \
+  --task-dir <task-dir> \
+  --target-worktree <path> \
+  --expected-commit <commit> \
+  [--verify-command "pytest -q"] \
+  [--verification-timeout 300] \
+  --coordinator <coordinator-id>
+```
+
+Purpose: perform the coordinator-owned mechanical merge gate for an approved
+task or a verified Direct task.
+
+The command derives source and target branches from `STATUS.json` and
+`RUN.json`, requires clean task and target worktrees, permits only
+fast-forward merge, and uses Git ancestry as the merge source of truth. If Git
+already contains the bound task commit but task state is not yet `merged`, the
+same command resumes verification and protocol recording. Repeated completed
+invocations do not duplicate `task_merged` events. No `MERGE.json` artifact is
+created.
+
+Optional post-merge commands run as parsed argv without a shell and write one
+task-local `logs/post-merge.log`. A failed post-merge command returns non-zero
+but the task remains truthfully `merged`, because RDO never rewinds a target
+branch after Git has accepted the commit.
+
+Natural-language intent:
+
+```text
+$research-dev-orchestrator merge run=<run-id> task=<task-id> target-worktree=<path> [commit=<sha>] [verify="<command>"]
+```
 
 ### recover-lock
 

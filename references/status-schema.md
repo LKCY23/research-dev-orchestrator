@@ -107,6 +107,12 @@ For tmux dispatch timeout before the attempt-local `exit_code` file appears, `ST
 
 `STATUS.state = verified` is Direct-only. It requires a completed attempt with `handoff_valid = true`, `handoff_state = verified`, worker `exit_code = 0`, and `HANDOFF.json.self_review.passed = true`. The worker must test, review its diff, and fix its own findings before requesting this state.
 
+`STATUS.state = merged` requires a matching `task_merged` event whose exact
+commit is contained by `RUN.json.target_branch`. For reviewed tasks, that commit
+must be the immutable `approved_commit` in the current task review decision.
+For Direct tasks, the current task worktree must still match the completed
+verified attempt's `worktree-after` fingerprint at merge time.
+
 `STATUS.state = strategy_review` requires a completed planning or execution revision attempt with `handoff_state = strategy_review`, exit code `0`, and a handoff digest matching an immutable submitted strategy revision. No `.dispatch-lock` may remain active.
 
 `STATUS.state = blocked` requires `previous_state = planning|running`, valid `blocker_type`, and non-empty `blocking_reason`. A normal blocked handoff also requires a completed attempt with `handoff_valid = true`, `handoff_state = blocked`, substantive `HANDOFF.md`, and `HANDOFF.json` with `requested_state = blocked`. An invalid worker handoff may instead use `ATTEMPT.state = invalid_handoff`, `handoff_valid = false`, and `blocker_type = needs_coordinator` for coordinator triage. The final transition is written by `dispatch`, not by the worker.

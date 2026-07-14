@@ -146,6 +146,7 @@ $research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>"
 $research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
 $research-dev-orchestrator status run=<run-id> [json] [summary] [dashboard] [diagnostics]
 $research-dev-orchestrator review run=<run-id> task=<task-id>
+$research-dev-orchestrator merge run=<run-id> task=<task-id> target-worktree=<path> [commit=<sha>] [verify="<command>"]
 $research-dev-orchestrator recover-lock run=<run-id> task=<task-id>
 $research-dev-orchestrator close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
 ```
@@ -171,6 +172,13 @@ requires an explicit user-authorized decision and a non-empty task-local
 findings file, records an immutable digest-bound decision, performs only the
 legal `review -> approved|changes_requested|failed` transition, and makes
 `changes_requested` feedback available to later worker prompts.
+
+`rdo.py task merge` is the coordinator-owned merge mutation. It derives the
+approved source and run target from protocol state, permits only a clean
+fast-forward merge, verifies exact approval/fingerprint binding, and reconciles
+Git ancestry with `STATUS.json` plus the existing `task_merged` event. It does
+not create a separate merge transaction artifact or call an internal FSM helper
+from ad hoc agent code.
 
 `dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; dispatch remains responsible for locks, worktrees, process supervision, and handoff validation.
 

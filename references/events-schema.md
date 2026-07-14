@@ -71,6 +71,12 @@ Attempt-local `runtime/USAGE.ndjson` is a separate high-volume ledger, not part 
 
 `dispatch_lock_removed` records a user-approved recovery action that removed a stale `.dispatch-lock`. It must include `task_id`, should include `attempt_id` when known, and should include `reason` plus a diagnostics `snapshot` path.
 
+`task_merged` records the exact merged `commit`, source branch, target branch,
+and coordinator identity. When post-merge verification was requested, it also
+contains structured command results and the task-local log path. A matching
+`task_id + commit` identifies an already-recorded merge for idempotent replay;
+no separate merge identifier or `MERGE.json` is required.
+
 ## Validation
 
 Malformed JSON, missing required fields, and wrong `run_id` are protocol violations.

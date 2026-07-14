@@ -48,3 +48,9 @@ Create a new task such as `T001R1-*` when scope, acceptance criteria, design, or
 ## Approval Gate
 
 Do not mark `approved` because code appears reasonable. Before `review -> approved`, Codex must verify diff quality, acceptance evidence, allowed/forbidden paths, mergeability, integration smoke tests, and lock/blocker state.
+
+The immutable task review decision binds the exact approved task commit and
+reviewed evidence/handoff digests. `rdo task merge` is the public coordinator
+surface for `approved|verified -> merged`; it performs only a fast-forward merge
+and reconciles a prior Git merge by ancestry instead of relying on an additional
+merge transaction artifact.

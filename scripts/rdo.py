@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import hashlib
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from completion import write_completion
-from protocol import SKILL_ROOT, append_event, load_json, parse_iso, utc_now, write_json
+from protocol import SKILL_ROOT, append_event, load_json, parse_iso, repo_root, utc_now, write_json
 from strategy import StrategyValidationError, canonical_digest, load_approved_strategy, review_strategy, submit_strategy
 from supervisor import run_supervised, terminate_processes
 from worktree_fingerprint import fingerprint
@@ -99,6 +100,119 @@ def require_clean_task_worktree(cwd: Path, expected_branch: str) -> None:
         raise SystemExit("task worktree must be committed and clean before final handoff")
 
 
+def require_clean_target_worktree(cwd: Path, expected_branch: str) -> None:
+    branch = git_output(cwd, "branch", "--show-current")
+    if branch != expected_branch:
+        raise SystemExit(
+            f"target worktree must be on run target branch {expected_branch!r}, got {branch!r}"
+        )
+    raw = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+    )
+    if raw.returncode != 0:
+        raise SystemExit("cannot inspect target worktree status")
+    dirty: list[str] = []
+    for entry in raw.stdout.split(b"\0"):
+        if not entry:
+            continue
+        text = entry.decode("utf-8", errors="replace")
+        path = text[3:] if len(text) >= 4 else text
+        if path.startswith(".agent-collab/") or path.startswith(".agent-worktrees/"):
+            continue
+        dirty.append(path)
+    if dirty:
+        raise SystemExit(f"target worktree has non-RDO changes: {sorted(dirty)}")
+
+
+def git_output(cwd: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", *arguments], cwd=cwd, text=True, capture_output=True, check=False
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise SystemExit(f"git {' '.join(arguments)} failed: {detail}")
+    return result.stdout.strip()
+
+
+def resolve_worktree(root: Path, value: Any, *, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"{label} is missing")
+    path = Path(value)
+    resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+    if not resolved.is_dir():
+        raise SystemExit(f"{label} does not exist: {resolved}")
+    return resolved
+
+
+def require_same_repository(root: Path, worktree: Path) -> None:
+    root_common_raw = Path(git_output(root, "rev-parse", "--git-common-dir"))
+    worktree_common_raw = Path(git_output(worktree, "rev-parse", "--git-common-dir"))
+    root_common = (
+        root_common_raw.resolve()
+        if root_common_raw.is_absolute()
+        else (root / root_common_raw).resolve()
+    )
+    worktree_common = (
+        worktree_common_raw.resolve()
+        if worktree_common_raw.is_absolute()
+        else (worktree / worktree_common_raw).resolve()
+    )
+    if root_common != worktree_common:
+        raise SystemExit("target and task worktrees must belong to the same Git repository")
+
+
+def current_task_review(path: Path) -> dict[str, Any]:
+    pointer_path = path / "reviews" / "CURRENT_TASK_REVIEW.json"
+    if not pointer_path.exists():
+        raise SystemExit("approved task is missing CURRENT_TASK_REVIEW.json")
+    pointer = load_json(pointer_path)
+    relative = pointer.get("decision_path") if isinstance(pointer, dict) else None
+    if not isinstance(relative, str) or not relative:
+        raise SystemExit("CURRENT_TASK_REVIEW.json has no decision_path")
+    decision_path = (path / relative).resolve()
+    try:
+        decision_path.relative_to((path / "reviews").resolve())
+    except ValueError as exc:
+        raise SystemExit("task review decision must be inside the reviews directory") from exc
+    decision = load_json(decision_path)
+    if decision.get("decision") != "approved":
+        raise SystemExit("current task review decision is not approved")
+    if decision.get("task_id") != load_json(path / "STATUS.json").get("task_id"):
+        raise SystemExit("task review decision task_id does not match STATUS.json")
+    return decision
+
+
+def approval_git_binding(path: Path, status: dict[str, Any]) -> dict[str, str]:
+    root = repo_root(path)
+    task_worktree = resolve_worktree(root, status.get("worktree"), label="task worktree")
+    require_same_repository(root, task_worktree)
+    source_branch = str(status.get("branch") or "")
+    require_clean_task_worktree(task_worktree, source_branch)
+    run = load_json(run_dir(path) / "RUN.json")
+    target_branch = run.get("target_branch")
+    if not isinstance(target_branch, str) or not target_branch:
+        raise SystemExit("RUN.json target_branch is missing")
+    approved_commit = git_output(task_worktree, "rev-parse", "HEAD")
+    target_commit = git_output(root, "rev-parse", target_branch)
+    if subprocess.run(
+        ["git", "merge-base", "--is-ancestor", target_commit, approved_commit],
+        cwd=root,
+        check=False,
+    ).returncode != 0:
+        raise SystemExit("task branch is not fast-forward mergeable from the reviewed target commit")
+    return {
+        "approved_commit": approved_commit,
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "target_commit_at_review": target_commit,
+        "evidence_sha256": hashlib.sha256((path / "EVIDENCE.md").read_bytes()).hexdigest(),
+        "handoff_sha256": hashlib.sha256((path / "HANDOFF.json").read_bytes()).hexdigest(),
+    }
+
+
 def strategy_submit(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
     status = load_json(path / "STATUS.json")
@@ -168,7 +282,8 @@ def strategy_review(args: argparse.Namespace) -> int:
 
 def task_review(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
-    if load_json(path / "STATUS.json").get("state") != "review":
+    status = load_json(path / "STATUS.json")
+    if status.get("state") != "review":
         raise SystemExit("task review requires review state")
 
     target_by_decision = {
@@ -212,6 +327,8 @@ def task_review(args: argparse.Namespace) -> int:
         "findings_sha256": hashlib.sha256(findings.encode("utf-8")).hexdigest(),
         "notes": args.note,
     }
+    if args.decision == "approved":
+        payload.update(approval_git_binding(path, status))
     write_json(decision_path, payload)
     write_json(
         reviews / "CURRENT_TASK_REVIEW.json",
@@ -238,6 +355,252 @@ def task_review(args: argparse.Namespace) -> int:
     )
     print(json.dumps(payload, indent=2))
     return 0
+
+
+def merge_source_commit(path: Path, status: dict[str, Any], root: Path) -> tuple[str, str, str]:
+    source_branch = str(status.get("branch") or "")
+    task_worktree = resolve_worktree(root, status.get("worktree"), label="task worktree")
+    require_same_repository(root, task_worktree)
+    require_clean_task_worktree(task_worktree, source_branch)
+    source_head = git_output(task_worktree, "rev-parse", "HEAD")
+    run = load_json(run_dir(path) / "RUN.json")
+    target_branch = run.get("target_branch")
+    if not isinstance(target_branch, str) or not target_branch:
+        raise SystemExit("RUN.json target_branch is missing")
+
+    profile = status.get("profile", "full")
+    if status.get("state") in {"approved", "merged"} and profile != "direct":
+        decision = current_task_review(path)
+        required = {
+            "approved_commit", "source_branch", "target_branch",
+            "target_commit_at_review", "evidence_sha256", "handoff_sha256",
+        }
+        missing = sorted(field for field in required if not decision.get(field))
+        if missing:
+            raise SystemExit(f"approved task review is missing Git binding fields: {missing}")
+        if decision["source_branch"] != source_branch or decision["target_branch"] != target_branch:
+            raise SystemExit("approved task review branch binding no longer matches task/run metadata")
+        if decision["approved_commit"] != source_head:
+            raise SystemExit("task branch HEAD changed after coordinator approval")
+        if decision["evidence_sha256"] != hashlib.sha256((path / "EVIDENCE.md").read_bytes()).hexdigest():
+            raise SystemExit("EVIDENCE.md changed after coordinator approval")
+        if decision["handoff_sha256"] != hashlib.sha256((path / "HANDOFF.json").read_bytes()).hexdigest():
+            raise SystemExit("HANDOFF.json changed after coordinator approval")
+        return source_head, source_branch, target_branch
+
+    if profile != "direct" or status.get("state") not in {"verified", "merged"}:
+        raise SystemExit("task merge requires an approved task or a verified Direct task")
+    attempt_id = status.get("current_attempt_id")
+    attempt = path / "attempts" / str(attempt_id)
+    metadata = load_json(attempt / "ATTEMPT.json")
+    if (
+        metadata.get("state") != "completed"
+        or metadata.get("handoff_valid") is not True
+        or metadata.get("handoff_state") != "verified"
+    ):
+        raise SystemExit("verified Direct task does not have a valid completed attempt")
+    after_path = attempt / "runtime" / "worktree-after.json"
+    if not after_path.exists():
+        raise SystemExit("verified Direct task is missing worktree-after fingerprint")
+    if load_json(after_path).get("sha256") != fingerprint(task_worktree).get("sha256"):
+        raise SystemExit("Direct task worktree changed after verified handoff")
+    return source_head, source_branch, target_branch
+
+
+def existing_task_merged_event(path: Path, commit: str | None = None) -> dict[str, Any] | None:
+    events_path = run_dir(path) / "EVENTS.ndjson"
+    if not events_path.exists():
+        return None
+    task_id = load_json(path / "STATUS.json").get("task_id")
+    matches: list[dict[str, Any]] = []
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if (
+            record.get("event") == "task_merged"
+            and record.get("task_id") == task_id
+            and (commit is None or record.get("commit") == commit)
+        ):
+            matches.append(record)
+    return matches[-1] if matches else None
+
+
+def run_merge_verification(
+    path: Path,
+    target_worktree: Path,
+    commands: list[str],
+    timeout_seconds: float,
+) -> dict[str, Any] | None:
+    if not commands:
+        return None
+    if timeout_seconds <= 0:
+        raise SystemExit("verification timeout must be positive")
+    log_path = path / "logs" / "post-merge.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, Any]] = []
+    with log_path.open("a", encoding="utf-8") as log:
+        for raw in commands:
+            argv = shlex.split(raw)
+            if not argv:
+                raise SystemExit("post-merge verification command cannot be empty")
+            log.write(f"\n[{utc_now()}] $ {shlex.join(argv)}\n")
+            log.flush()
+            timed_out = False
+            try:
+                completed = subprocess.run(
+                    argv,
+                    cwd=target_worktree,
+                    text=True,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
+                exit_code = int(completed.returncode)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                exit_code = 124
+                log.write(f"command timed out after {timeout_seconds:g} seconds\n")
+            except OSError as exc:
+                exit_code = 127
+                log.write(f"command could not start: {exc}\n")
+            result = {
+                "command": argv,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+            }
+            results.append(result)
+            if exit_code != 0:
+                break
+    return {
+        "passed": all(item["exit_code"] == 0 for item in results),
+        "results": results,
+        "log": log_path.relative_to(path).as_posix(),
+    }
+
+
+def task_merge(args: argparse.Namespace) -> int:
+    path = task_dir(args.task_dir)
+    status = load_json(path / "STATUS.json")
+    if status.get("state") not in {"approved", "verified", "merged"}:
+        raise SystemExit("task merge requires approved, verified, or already merged state")
+    if (path / ".dispatch-lock").exists():
+        raise SystemExit("task merge is forbidden while a dispatch lock exists")
+
+    root = repo_root(path)
+    run = load_json(run_dir(path) / "RUN.json")
+    configured_target = run.get("target_branch")
+    if not isinstance(configured_target, str) or not configured_target:
+        raise SystemExit("RUN.json target_branch is missing")
+    target_worktree = Path(args.target_worktree).resolve()
+    if not target_worktree.is_dir():
+        raise SystemExit(f"target worktree does not exist: {target_worktree}")
+    require_same_repository(root, target_worktree)
+    require_clean_target_worktree(target_worktree, configured_target)
+
+    if status.get("state") == "merged":
+        recorded = existing_task_merged_event(path)
+        if recorded is not None:
+            source_commit = recorded.get("commit")
+            if not isinstance(source_commit, str) or not source_commit:
+                raise SystemExit("task_merged event is missing commit")
+            if recorded.get("target_branch") != configured_target:
+                raise SystemExit("task_merged target branch does not match RUN.json")
+            if args.expected_commit:
+                expected = git_output(root, "rev-parse", args.expected_commit)
+                if expected != source_commit:
+                    raise SystemExit(
+                        f"expected commit {expected} does not match merged commit {source_commit}"
+                    )
+            target_head = git_output(target_worktree, "rev-parse", "HEAD")
+            if subprocess.run(
+                ["git", "merge-base", "--is-ancestor", source_commit, target_head],
+                cwd=target_worktree,
+                check=False,
+            ).returncode != 0:
+                raise SystemExit("STATUS is merged but target branch does not contain the merged commit")
+            print(json.dumps(recorded, indent=2))
+            verification = recorded.get("verification")
+            return 0 if not isinstance(verification, dict) or verification.get("passed") is not False else 1
+
+    source_commit, source_branch, target_branch = merge_source_commit(path, status, root)
+    if args.expected_commit:
+        expected = git_output(root, "rev-parse", args.expected_commit)
+        if expected != source_commit:
+            raise SystemExit(
+                f"expected commit {expected} does not match approved source commit {source_commit}"
+            )
+    target_head = git_output(target_worktree, "rev-parse", "HEAD")
+    contains_source = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", source_commit, target_head],
+        cwd=target_worktree,
+        check=False,
+    ).returncode == 0
+    if not contains_source:
+        fast_forwardable = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", target_head, source_commit],
+            cwd=target_worktree,
+            check=False,
+        ).returncode == 0
+        if not fast_forwardable:
+            raise SystemExit("task commit cannot be fast-forward merged into the target branch")
+        merge = subprocess.run(
+            ["git", "merge", "--ff-only", source_commit],
+            cwd=target_worktree,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if merge.returncode != 0:
+            detail = merge.stderr.strip() or merge.stdout.strip()
+            raise SystemExit(f"git merge --ff-only failed: {detail}")
+        target_head = git_output(target_worktree, "rev-parse", "HEAD")
+        if subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source_commit, target_head],
+            cwd=target_worktree,
+            check=False,
+        ).returncode != 0:
+            raise SystemExit("target branch does not contain the task commit after merge")
+
+    verification = run_merge_verification(
+        path,
+        target_worktree,
+        list(args.verify_command),
+        float(args.verification_timeout),
+    )
+    if status.get("state") != "merged":
+        transition(path, "merged", "coordinator")
+    if verification is not None:
+        updated = load_json(path / "STATUS.json")
+        evidence = updated.setdefault("evidence", {})
+        commands_run = evidence.setdefault("commands_run", [])
+        for result in verification["results"]:
+            rendered = shlex.join(result["command"])
+            if rendered not in commands_run:
+                commands_run.append(rendered)
+        logs = evidence.setdefault("logs", [])
+        if verification["log"] not in logs:
+            logs.append(verification["log"])
+        evidence["passed"] = verification["passed"]
+        write_json(path / "STATUS.json", updated)
+
+    payload: dict[str, Any] = {
+        "commit": source_commit,
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "coordinator_id": args.coordinator,
+    }
+    if verification is not None:
+        payload["verification"] = verification
+    event(path, "task_merged", "coordinator", **payload)
+    result = {
+        "task_id": status.get("task_id"),
+        "state": "merged",
+        **payload,
+    }
+    print(json.dumps(result, indent=2))
+    return 0 if verification is None or verification["passed"] else 1
 
 
 def workflow_events(attempt: Path) -> list[dict[str, Any]]:
@@ -684,6 +1047,7 @@ def build_parser() -> argparse.ArgumentParser:
         command = strategy.add_parser(name); command.add_argument("--task-dir", required=True); command.add_argument("--revision", type=int, required=True); command.add_argument("--reviewer", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=strategy_review)
     tasks = areas.add_parser("task").add_subparsers(dest="task_action", required=True)
     command = tasks.add_parser("review"); command.add_argument("--task-dir", required=True); command.add_argument("--decision", choices=("approved", "changes_requested", "failed"), required=True); command.add_argument("--reviewer", required=True); command.add_argument("--findings-file", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=task_review)
+    command = tasks.add_parser("merge"); command.add_argument("--task-dir", required=True); command.add_argument("--target-worktree", required=True); command.add_argument("--expected-commit", default=""); command.add_argument("--verify-command", action="append", default=[]); command.add_argument("--verification-timeout", type=float, default=300); command.add_argument("--coordinator", required=True); command.set_defaults(func=task_merge)
     workflows = areas.add_parser("workflow").add_subparsers(dest="workflow_action", required=True)
     for name in ("start", "heartbeat", "complete"):
         command = workflows.add_parser(name); command.add_argument("--attempt-dir", required=True); command.add_argument("--workflow-id", required=True); command.add_argument("--instance-id", required=True); command.add_argument("--review-evidence", action="append", default=[]); command.set_defaults(func=workflow_action)

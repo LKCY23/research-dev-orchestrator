@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -342,6 +343,83 @@ def validate_status(
     return violations, warnings
 
 
+def validate_merged_task(
+    root: Path,
+    task_dir: Path,
+    status: dict[str, Any],
+    run_json: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    if status.get("state") != "merged":
+        return [], []
+    task_id = status.get("task_id")
+    matches = [
+        item for item in events
+        if item.get("event") == "task_merged" and item.get("task_id") == task_id
+    ]
+    if not matches:
+        return [f"{task_dir.name}: merged task has no task_merged event"], []
+    latest = matches[-1]
+    commit = latest.get("commit")
+    target_branch = latest.get("target_branch")
+    violations: list[str] = []
+    warnings: list[str] = []
+    if not isinstance(commit, str) or not commit:
+        violations.append(f"{task_dir.name}: task_merged event has no commit")
+    if status.get("profile", "full") != "direct":
+        try:
+            pointer = load_json(task_dir / "reviews" / "CURRENT_TASK_REVIEW.json")
+            decision_path = task_dir / str(pointer.get("decision_path") or "")
+            decision = load_json(decision_path)
+        except Exception as exc:
+            violations.append(f"{task_dir.name}: merged task review binding is unreadable: {exc}")
+        else:
+            if decision.get("decision") != "approved" or decision.get("approved_commit") != commit:
+                violations.append(
+                    f"{task_dir.name}: merged commit does not match the current approved task review"
+                )
+    expected_target = run_json.get("target_branch")
+    if target_branch != expected_target:
+        violations.append(
+            f"{task_dir.name}: task_merged target_branch {target_branch!r} "
+            f"does not match RUN.json {expected_target!r}"
+        )
+    if isinstance(commit, str) and commit and isinstance(expected_target, str) and expected_target:
+        contained = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, expected_target],
+            cwd=root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+        if not contained:
+            violations.append(
+                f"{task_dir.name}: target branch {expected_target!r} does not contain merged commit {commit}"
+            )
+    verification = latest.get("verification")
+    if isinstance(verification, dict) and verification.get("passed") is False:
+        warnings.append(f"{task_dir.name}: post-merge verification failed; create a repair task")
+    return violations, warnings
+
+
+def validate_approved_task(task_dir: Path, status: dict[str, Any]) -> list[str]:
+    if status.get("state") != "approved" or status.get("profile", "full") == "direct":
+        return []
+    try:
+        pointer = load_json(task_dir / "reviews" / "CURRENT_TASK_REVIEW.json")
+        decision = load_json(task_dir / str(pointer.get("decision_path") or ""))
+    except Exception as exc:
+        return [f"{task_dir.name}: approved task review binding is unreadable: {exc}"]
+    required = {
+        "approved_commit", "source_branch", "target_branch",
+        "target_commit_at_review", "evidence_sha256", "handoff_sha256",
+    }
+    missing = sorted(field for field in required if not decision.get(field))
+    if decision.get("decision") != "approved" or missing:
+        return [f"{task_dir.name}: approved task review is missing Git binding fields: {missing}"]
+    return []
+
+
 def collect(
     run_id: str,
     stale_lock_hours: float,
@@ -369,6 +447,7 @@ def collect(
     warnings.extend(event_warnings)
     warnings.extend(f"config: {warning}" for warning in (config_warnings or []))
     violations.extend(f"config: {error}" for error in (config_errors or []))
+    run_json: dict[str, Any] = {}
     run_json_path = run_dir / "RUN.json"
     if not run_json_path.exists():
         violations.append("run: missing required RUN.json")
@@ -438,6 +517,12 @@ def collect(
         )
         violations.extend(status_violations)
         warnings.extend(status_warnings)
+        violations.extend(validate_approved_task(task_dir, status))
+        merge_violations, merge_warnings = validate_merged_task(
+            root, task_dir, status, run_json, events
+        )
+        violations.extend(merge_violations)
+        warnings.extend(merge_warnings)
 
         lock = task_dir / "LOCK"
         lock_info = None
