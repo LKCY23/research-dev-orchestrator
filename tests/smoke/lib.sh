@@ -180,6 +180,44 @@ SH
   chmod +x "${path}"
 }
 
+make_verified_worker() {
+  local path="$1"
+  cat > "${path}" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+prompt="$(mktemp)"
+cat > "${prompt}"
+EVIDENCE_PATH="$(awk -F': ' '/^- EVIDENCE_PATH:/ {print $2}' "${prompt}")"
+HANDOFF_PATH="$(awk -F': ' '/^- HANDOFF_PATH:/ {print $2}' "${prompt}")"
+HANDOFF_JSON_PATH="$(awk -F': ' '/^- HANDOFF_JSON_PATH:/ {print $2}' "${prompt}")"
+printf '# Evidence\n\n## Commands Run\n- smoke\n\n## Tests Passed\n- yes\n' > "${EVIDENCE_PATH}"
+printf '# Handoff\n\n## Summary\n- direct worker completed and self-reviewed\n' > "${HANDOFF_PATH}"
+cat > "${HANDOFF_JSON_PATH}" <<'JSON'
+{
+  "_template": false,
+  "requested_state": "verified",
+  "summary": "direct worker completed and self-reviewed",
+  "commands_run": ["smoke"],
+  "files_changed": ["file.txt"],
+  "known_limitations": [],
+  "self_review": {
+    "acceptance_checked": true,
+    "changed_paths_checked": true,
+    "tests_passed": true,
+    "diff_check_passed": true,
+    "findings": [],
+    "fixes_applied": [],
+    "passed": true
+  },
+  "needs_coordinator": false,
+  "blocker_type": "",
+  "blocking_reason": ""
+}
+JSON
+SH
+  chmod +x "${path}"
+}
+
 make_blocked_worker() {
   local path="$1"
   local blocker_type="${2:-needs_coordinator}"
@@ -228,6 +266,25 @@ make_sleep_worker() {
 set -euo pipefail
 cat >/dev/null
 sleep ${seconds}
+SH
+  chmod +x "${path}"
+}
+
+make_persistent_handoff_worker() {
+  local path="$1"
+  cat > "${path}" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+prompt="\$(mktemp)"
+cat > "\${prompt}"
+TASK_DIR="\$(awk -F': ' '/^- TASK_DIR:/ {print \$2}' "\${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" handoff \
+  --task-dir "\${TASK_DIR}" \
+  --state review \
+  --summary "persistent interactive worker completed" \
+  --command "smoke" \
+  --file "file.txt"
+sleep 30
 SH
   chmod +x "${path}"
 }

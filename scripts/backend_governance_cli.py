@@ -18,6 +18,7 @@ def compile_action(args: argparse.Namespace) -> int:
         backend_id=args.backend,
         phase=args.phase,
         strategy_path=Path(args.strategy).resolve() if args.strategy else None,
+        io_mode=args.io_mode or None,
     )
     print(json.dumps(profile, sort_keys=True))
     return 0
@@ -39,6 +40,7 @@ def main() -> int:
     compile_cmd.add_argument("--backend", required=True)
     compile_cmd.add_argument("--phase", choices=["planning", "execution"], required=True)
     compile_cmd.add_argument("--strategy", default="")
+    compile_cmd.add_argument("--io-mode", choices=["machine", "human"], default="")
     compile_cmd.set_defaults(func=compile_action)
     materialize = sub.add_parser("materialize")
     materialize.add_argument("--profile-json", required=True)

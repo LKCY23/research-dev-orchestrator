@@ -14,6 +14,7 @@ from typing import Any
 
 from protocol import utc_now
 from supervisor import _process_table, descendants, terminate_processes
+from usage import UsageSupervisor
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -40,6 +41,27 @@ def startup_event(backend: str, line: bytes) -> str | None:
     return None
 
 
+def session_id_from_event(backend: str, line: bytes) -> str:
+    try:
+        payload = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    candidates: list[Any] = [
+        payload.get("session_id"), payload.get("sessionId"), payload.get("sessionID"),
+        payload.get("thread_id"), payload.get("threadId"),
+    ]
+    for key in ("thread", "session", "properties", "info"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidates.extend([
+                nested.get("id"), nested.get("session_id"), nested.get("sessionID"),
+                nested.get("thread_id"),
+            ])
+    return next((str(value) for value in candidates if isinstance(value, str) and value), "")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Supervise one machine-mode RDO attempt.")
     parser.add_argument("--backend", required=True)
@@ -54,9 +76,12 @@ def main() -> int:
     parser.add_argument("--supervisor-result", required=True)
     parser.add_argument("--supervisor-state", required=True)
     parser.add_argument("--transcript", required=True)
+    parser.add_argument("--session-result", default="")
+    parser.add_argument("--existing-session-id", default="")
     parser.add_argument("--strategy-id", default="")
     parser.add_argument("--strategy-sha256", default="")
     parser.add_argument("--custom-command", action="store_true")
+    parser.add_argument("--backend-profile", default="")
     args = parser.parse_args()
 
     argv = json.loads(args.argv_json)
@@ -76,6 +101,15 @@ def main() -> int:
     transcript_path = Path(args.transcript)
     prompt_path = Path(args.prompt_path)
     prompt_sha256 = __import__("hashlib").sha256(prompt_path.read_bytes()).hexdigest()
+    session_path = Path(args.session_result) if args.session_result else None
+    resource_budget: dict[str, Any] = {}
+    if args.backend_profile:
+        profile = json.loads(Path(args.backend_profile).read_text(encoding="utf-8"))
+        resource_budget = profile.get("resource_budget", {})
+    usage = UsageSupervisor(transcript_path.parent / "runtime", args.backend, resource_budget)
+    observed_session_id = args.existing_session_id
+    if observed_session_id and session_path is not None:
+        atomic_json(session_path, {"backend_id": args.backend, "session_id": observed_session_id})
     env = os.environ.copy()
     env.update(environment)
     stdin_spec: int = subprocess.DEVNULL if args.prompt_transport == "arg" else subprocess.PIPE
@@ -125,6 +159,7 @@ def main() -> int:
     observed_pgids = {process.pid}
     timed_out = False
     startup_failed = False
+    budget_exceeded = False
     last_state_write = 0.0
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     with transcript_path.open("wb") as transcript:
@@ -140,12 +175,26 @@ def main() -> int:
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
+                    try:
+                        usage_payload = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        usage_payload = None
+                    if usage.observe(usage_payload):
+                        budget_exceeded = True
+                        break
                     evidence = startup_event(args.backend, line)
+                    candidate_session_id = session_id_from_event(args.backend, line)
+                    if candidate_session_id and not observed_session_id:
+                        observed_session_id = candidate_session_id
+                        if session_path is not None:
+                            atomic_json(session_path, {"backend_id": args.backend, "session_id": observed_session_id})
                     if evidence and startup["state"] != "worker_started":
                         startup["state"] = "worker_started"
                         startup["worker_started_at"] = utc_now()
                         startup["startup_evidence"] = {"decoder": args.backend, "event": evidence}
                         atomic_json(startup_path, startup)
+                if budget_exceeded:
+                    break
             try:
                 table = _process_table()
                 current = descendants(process.pid, table)
@@ -171,10 +220,13 @@ def main() -> int:
                 startup["failure"] = {"code": "startup_timeout", "message": "no valid backend startup event"}
                 atomic_json(startup_path, startup)
                 break
+            if usage.check_clock():
+                budget_exceeded = True
+                break
             if elapsed >= args.timeout_seconds:
                 timed_out = True
                 break
-        if process.poll() is None and (timed_out or startup_failed):
+        if process.poll() is None and (timed_out or startup_failed or budget_exceeded):
             survivors = terminate_processes(observed_pgids, observed_pids)
             process.wait()
         else:
@@ -196,8 +248,11 @@ def main() -> int:
                 }
                 atomic_json(startup_path, startup)
 
-    exit_code = 124 if timed_out else 125 if startup_failed else int(process.returncode)
-    state = "timed_out" if timed_out else "startup_failed" if startup_failed else "completed"
+    exit_code = 124 if timed_out else 125 if startup_failed or budget_exceeded else int(process.returncode)
+    state = (
+        "timed_out" if timed_out else "startup_failed" if startup_failed
+        else "budget_exceeded" if budget_exceeded else "completed"
+    )
     atomic_json(state_path, {
         "state": state,
         "worker_pid": process.pid,
@@ -207,17 +262,21 @@ def main() -> int:
         "surviving_pids": list(survivors),
         "exit_code": exit_code,
         "startup_state": startup["state"],
+        "usage": usage.summary(),
     })
     atomic_json(supervisor_path, {
         "exit_code": exit_code,
         "timed_out": timed_out,
         "startup_failed": startup_failed,
+        "budget_exceeded": budget_exceeded,
         "elapsed_seconds": round(time.monotonic() - started_monotonic, 6),
         "observed_pids": sorted(observed_pids),
         "observed_pgids": sorted(observed_pgids),
         "surviving_pids": list(survivors),
         "strategy_id": args.strategy_id or None,
         "strategy_sha256": args.strategy_sha256 or None,
+        "backend_session_id": observed_session_id or None,
+        "usage": usage.summary(),
     })
     return exit_code
 

@@ -18,6 +18,7 @@ DISPATCH_ASSETS="${SCRIPT_DIR}/dispatch_assets.py"
 AGENT_BACKEND_CLI="${SCRIPT_DIR}/agent_backend_cli.py"
 BACKEND_GOVERNANCE_CLI="${SCRIPT_DIR}/backend_governance_cli.py"
 BACKEND_PREFLIGHT="${SCRIPT_DIR}/backend_preflight.py"
+RESUME_CONTEXT_CLI="${SCRIPT_DIR}/resume_context.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -71,6 +72,7 @@ append_event() {
     --event-name "${event_name}" \
     --agent-name "${RDO_WORKER_AGENT_NAME}" \
     --worker-backend "${RDO_WORKER_BACKEND}" \
+    --execution-mode "${RDO_EXECUTION_MODE}" \
     --status-path "${STATUS_PATH}"
 }
 
@@ -146,6 +148,8 @@ eval "${CONFIG_ENV}"
 : "${RDO_WORKER_COMMAND:=${CLAUDE_CODE_CMD:-${CONFIG_RDO_WORKER_COMMAND}}}"
 : "${RDO_WORKER_AGENT_NAME:=${CLAUDE_AGENT_NAME:-${CONFIG_RDO_WORKER_AGENT_NAME}}}"
 : "${RDO_BACKEND_SESSION_ID:=${CLAUDE_SESSION_ID:-${CONFIG_RDO_BACKEND_SESSION_ID}}}"
+: "${RDO_WORKER_ID:=}"
+: "${RDO_EXECUTION_MODE:=auto}"
 : "${RDO_WORKER_BACKEND:=${CONFIG_RDO_WORKER_BACKEND}}"
 : "${RDO_PERMISSION_MODE:=${CONFIG_RDO_PERMISSION_MODE}}"
 : "${RDO_RUNTIME_BACKEND:=${CONFIG_RDO_RUNTIME_BACKEND}}"
@@ -161,22 +165,49 @@ import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8")).get("state", ""))
 PY
 )"
+TASK_PROFILE="$(python3 - "${STATUS_PATH}" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8")).get("profile", "full"))
+PY
+)"
+case "${TASK_PROFILE}" in
+  direct|delegated|full) ;;
+  *) echo "invalid task profile: ${TASK_PROFILE}" >&2; exit 2 ;;
+esac
 if [[ "${RDO_ATTEMPT_PHASE}" == "auto" ]]; then
-  case "${STATUS_STATE}" in
-    pending|blocked|changes_requested) RDO_ATTEMPT_PHASE="planning" ;;
-    strategy_review) RDO_ATTEMPT_PHASE="execution" ;;
-    *) echo "cannot auto-detect dispatch phase from state ${STATUS_STATE}" >&2; exit 2 ;;
-  esac
+  if [[ "${TASK_PROFILE}" == "full" ]]; then
+    case "${STATUS_STATE}" in
+      pending) RDO_ATTEMPT_PHASE="planning" ;;
+      strategy_review) RDO_ATTEMPT_PHASE="execution" ;;
+      blocked|changes_requested)
+        if [[ -f "${TASK_DIR}/strategy/CURRENT.json" ]]; then
+          RDO_ATTEMPT_PHASE="execution"
+        else
+          RDO_ATTEMPT_PHASE="planning"
+        fi
+        ;;
+      *) echo "cannot auto-detect dispatch phase from state ${STATUS_STATE}" >&2; exit 2 ;;
+    esac
+  else
+    case "${STATUS_STATE}" in
+      pending|blocked|changes_requested) RDO_ATTEMPT_PHASE="execution" ;;
+      *) echo "cannot auto-detect ${TASK_PROFILE} dispatch phase from state ${STATUS_STATE}" >&2; exit 2 ;;
+    esac
+  fi
 fi
 case "${RDO_ATTEMPT_PHASE}" in
   planning|execution) ;;
   *) echo "RDO_ATTEMPT_PHASE must be planning or execution" >&2; exit 2 ;;
 esac
+if [[ "${TASK_PROFILE}" != "full" && "${RDO_ATTEMPT_PHASE}" != "execution" ]]; then
+  echo "task profile ${TASK_PROFILE} does not use planning attempts" >&2
+  exit 2
+fi
 
 STRATEGY_ID=""
 STRATEGY_SHA256=""
 STRATEGY_PATH=""
-if [[ "${RDO_ATTEMPT_PHASE}" == "execution" ]]; then
+if [[ "${RDO_ATTEMPT_PHASE}" == "execution" && "${TASK_PROFILE}" == "full" ]]; then
   STRATEGY_INFO="$(PYTHONPATH="${SCRIPT_DIR}" python3 - "${TASK_DIR}" <<'PY'
 import json, sys
 from pathlib import Path
@@ -279,6 +310,7 @@ BACKEND_PROFILE_COMPILE_ARGS=(
   --task-dir "${TASK_DIR}"
   --backend "${RDO_WORKER_BACKEND}"
   --phase "${RDO_ATTEMPT_PHASE}"
+  --io-mode "${RDO_IO_MODE}"
 )
 if [[ -n "${STRATEGY_PATH}" ]]; then
   BACKEND_PROFILE_COMPILE_ARGS+=(--strategy "${STRATEGY_PATH}")
@@ -297,6 +329,61 @@ import secrets
 print(secrets.token_hex(3))
 PY
 )"
+WORKER_CONTEXT="$(python3 - "${STATUS_PATH}" "${RDO_WORKER_BACKEND}" <<'PY'
+import json, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+backend = sys.argv[2]
+assigned = status.get("assigned_worker") or {}
+same_backend = assigned.get("backend_id") == backend
+print(json.dumps({
+    "parent_attempt_id": status.get("current_attempt_id") or "",
+    "worker_id": assigned.get("worker_id", "") if same_backend else "",
+    "session_id": (assigned.get("backend_session_id") or assigned.get("session_id") or "") if same_backend else "",
+    "had_worker": bool(assigned),
+    "same_backend": same_backend,
+}))
+PY
+)"
+PARENT_ATTEMPT_ID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["parent_attempt_id"])' "${WORKER_CONTEXT}")"
+if [[ -z "${RDO_WORKER_ID}" ]]; then
+  RDO_WORKER_ID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["worker_id"])' "${WORKER_CONTEXT}")"
+fi
+if [[ -z "${RDO_WORKER_ID}" ]]; then
+  RDO_WORKER_ID="W-$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(4))
+PY
+)"
+fi
+if [[ -z "${RDO_BACKEND_SESSION_ID}" ]]; then
+  RDO_BACKEND_SESSION_ID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["session_id"])' "${WORKER_CONTEXT}")"
+fi
+if [[ "${RDO_EXECUTION_MODE}" == "auto" ]]; then
+  HAD_WORKER="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1])["had_worker"] else "0")' "${WORKER_CONTEXT}")"
+  SAME_BACKEND="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1])["same_backend"] else "0")' "${WORKER_CONTEXT}")"
+  if [[ "${SAME_BACKEND}" == "1" && -n "${RDO_BACKEND_SESSION_ID}" ]]; then
+    RDO_EXECUTION_MODE="resume"
+  elif [[ "${HAD_WORKER}" == "1" && "${SAME_BACKEND}" != "1" ]]; then
+    RDO_EXECUTION_MODE="replace"
+  else
+    RDO_EXECUTION_MODE="start"
+  fi
+fi
+case "${RDO_EXECUTION_MODE}" in
+  start|resume|replace) ;;
+  *) echo "RDO_EXECUTION_MODE must be start, resume, or replace" >&2; exit 2 ;;
+esac
+if [[ "${RDO_EXECUTION_MODE}" == "resume" && -z "${RDO_BACKEND_SESSION_ID}" ]]; then
+  echo "resume requires a backend session id" >&2
+  exit 2
+fi
+if [[ "${RDO_EXECUTION_MODE}" != "resume" && "${RDO_WORKER_BACKEND}" == "claude-code" && -z "${RDO_BACKEND_SESSION_ID}" ]]; then
+  RDO_BACKEND_SESSION_ID="$(python3 - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)"
+fi
 ATTEMPT_DIR="${TASK_DIR}/attempts/${ATTEMPT_ID}"
 RUN_SHORT="$(printf "%s" "${RUN_ID}" | sanitize_name | cut -c1-18)"
 TASK_SHORT="$(printf "%s" "${TASK_ID}" | sanitize_name | cut -c1-32)"
@@ -363,7 +450,7 @@ for artifact in EVIDENCE.md HANDOFF.md HANDOFF.json; do
   fi
   cp "${SKILL_ROOT}/templates/task/${artifact}" "${TASK_DIR}/${artifact}"
 done
-rm -f "${TASK_DIR}/HANDOFF.complete"
+rm -f "${ATTEMPT_DIR}/COMPLETION.json" "${ATTEMPT_DIR}/COMPLETION.json.tmp"
 
 {
   echo "owner: dispatch"
@@ -412,6 +499,8 @@ if [[ -z "${RDO_WORKER_COMMAND}" ]]; then
     --cwd "${WORKTREE_PATH}" \
     --prompt-path "${ATTEMPT_DIR}/prompt.md" \
     --agent-name "${RDO_WORKER_AGENT_NAME}" \
+    --execution-mode "${RDO_EXECUTION_MODE}" \
+    --session-id "${RDO_BACKEND_SESSION_ID}" \
     --backend-profile "${BACKEND_PROFILE_PATH}" \
     --json)"
   RDO_WORKER_COMMAND="$(python3 - <<'PY' "${BACKEND_COMMAND_JSON}"
@@ -459,13 +548,14 @@ if [[ "${RDO_RUNTIME_BACKEND}" == "plain" ]]; then
     "${ATTEMPT_TIMEOUT_SECONDS}" "${ATTEMPT_DIR}/runtime/STARTUP.json" \
     "${SUPERVISOR_RESULT}" "${ATTEMPT_DIR}/runtime/supervisor.json" \
     "${ATTEMPT_DIR}/transcript.log" "${STRATEGY_ID}" "${STRATEGY_SHA256}" \
-    "${REGISTERED_BACKEND_COMMAND}" <<'PY'
+    "${ATTEMPT_DIR}/runtime/SESSION.json" "${RDO_BACKEND_SESSION_ID}" \
+    "${REGISTERED_BACKEND_COMMAND}" "${BACKEND_PROFILE_PATH}" <<'PY'
 import shlex, sys
 (
     script, backend, argv_json, environment_json, cwd, prompt_path,
     prompt_transport, startup_timeout, timeout, startup_result,
     supervisor_result, supervisor_state, transcript, strategy_id,
-    strategy_sha256, registered,
+    strategy_sha256, session_result, existing_session_id, registered, backend_profile,
 ) = sys.argv[1:]
 parts = [
     sys.executable, script, "--backend", backend,
@@ -477,6 +567,9 @@ parts = [
     "--supervisor-result", supervisor_result, "--supervisor-state", supervisor_state,
     "--transcript", transcript, "--strategy-id", strategy_id,
     "--strategy-sha256", strategy_sha256,
+    "--session-result", session_result,
+    "--existing-session-id", existing_session_id,
+    "--backend-profile", backend_profile,
 ]
 if registered == "0":
     parts.append("--custom-command")
@@ -484,9 +577,9 @@ print(" ".join(shlex.quote(part) for part in parts))
 PY
 )"
 else
-  RDO_WORKER_COMMAND="$(python3 - "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${ORIGINAL_WORKER_COMMAND}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" <<'PY'
+  RDO_WORKER_COMMAND="$(python3 - "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${ORIGINAL_WORKER_COMMAND}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" "${ATTEMPT_DIR}/COMPLETION.json" "${TASK_DIR}" "${ATTEMPT_ID}" "${ATTEMPT_DIR}/runtime/FINALIZATION.json" <<'PY'
 import shlex, sys
-script, timeout, result, cwd, command, strategy_id, strategy_sha256 = sys.argv[1:]
+script, timeout, result, cwd, command, strategy_id, strategy_sha256, completion_path, task_dir, attempt_id, finalization_path = sys.argv[1:]
 print(" ".join([
     shlex.quote(sys.executable), shlex.quote(script),
     "--timeout-seconds", shlex.quote(timeout),
@@ -494,6 +587,11 @@ print(" ".join([
     "--cwd", shlex.quote(cwd),
     "--strategy-id", shlex.quote(strategy_id),
     "--strategy-sha256", shlex.quote(strategy_sha256),
+    "--completion-path", shlex.quote(completion_path),
+    "--task-dir", shlex.quote(task_dir),
+    "--attempt-id", shlex.quote(attempt_id),
+    "--finalization-path", shlex.quote(finalization_path),
+    "--finalization-timeout-seconds", "90",
     "--shell-command", shlex.quote(command),
 ]))
 PY
@@ -505,9 +603,12 @@ python3 "${PROTOCOL_CLI}" create-attempt \
   --attempt-id "${ATTEMPT_ID}" \
   --task-id "${TASK_ID}" \
   --agent-name "${RDO_WORKER_AGENT_NAME}" \
+  --worker-id "${RDO_WORKER_ID}" \
+  --parent-attempt-id "${PARENT_ATTEMPT_ID}" \
   --session-id "${RDO_BACKEND_SESSION_ID}" \
   --worker-backend "${RDO_WORKER_BACKEND}" \
-  --execution-mode "start" \
+  --execution-mode "${RDO_EXECUTION_MODE}" \
+  --resume-reason "${STATUS_STATE}" \
   --phase "${RDO_ATTEMPT_PHASE}" \
   --strategy-id "${STRATEGY_ID}" \
   --strategy-sha256 "${STRATEGY_SHA256}" \
@@ -526,6 +627,7 @@ python3 "${PROTOCOL_CLI}" transition-running \
   --status-path "${STATUS_PATH}" \
   --fsm-path "${FSM_PATH}" \
   --attempt-id "${ATTEMPT_ID}" \
+  --worker-id "${RDO_WORKER_ID}" \
   --agent-name "${RDO_WORKER_AGENT_NAME}" \
   --session-id "${RDO_BACKEND_SESSION_ID}" \
   --worker-backend "${RDO_WORKER_BACKEND}" \
@@ -539,6 +641,14 @@ if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
   python3 "${SCRIPT_DIR}/worktree_fingerprint.py" \
     --worktree "${WORKTREE_PATH}" \
     --output "${ATTEMPT_DIR}/runtime/worktree-before.json"
+  if [[ "${TASK_PROFILE}" == "full" && "${RDO_ATTEMPT_PHASE}" == "execution" ]]; then
+    python3 "${RESUME_CONTEXT_CLI}" \
+      --task-dir "${TASK_DIR}" \
+      --attempt-dir "${ATTEMPT_DIR}" \
+      --strategy "${STRATEGY_PATH}" \
+      --current-worktree-before "${ATTEMPT_DIR}/runtime/worktree-before.json" \
+      > /dev/null
+  fi
 fi
 
 if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
@@ -615,7 +725,7 @@ PY
     if [[ "${EXIT_CODE_RAW}" =~ ^[0-9]+$ ]]; then
       EXIT_CODE="${EXIT_CODE_RAW}"
     else
-      EXIT_CODE=0
+      EXIT_CODE=125
     fi
   fi
   {
@@ -623,6 +733,17 @@ PY
     echo
     echo "exit_code: ${EXIT_CODE_RAW}"
   } > "${ATTEMPT_DIR}/result.md"
+fi
+
+set +e
+python3 "${PROTOCOL_CLI}" record-session \
+  --status-path "${STATUS_PATH}" \
+  --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
+  --session-path "${ATTEMPT_DIR}/runtime/SESSION.json"
+SESSION_RECORD_CODE=$?
+set -e
+if [[ "${SESSION_RECORD_CODE}" -ne 0 ]]; then
+  echo "record-session failed with exit ${SESSION_RECORD_CODE}; continuing to handoff validation" >> "${ATTEMPT_DIR}/transcript.log"
 fi
 
 if [[ -f "${ATTEMPT_DIR}/runtime/STARTUP.json" ]]; then
@@ -695,6 +816,8 @@ PY
 )"
 if [[ "${FINAL_STATE}" == "review" ]]; then
   append_event "worker_review_ready"
+elif [[ "${FINAL_STATE}" == "verified" ]]; then
+  append_event "worker_verified"
 elif [[ "${FINAL_STATE}" == "strategy_review" ]]; then
   append_event "strategy_review_ready"
 elif [[ "${FINAL_STATE}" == "blocked" ]]; then

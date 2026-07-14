@@ -96,6 +96,22 @@ class StrategyTests(unittest.TestCase):
         with self.assertRaises(StrategyValidationError):
             submit_strategy(self.task, payload)
 
+    def test_resource_budget_is_optional_and_strictly_validated(self):
+        payload = strategy_payload("T001-test")
+        payload["resource_budget"] = {
+            "max_model_turns": 20,
+            "max_input_tokens": 100000,
+            "max_cost_usd": 2.5,
+            "first_workflow_start_seconds": 30,
+            "max_no_progress_turns": 8,
+        }
+        submit_strategy(self.task, payload)
+
+        invalid = strategy_payload("T001-test", 2, payload["strategy_id"])
+        invalid["resource_budget"] = {"unknown_limit": 1}
+        with self.assertRaisesRegex(StrategyValidationError, "unknown fields"):
+            submit_strategy(self.task, invalid)
+
     def test_strategy_must_match_planning_attempt_backend(self):
         attempt_id = "A001-codex"
         attempt_dir = self.task / "attempts" / attempt_id
@@ -108,6 +124,51 @@ class StrategyTests(unittest.TestCase):
         })
         with self.assertRaises(StrategyValidationError):
             submit_strategy(self.task, strategy_payload("T001-test"))
+
+    def test_resume_is_allowed_only_on_later_strategy_revision(self):
+        first = strategy_payload("T001-test")
+        first["workflows"][0]["resume"] = {
+            "from_attempt": "A001-claude",
+            "from_workflow": "WF-old",
+            "mode": "reuse",
+        }
+        with self.assertRaisesRegex(StrategyValidationError, "revision greater than 1"):
+            submit_strategy(self.task, first)
+
+        first["workflows"][0].pop("resume")
+        submit_strategy(self.task, first)
+        second = strategy_payload("T001-test", 2, first["strategy_id"])
+        second["workflows"][0]["resume"] = {
+            "from_attempt": "A001-claude",
+            "from_workflow": "WF-old",
+            "mode": "revalidate",
+        }
+        submit_strategy(self.task, second)
+
+    def test_resume_rejects_unsafe_attempt_identifier(self):
+        payload = strategy_payload("T001-test", 2, "T001-test-S001")
+        payload["workflows"][0]["resume"] = {
+            "from_attempt": "../A001",
+            "from_workflow": "WF-old",
+            "mode": "reuse",
+        }
+        with self.assertRaisesRegex(StrategyValidationError, "safe identifier"):
+            submit_strategy(self.task, payload)
+
+    def test_independent_review_cannot_be_claimed_by_primary_worker(self):
+        payload = strategy_payload("T001-test")
+        workflow = payload["workflows"][0]
+        workflow.update(kind="readonly_review")
+        with self.assertRaisesRegex(StrategyValidationError, "explicit review declaration"):
+            submit_strategy(self.task, payload)
+        workflow["review"] = {"mode": "independent", "required_reviewers": 2}
+        workflow["executor"]["write_access"] = False
+        with self.assertRaisesRegex(StrategyValidationError, "requires native_subagents"):
+            submit_strategy(self.task, payload)
+
+        payload["global_budget"].update(max_subagents=2)
+        workflow["executor"].update(mode="native_subagents", max_agents=2, max_parallel=1)
+        submit_strategy(self.task, payload)
 
 
 if __name__ == "__main__":

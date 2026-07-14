@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from protocol import load_json, utc_now
+from usage import UsageSupervisor
 
 
 def append_line(path: Path, payload: dict[str, Any]) -> None:
@@ -66,6 +67,7 @@ class Guardian:
         permission_mode: str,
         emit_events: bool,
         stop_when_root_idle: bool,
+        resource_budget: dict[str, Any] | None = None,
     ):
         self.api = api
         self.runtime = runtime
@@ -76,11 +78,15 @@ class Guardian:
         self.permission_mode = permission_mode
         self.emit_events = emit_events
         self.stop_when_root_idle = stop_when_root_idle
+        self.usage = UsageSupervisor(runtime, "opencode", resource_budget or {})
         self.reservations: list[dict[str, Any]] = []
         self.active: dict[str, dict[str, str]] = {}
         self.root_idle = threading.Event()
         self.ready = threading.Event()
         self.failed: Exception | None = None
+        self.budget_exceeded: str | None = None
+        self.stopped = threading.Event()
+        self.budget_lock = threading.Lock()
 
     def audit(self, event: str, **fields: Any) -> None:
         append_line(self.runtime / "BACKEND_EVENTS.ndjson", {
@@ -183,6 +189,10 @@ class Guardian:
         self.audit("subagent_started", session_id=session_id, agent_type=reservation["agent_type"])
 
     def handle(self, event: dict[str, Any]) -> None:
+        reason = self.usage.observe(event)
+        if reason:
+            self.abort_for_budget(reason)
+            return
         event_type = event.get("type")
         properties = event.get("properties") or {}
         if self.emit_events:
@@ -199,7 +209,27 @@ class Guardian:
                 details = self.active.pop(session_id)
                 self.audit("subagent_stopped", session_id=session_id, **details)
 
+    def abort_for_budget(self, reason: str) -> None:
+        with self.budget_lock:
+            if self.budget_exceeded:
+                return
+            self.budget_exceeded = reason
+            self.audit("root_session_aborted", reason=reason)
+            try:
+                self.api.request("POST", f"/session/{self.root_session}/abort")
+            finally:
+                self.root_idle.set()
+
+    def watch_budget_clock(self) -> None:
+        while not self.stopped.wait(0.25):
+            reason = self.usage.check_clock()
+            if reason:
+                self.abort_for_budget(reason)
+                return
+
     def run(self) -> None:
+        watchdog = threading.Thread(target=self.watch_budget_clock, name="opencode-budget", daemon=True)
+        watchdog.start()
         try:
             with self.api.event_stream() as response:
                 self.ready.set()
@@ -216,6 +246,8 @@ class Guardian:
             self.failed = exc
             self.ready.set()
             self.root_idle.set()
+        finally:
+            self.stopped.set()
 
 
 def free_port() -> int:
@@ -264,6 +296,8 @@ def main() -> int:
     parser.add_argument("--permission-mode", choices=["default", "auto"], required=True)
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--prompt", required=True)
+    parser.add_argument("--execution-mode", choices=["start", "resume", "replace"], default="start")
+    parser.add_argument("--session-id", default="")
     args = parser.parse_args()
 
     runtime = Path(args.runtime_dir).resolve()
@@ -291,8 +325,17 @@ def main() -> int:
     try:
         api = Api(base_url, password, args.cwd)
         wait_for_server(api, server)
-        root = api.request("POST", "/session", {"title": "RDO attempt"})
-        root_id = str(root["id"])
+        if args.execution_mode == "resume":
+            if not args.session_id:
+                raise RuntimeError("OpenCode resume requires --session-id")
+            root_id = args.session_id
+        else:
+            root = api.request("POST", "/session", {"title": "RDO attempt"})
+            root_id = str(root["id"])
+        (runtime / "SESSION.json").write_text(
+            json.dumps({"backend_id": "opencode", "session_id": root_id}) + "\n",
+            encoding="utf-8",
+        )
         guardian = Guardian(
             api=api,
             runtime=runtime,
@@ -303,6 +346,7 @@ def main() -> int:
             permission_mode=args.permission_mode,
             emit_events=args.io_mode == "machine",
             stop_when_root_idle=args.io_mode == "machine",
+            resource_budget=profile.get("resource_budget", {}),
         )
         thread = threading.Thread(target=guardian.run, name="opencode-guardian", daemon=True)
         thread.start()
@@ -319,11 +363,11 @@ def main() -> int:
                 env=environment,
                 check=False,
             )
-            return attach.returncode
+            return 125 if guardian.budget_exceeded else attach.returncode
         guardian.root_idle.wait()
         if guardian.failed:
             raise RuntimeError(f"OpenCode event supervisor failed: {guardian.failed}")
-        return 0
+        return 125 if guardian.budget_exceeded else 0
     finally:
         stop_process(server)
         server_log.close()

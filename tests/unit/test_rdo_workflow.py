@@ -1,0 +1,118 @@
+import argparse
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import rdo
+
+
+class WorkflowCompletionGateTests(unittest.TestCase):
+    def strategy(self) -> dict:
+        return {
+            "global_budget": {"max_parallel_workflows": 1, "max_workflow_instances": 1},
+            "workflows": [
+                {
+                    "workflow_id": "WF-acceptance",
+                    "kind": "verification",
+                    "depends_on": [],
+                    "required": True,
+                    "budget": {
+                        "wall_seconds": 600,
+                        "command_seconds": 60,
+                        "max_instances": 1,
+                    },
+                    "on_timeout": "block",
+                }
+            ],
+            "completion_gate": {
+                "required_workflows_complete": True,
+                "acceptance_commands_pass": True,
+                "optional_workflows_may_timeout": False,
+            },
+        }
+
+    def args(self, action: str, attempt: Path) -> argparse.Namespace:
+        return argparse.Namespace(
+            workflow_action=action,
+            attempt_dir=str(attempt),
+            workflow_id="WF-acceptance",
+            instance_id="WF-acceptance-I001",
+        )
+
+    def test_failed_early_gate_keeps_instance_active_for_repair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            attempt = root / "task" / "attempts" / "A001"
+            attempt.mkdir(parents=True)
+            strategy = self.strategy()
+            with patch("rdo.active_execution_attempt", return_value=(attempt, root / "task", strategy)), patch("rdo.event"):
+                rdo.workflow_action(self.args("start", attempt))
+                with self.assertRaisesRegex(SystemExit, "acceptance command records are missing"):
+                    rdo.workflow_action(self.args("complete", attempt))
+                records = rdo.workflow_events(attempt)
+                self.assertEqual(["workflow_started"], [item["event"] for item in records])
+
+                runtime = attempt / "runtime"
+                with (runtime / "COMMANDS.ndjson").open("w", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "acceptance": True,
+                        "command": ["pytest", "-q"],
+                        "exit_code": 0,
+                        "timed_out": False,
+                    }) + "\n")
+                rdo.workflow_action(self.args("complete", attempt))
+
+            records = rdo.workflow_events(attempt)
+            self.assertEqual(
+                ["workflow_started", "workflow_completed"],
+                [item["event"] for item in records],
+            )
+            finalization = json.loads((attempt / "runtime" / "FINALIZATION.json").read_text())
+            self.assertEqual("finalizing", finalization["stage"])
+
+    def test_failed_acceptance_record_blocks_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary) / "A001"
+            runtime = attempt / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "COMMANDS.ndjson").write_text(
+                json.dumps({"acceptance": True, "exit_code": 1, "timed_out": False}) + "\n",
+                encoding="utf-8",
+            )
+            reasons = rdo.completion_gate_reasons(
+                attempt,
+                self.strategy(),
+                completing_workflow="WF-acceptance",
+            )
+            self.assertIn("one or more acceptance commands failed or timed out", reasons)
+
+    def test_independent_review_requires_observed_distinct_reviewers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary) / "A001"
+            runtime = attempt / "runtime"
+            reviews = runtime / "reviews"
+            reviews.mkdir(parents=True)
+            (reviews / "one.md").write_text("No findings.\n")
+            (reviews / "two.md").write_text("One minor finding.\n")
+            with (runtime / "BACKEND_EVENTS.ndjson").open("w") as handle:
+                handle.write(json.dumps({"event": "subagent_started", "session_id": "reviewer-1"}) + "\n")
+                handle.write(json.dumps({"event": "backend_agent_started", "agent_id": "reviewer-2"}) + "\n")
+            definition = {"review": {"mode": "independent", "required_reviewers": 2}}
+            evidence = rdo.independent_review_evidence(attempt, definition, [
+                f"reviewer-1={reviews / 'one.md'}",
+                f"reviewer-2={reviews / 'two.md'}",
+            ])
+            self.assertEqual({item["reviewer_id"] for item in evidence}, {"reviewer-1", "reviewer-2"})
+            with self.assertRaisesRegex(SystemExit, "not observed"):
+                rdo.independent_review_evidence(
+                    attempt, definition, [
+                        f"reviewer-1={reviews / 'one.md'}",
+                        f"fake={reviews / 'two.md'}",
+                    ]
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

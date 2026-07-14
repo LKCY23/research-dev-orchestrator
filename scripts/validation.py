@@ -14,6 +14,8 @@ from protocol import (
     ATTEMPT_EVENTS,
     BLOCKER_TYPES,
     CORE_EVENTS,
+    EXECUTION_MODES,
+    EXECUTION_PROFILES,
     HANDOFF_STATES,
     REQUIRED_STATUS_FIELDS,
     RUNTIME_BACKENDS,
@@ -59,13 +61,20 @@ def load_handoff_request(task_dir: Path) -> tuple[dict[str, Any] | None, list[st
 
     reasons: list[str] = []
     requested_state = request.get("requested_state")
-    if requested_state not in {"strategy_review", "review", "blocked"}:
-        reasons.append(f"HANDOFF.json requested_state must be strategy_review, review, or blocked, got {requested_state!r}")
+    if requested_state not in {"strategy_review", "verified", "review", "blocked"}:
+        reasons.append(
+            "HANDOFF.json requested_state must be strategy_review, verified, review, or blocked, "
+            f"got {requested_state!r}"
+        )
     for field in ("commands_run", "files_changed", "known_limitations"):
         if field in request and not isinstance(request.get(field), list):
             reasons.append(f"HANDOFF.json {field} must be a list")
     if "needs_coordinator" in request and not isinstance(request.get("needs_coordinator"), bool):
         reasons.append("HANDOFF.json needs_coordinator must be boolean")
+    if requested_state == "verified":
+        self_review = request.get("self_review")
+        if not isinstance(self_review, dict) or self_review.get("passed") is not True:
+            reasons.append("verified handoff requires self_review.passed=true")
     return request, reasons
 
 
@@ -85,6 +94,10 @@ def validate_status_schema(status: Any, fsm: dict[str, Any], task_name: str) -> 
     if state not in states:
         violations.append(f"{task_name}: invalid state {state!r}")
 
+    profile = status.get("profile", "full")
+    if profile not in EXECUTION_PROFILES:
+        violations.append(f"{task_name}: invalid execution profile {profile!r}")
+
     if state == "blocked":
         blocker_type = status.get("blocker_type")
         if blocker_type not in BLOCKER_TYPES:
@@ -101,7 +114,7 @@ def validate_status_schema(status: Any, fsm: dict[str, Any], task_name: str) -> 
             violations.append(f"{task_name}: evidence.logs must be a list")
 
     attempt_id = status.get("current_attempt_id")
-    if state in {"planning", "strategy_review", "running", "blocked", "review", "approved", "merged"} and not attempt_id:
+    if state in {"planning", "strategy_review", "running", "blocked", "verified", "review", "approved", "merged"} and not attempt_id:
         violations.append(f"{task_name}: {state} task is missing current_attempt_id")
 
     return violations
@@ -227,6 +240,12 @@ def validate_attempt_schema(
         violations.append(f"{task_name}: invalid ATTEMPT.ended_at {attempt.get('ended_at')!r}")
     if attempt.get("phase") not in {"planning", "execution"}:
         violations.append(f"{task_name}: ATTEMPT.phase must be planning or execution")
+    if "execution_mode" in attempt and attempt.get("execution_mode") not in EXECUTION_MODES:
+        violations.append(f"{task_name}: invalid ATTEMPT.execution_mode {attempt.get('execution_mode')!r}")
+    if "worker_id" in attempt and not is_non_empty_string(attempt.get("worker_id")):
+        violations.append(f"{task_name}: ATTEMPT.worker_id must be a non-empty string")
+    if "parent_attempt_id" in attempt and attempt.get("parent_attempt_id") is not None and not is_non_empty_string(attempt.get("parent_attempt_id")):
+        violations.append(f"{task_name}: ATTEMPT.parent_attempt_id must be null or a non-empty string")
 
     runtime_violations, _ = validate_runtime_backend(attempt.get("runtime"), task_name)
     violations.extend(runtime_violations)
@@ -249,7 +268,7 @@ def validate_attempt_schema(
     if attempt_state == "completed":
         if attempt.get("handoff_valid") is not True:
             violations.append(f"{task_name}: completed ATTEMPT requires handoff_valid=true")
-        if attempt.get("handoff_state") not in {"strategy_review", "review", "blocked"}:
+        if attempt.get("handoff_state") not in {"strategy_review", "verified", "review", "blocked"}:
             violations.append(f"{task_name}: completed ATTEMPT requires a terminal handoff_state")
     if attempt_state == "invalid_handoff":
         if attempt.get("handoff_valid") is not False:
@@ -360,7 +379,8 @@ def validate_worker_handoff(
         )
 
     state = status.get("state")
-    if requested_state == "review":
+    task_profile = status.get("profile", "full")
+    if requested_state in {"verified", "review"}:
         allowed_active_states = {"running"}
     else:
         allowed_active_states = {"planning", "running"}
@@ -406,19 +426,27 @@ def validate_worker_handoff(
                     reasons.append("strategy review handoff digest does not match submitted strategy")
             except Exception as exc:
                 reasons.append(f"strategy review handoff cannot load submitted strategy: {exc}")
-    elif requested_state == "review":
+    elif requested_state in {"verified", "review"}:
         if exit_code != 0:
-            reasons.append(f"review handoff requires exit_code 0, got {exit_code!r}")
+            reasons.append(f"{requested_state} handoff requires exit_code 0, got {exit_code!r}")
         if not handoff_ok:
-            reasons.append("review handoff requires substantive HANDOFF.md")
+            reasons.append(f"{requested_state} handoff requires substantive HANDOFF.md")
         if not evidence_ok:
-            reasons.append("review handoff requires substantive EVIDENCE.md")
+            reasons.append(f"{requested_state} handoff requires substantive EVIDENCE.md")
         try:
             attempt = load_json(task_dir / "attempts" / attempt_id / "ATTEMPT.json")
             if attempt.get("phase") != "execution":
-                reasons.append("review handoff requires an execution attempt")
+                reasons.append(f"{requested_state} handoff requires an execution attempt")
+            expected = "verified" if task_profile == "direct" else "review"
+            if requested_state != expected:
+                reasons.append(f"profile {task_profile!r} requires {expected!r} handoff")
+            if requested_state == "verified":
+                self_review = request.get("self_review") if isinstance(request, dict) else None
+                if not isinstance(self_review, dict) or self_review.get("passed") is not True:
+                    reasons.append("verified handoff requires self_review.passed=true")
+            if task_profile != "full":
+                raise StopIteration
             from strategy import load_approved_strategy
-
             approved, _ = load_approved_strategy(task_dir)
             attempt_runtime = task_dir / "attempts" / attempt_id / "runtime"
             records_path = attempt_runtime / "WORKFLOWS.ndjson"
@@ -429,7 +457,7 @@ def validate_worker_handoff(
                 completed = {
                     record.get("workflow_id")
                     for record in records
-                    if record.get("event") == "workflow_completed"
+                    if record.get("event") in {"workflow_completed", "workflow_carried_forward"}
                 }
                 missing = sorted(
                     workflow["workflow_id"]
@@ -452,6 +480,8 @@ def validate_worker_handoff(
                 record.get("event") == "workflow_timed_out" for record in records
             ):
                 reasons.append("workflow timeout is forbidden by the completion gate")
+        except StopIteration:
+            pass
         except Exception as exc:
             reasons.append(f"review handoff cannot validate approved strategy completion: {exc}")
     elif requested_state == "blocked":
@@ -466,7 +496,7 @@ def validate_worker_handoff(
 
     return HandoffValidationResult(
         valid=not reasons,
-        handoff_state=requested_state if requested_state in {"strategy_review", "review", "blocked"} else None,
+        handoff_state=requested_state if requested_state in {"strategy_review", "verified", "review", "blocked"} else None,
         exit_code=exit_code,
         reasons=reasons,
         request=request,

@@ -82,6 +82,8 @@ GOVERNANCE_FIELDS: dict[str, dict[str, str]] = {
     },
 }
 
+USAGE_METRICS = {"model_turns", "input_tokens", "output_tokens", "cost_usd", "context_tokens"}
+
 
 @dataclass(frozen=True)
 class BackendCommand:
@@ -125,6 +127,15 @@ def validate_backend(payload: dict[str, Any]) -> list[str]:
                 errors.append(f"unsupported capability for {backend_id}: {key}")
             elif not isinstance(value, bool):
                 errors.append(f"capabilities.{key} must be boolean")
+    observability = payload.get("usage_observability")
+    if not isinstance(observability, dict) or set(observability) != set(IO_MODES):
+        errors.append("usage_observability must define exactly machine and human")
+    else:
+        for mode, metrics in observability.items():
+            if not isinstance(metrics, list) or not all(isinstance(item, str) for item in metrics):
+                errors.append(f"usage_observability.{mode} must be a string list")
+            elif len(metrics) != len(set(metrics)) or set(metrics) - USAGE_METRICS:
+                errors.append(f"usage_observability.{mode} contains duplicate or unsupported metrics")
     governance = payload.get("governance")
     if not isinstance(governance, dict):
         errors.append("governance must be a table")
@@ -217,11 +228,17 @@ def build_command(
     prompt: str,
     agent_name: str,
     backend_profile: str = "",
+    execution_mode: str = "start",
+    session_id: str = "",
 ) -> BackendCommand:
     if io_mode not in IO_MODES:
         raise ValueError(f"io_mode must be one of {sorted(IO_MODES)}")
     if permission_mode not in PERMISSION_MODES:
         raise ValueError(f"permission_mode must be one of {sorted(PERMISSION_MODES)}")
+    if execution_mode not in {"start", "resume", "replace"}:
+        raise ValueError("execution_mode must be start, resume, or replace")
+    if execution_mode == "resume" and not session_id:
+        raise ValueError("resume execution requires session_id")
     payload = load_backend(backend_id)
     errors = validate_backend(payload)
     if errors:
@@ -241,6 +258,20 @@ def build_command(
         "prompt": prompt,
         "agent_name": agent_name,
     })]
+    if execution_mode == "resume":
+        if backend_id == "claude-code":
+            argv[1:1] = ["--resume", session_id]
+        elif backend_id == "codex":
+            exec_index = argv.index("exec")
+            argv.insert(exec_index + 1, "resume")
+            argv.insert(len(argv) - 1, session_id)
+        elif backend_id == "opencode":
+            argv.insert(len(argv) - 1, "--session")
+            argv.insert(len(argv) - 1, session_id)
+        elif backend_id == "kimi-code":
+            argv[1:1] = ["--session", session_id]
+    elif backend_id == "claude-code" and session_id:
+        argv[1:1] = ["--session-id", session_id]
     environment: dict[str, str] = {}
     if backend_profile:
         profile_path = Path(backend_profile).resolve()
@@ -321,6 +352,10 @@ def build_command(
                 cwd,
                 "--prompt",
                 prompt,
+                "--execution-mode",
+                execution_mode,
+                "--session-id",
+                session_id,
             ]
     display_argv = argv
     if environment:

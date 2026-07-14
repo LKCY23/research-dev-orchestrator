@@ -11,6 +11,10 @@ native_subagents = true
 agent_teams = true
 process_level_native_agent_control = false
 
+[usage_observability]
+machine = ["model_turns", "input_tokens", "output_tokens", "cost_usd", "context_tokens"]
+human = []
+
 [governance]
 disabled_plugins = ["superpowers@claude-plugins-official"]
 enable_agent_teams = true
@@ -23,7 +27,7 @@ human_transport = "arg"
 max_arg_bytes = 100000
 
 [session]
-handling = "manual"
+handling = "native_resume"
 
 [permission_modes.default]
 supported = true

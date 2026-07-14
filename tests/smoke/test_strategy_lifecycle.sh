@@ -56,6 +56,11 @@ status = json.loads((task / "STATUS.json").read_text())
 assert status["state"] == "strategy_review", status
 assert status["state_history"][-1]["from"] == "planning"
 assert status["state_history"][-1]["to"] == "strategy_review"
+attempt = task / "attempts" / status["current_attempt_id"]
+completion = json.loads((attempt / "COMPLETION.json").read_text())
+assert completion["attempt_id"] == status["current_attempt_id"]
+assert completion["phase"] == "planning"
+assert completion["requested_state"] == "strategy_review"
 PY
 
 python3 "${RDO_ROOT}/scripts/rdo.py" strategy approve --task-dir "${task}" --revision 1 --reviewer smoke >/dev/null
@@ -73,7 +78,7 @@ rdo = [sys.executable, "${RDO_ROOT}/scripts/rdo.py"]
 subprocess.run(rdo + ["workflow", "start", "--attempt-dir", str(attempt), "--workflow-id", "WF-verify", "--instance-id", "WF-verify-I001"], check=True)
 subprocess.run(rdo + ["exec", "--attempt-dir", str(attempt), "--workflow-id", "WF-verify", "--instance-id", "WF-verify-I001", "--timeout", "5", "--acceptance", "--", "/usr/bin/true"], check=True)
 subprocess.run(rdo + ["workflow", "complete", "--attempt-dir", str(attempt), "--workflow-id", "WF-verify", "--instance-id", "WF-verify-I001"], check=True)
-subprocess.run(rdo + ["handoff", "--task-dir", str(task), "--state", "review", "--summary", "strategy lifecycle complete", "--command", "/usr/bin/true"], check=True)
+subprocess.run(rdo + ["finalize", "--task-dir", str(task), "--state", "review", "--summary", "strategy lifecycle complete"], check=True)
 PY
 chmod +x "${executor}"
 
@@ -88,7 +93,19 @@ metadata = json.loads((attempt / "ATTEMPT.json").read_text())
 profile = json.loads((attempt / "runtime" / "BACKEND_PROFILE.json").read_text())
 assert metadata["backend_profile_sha256"] == profile["profile_sha256"]
 assert profile["backend_id"] == "claude-code"
+completion = json.loads((attempt / "COMPLETION.json").read_text())
+assert completion["attempt_id"] == metadata["attempt_id"]
+assert completion["phase"] == "execution"
+assert completion["requested_state"] == "review"
+handoff = json.loads((attempt.parent.parent / "HANDOFF.json").read_text())
+assert handoff["commands_run"] == ["/usr/bin/true"], handoff
 PY
 collect_json strategy-run "${repo}/strategy-status.json"
 assert_json_expr "${repo}/strategy-status.json" "payload['valid'] is True"
 assert_json_expr "${repo}/strategy-status.json" "payload['tasks'][0]['state'] == 'review'"
+python3 "${RDO_ROOT}/scripts/protocol_cli.py" validate-handoff \
+  --status-path "${task}/STATUS.json" \
+  --attempt-id "${attempt_id}" \
+  --task-dir "${task}" \
+  --attempt-path "${task}/attempts/${attempt_id}/ATTEMPT.json" \
+  --exit-code-raw 0

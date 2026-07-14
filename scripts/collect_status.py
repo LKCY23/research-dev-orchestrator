@@ -72,8 +72,10 @@ def load_handoff_index(task_dir: Path) -> tuple[dict[str, Any] | None, list[str]
 
     warnings: list[str] = []
     requested_state = payload.get("requested_state")
-    if requested_state not in {"", None, "strategy_review", "review", "blocked"}:
-        warnings.append(f"{task_dir.name}: HANDOFF.json requested_state should be strategy_review, review, or blocked")
+    if requested_state not in {"", None, "strategy_review", "verified", "review", "blocked"}:
+        warnings.append(
+            f"{task_dir.name}: HANDOFF.json requested_state should be strategy_review, verified, review, or blocked"
+        )
     for field in ("commands_run", "files_changed", "known_limitations"):
         if field in payload and not isinstance(payload.get(field), list):
             warnings.append(f"{task_dir.name}: HANDOFF.json {field} must be a list")

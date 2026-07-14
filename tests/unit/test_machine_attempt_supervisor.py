@@ -7,7 +7,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from machine_attempt_supervisor import startup_event
+from machine_attempt_supervisor import session_id_from_event, startup_event
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -15,6 +15,15 @@ SUPERVISOR = ROOT / "scripts" / "machine_attempt_supervisor.py"
 
 
 class MachineAttemptSupervisorTests(unittest.TestCase):
+    def test_backend_session_id_decoders(self):
+        self.assertEqual(
+            session_id_from_event("claude-code", b'{"type":"system","subtype":"init","session_id":"claude-s1"}'),
+            "claude-s1",
+        )
+        self.assertEqual(
+            session_id_from_event("codex", b'{"type":"thread.started","thread_id":"codex-s1"}'),
+            "codex-s1",
+        )
     def test_backend_startup_event_decoders(self):
         self.assertEqual(
             startup_event("claude-code", b'{"type":"system","subtype":"init"}'),
@@ -103,6 +112,39 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 125)
         self.assertEqual(startup["state"], "worker_startup_failed")
         self.assertEqual(startup["failure"]["code"], "early_exit")
+
+    def test_hard_turn_budget_terminates_machine_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("work\n")
+            worker = root / "worker.py"
+            worker.write_text(textwrap.dedent("""
+                import json, time
+                print(json.dumps({"type": "system", "subtype": "init"}), flush=True)
+                for identifier in ("one", "two"):
+                    print(json.dumps({"type": "assistant", "message": {
+                        "id": identifier, "usage": {"input_tokens": 10, "output_tokens": 2}
+                    }}), flush=True)
+                time.sleep(10)
+            """))
+            profile = root / "profile.json"
+            profile.write_text(json.dumps({"resource_budget": {"max_model_turns": 1}}))
+            command = [
+                sys.executable, str(SUPERVISOR), "--backend", "claude-code",
+                "--argv-json", json.dumps([sys.executable, str(worker)]),
+                "--cwd", str(root), "--prompt-path", str(root / "prompt.md"),
+                "--prompt-transport", "arg", "--startup-timeout-seconds", "1",
+                "--timeout-seconds", "20", "--startup-result", str(root / "STARTUP.json"),
+                "--supervisor-result", str(root / "result.json"),
+                "--supervisor-state", str(root / "state.json"),
+                "--transcript", str(root / "transcript.log"),
+                "--backend-profile", str(profile),
+            ]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 125, result.stderr)
+            state = json.loads((root / "state.json").read_text())
+            self.assertEqual(state["state"], "budget_exceeded")
+            self.assertTrue((root / "runtime" / "VIOLATIONS.ndjson").exists())
 
 
 if __name__ == "__main__":

@@ -62,6 +62,7 @@ TASK_STATES = {
     "strategy_review",
     "running",
     "blocked",
+    "verified",
     "review",
     "changes_requested",
     "approved",
@@ -71,7 +72,9 @@ TASK_STATES = {
 
 BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "irrecoverable"}
 ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
-HANDOFF_STATES = {"strategy_review", "review", "blocked", None}
+HANDOFF_STATES = {"strategy_review", "verified", "review", "blocked", None}
+EXECUTION_PROFILES = {"direct", "delegated", "full"}
+EXECUTION_MODES = {"start", "resume", "replace"}
 RUNTIME_BACKENDS = {"plain", "tmux"}
 IO_MODES = {"machine", "human"}
 WORKER_BACKENDS = {"claude-code", "codex", "opencode", "kimi-code"}
@@ -97,6 +100,7 @@ CORE_EVENTS = {
     "workflow_started",
     "workflow_heartbeat",
     "workflow_completed",
+    "workflow_carried_forward",
     "workflow_timed_out",
     "worker_instruction_submitted",
     "worker_interrupted",
@@ -104,6 +108,7 @@ CORE_EVENTS = {
     "attempt_timed_out",
     "worker_blocked",
     "worker_review_ready",
+    "worker_verified",
     "worker_exit_without_valid_status",
     "dispatch_lock_removed",
     "coordinator_reviewed",
@@ -131,6 +136,7 @@ TASK_EVENTS = {
     "strategy_revision_requested",
     "worker_blocked",
     "worker_review_ready",
+    "worker_verified",
     "worker_exit_without_valid_status",
     "dispatch_lock_removed",
     "coordinator_reviewed",
@@ -155,6 +161,7 @@ ATTEMPT_EVENTS = {
     "workflow_timed_out",
     "worker_blocked",
     "worker_review_ready",
+    "worker_verified",
     "worker_exit_without_valid_status",
     "attempt_timed_out",
     "worker_instruction_submitted",

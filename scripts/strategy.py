@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,16 @@ DEFAULT_EXECUTION_POLICY: dict[str, Any] = {
 
 WORKFLOW_TIMEOUT_ACTIONS = {"block", "request_revision", "continue_without_result"}
 WORKFLOW_EXECUTOR_MODES = {"primary_worker", "managed_subagents", "native_subagents"}
+WORKFLOW_RESUME_MODES = {"reuse", "revalidate"}
+RESOURCE_BUDGET_FIELDS = {
+    "max_model_turns",
+    "max_input_tokens",
+    "max_output_tokens",
+    "max_cost_usd",
+    "max_context_tokens",
+    "first_workflow_start_seconds",
+    "max_no_progress_turns",
+}
 
 
 def _positive_int(payload: dict[str, Any], field: str, *, allow_zero: bool = False) -> int:
@@ -192,6 +203,62 @@ def _validate_workflow(workflow: Any, policy: dict[str, Any], backend_id: str) -
         raise StrategyValidationError(
             f"workflow {workflow['workflow_id']} completion.evidence must be a non-empty string"
         )
+    review = workflow.get("review")
+    is_review_kind = workflow["kind"].lower().replace("-", "_").endswith("review")
+    if is_review_kind and review is None:
+        raise StrategyValidationError(
+            f"workflow {workflow['workflow_id']} review workflow requires an explicit review declaration"
+        )
+    if review is not None:
+        if not is_review_kind:
+            raise StrategyValidationError(
+                f"workflow {workflow['workflow_id']} review declaration requires a review workflow kind"
+            )
+        if not isinstance(review, dict) or set(review) != {"mode", "required_reviewers"}:
+            raise StrategyValidationError(
+                f"workflow {workflow['workflow_id']} review requires exactly mode and required_reviewers"
+            )
+        if review.get("mode") not in {"self", "independent"}:
+            raise StrategyValidationError(
+                f"workflow {workflow['workflow_id']} review.mode must be self or independent"
+            )
+        reviewers = review.get("required_reviewers")
+        if not is_int_not_bool(reviewers) or reviewers <= 0:
+            raise StrategyValidationError(
+                f"workflow {workflow['workflow_id']} review.required_reviewers must be positive"
+            )
+        if review["mode"] == "independent":
+            if executor["mode"] != "native_subagents" or max_agents < reviewers:
+                raise StrategyValidationError(
+                    f"workflow {workflow['workflow_id']} independent review requires native_subagents "
+                    "and max_agents >= required_reviewers"
+                )
+            if executor["write_access"]:
+                raise StrategyValidationError(
+                    f"workflow {workflow['workflow_id']} independent review must be read-only"
+                )
+        elif executor["mode"] != "primary_worker" or reviewers != 1:
+            raise StrategyValidationError(
+                f"workflow {workflow['workflow_id']} self review requires primary_worker and one reviewer"
+            )
+    resume = workflow.get("resume")
+    if resume is not None:
+        if not isinstance(resume, dict):
+            raise StrategyValidationError(f"workflow {workflow['workflow_id']} resume must be an object")
+        if set(resume) != {"from_attempt", "from_workflow", "mode"}:
+            raise StrategyValidationError(
+                f"workflow {workflow['workflow_id']} resume requires exactly from_attempt, from_workflow, and mode"
+            )
+        for field in ("from_attempt", "from_workflow"):
+            value = resume.get(field)
+            if not is_non_empty_string(value) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+                raise StrategyValidationError(
+                    f"workflow {workflow['workflow_id']} resume.{field} must be a safe identifier"
+                )
+        if resume.get("mode") not in WORKFLOW_RESUME_MODES:
+            raise StrategyValidationError(
+                f"workflow {workflow['workflow_id']} resume.mode must be one of {sorted(WORKFLOW_RESUME_MODES)}"
+            )
     return workflow
 
 
@@ -236,12 +303,33 @@ def validate_strategy(strategy: Any, policy: dict[str, Any], *, task_id: str | N
     for strategy_field, policy_field in mappings.items():
         if global_budget[strategy_field] > policy[policy_field]:
             raise StrategyValidationError(f"strategy {strategy_field} exceeds execution policy")
+    resource_budget = strategy.get("resource_budget")
+    if resource_budget is not None:
+        if not isinstance(resource_budget, dict) or not resource_budget:
+            raise StrategyValidationError("strategy resource_budget must be a non-empty object")
+        unknown = sorted(set(resource_budget) - RESOURCE_BUDGET_FIELDS)
+        if unknown:
+            raise StrategyValidationError(f"strategy resource_budget has unknown fields: {unknown}")
+        for field, value in resource_budget.items():
+            if field == "max_cost_usd":
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                    raise StrategyValidationError("resource_budget.max_cost_usd must be a positive number")
+            elif not is_int_not_bool(value) or value <= 0:
+                raise StrategyValidationError(f"resource_budget.{field} must be a positive integer")
     workflows = strategy.get("workflows")
     if not isinstance(workflows, list) or not workflows:
         raise StrategyValidationError("strategy workflows must be a non-empty list")
     if len(workflows) > global_budget["max_workflows"]:
         raise StrategyValidationError("strategy workflow count exceeds global budget")
     validated = [_validate_workflow(item, policy, strategy["backend_id"]) for item in workflows]
+    if any(
+        item["executor"]["max_agents"] > global_budget["max_subagents"]
+        or item["executor"]["max_parallel"] > global_budget["max_parallel_subagents"]
+        for item in validated
+    ):
+        raise StrategyValidationError("workflow executor exceeds strategy global subagent budget")
+    if revision == 1 and any(item.get("resume") is not None for item in validated):
+        raise StrategyValidationError("workflow resume requires a strategy revision greater than 1")
     if sum(item["budget"]["max_instances"] for item in validated) > global_budget["max_workflow_instances"]:
         raise StrategyValidationError("sum of workflow max_instances exceeds global budget")
     workflow_ids = [item["workflow_id"] for item in validated]

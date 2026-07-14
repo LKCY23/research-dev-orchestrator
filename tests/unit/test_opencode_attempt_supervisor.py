@@ -78,6 +78,18 @@ class OpenCodeGuardianTests(unittest.TestCase):
         self.assertEqual(config["permission"]["task"], {"*": "ask"})
         self.assertEqual(config["agent"]["explore"]["permission"]["task"], "deny")
 
+    def test_usage_budget_aborts_root_session(self):
+        self.guardian.usage.budget = {"max_model_turns": 1}
+        def event(identifier):
+            return {"type": "message.updated", "properties": {"info": {
+                "id": identifier, "role": "assistant", "time": {"completed": 1},
+                "tokens": {"input": 10, "output": 2},
+            }}}
+        self.guardian.handle(event("one"))
+        self.guardian.handle(event("two"))
+        self.assertIn(("POST", "/session/ses_root/abort", None), self.api.calls)
+        self.assertIsNotNone(self.guardian.budget_exceeded)
+
 
 if __name__ == "__main__":
     unittest.main()

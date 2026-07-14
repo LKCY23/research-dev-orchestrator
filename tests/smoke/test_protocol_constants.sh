@@ -21,7 +21,7 @@ for required in sorted(protocol.BLOCKER_TYPES | protocol.RUNTIME_BACKENDS | prot
 
 doc_task_states = set(
     re.findall(
-        r"^(pending|planning|strategy_review|running|blocked|review|changes_requested|approved|merged|failed)$",
+        r"^(pending|planning|strategy_review|running|blocked|verified|review|changes_requested|approved|merged|failed)$",
         constants,
         re.M,
     )

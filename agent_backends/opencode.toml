@@ -10,6 +10,10 @@ permission_events = true
 native_agent_depth_limit = false
 native_parallel_agent_limit = false
 
+[usage_observability]
+machine = ["model_turns", "input_tokens", "output_tokens", "cost_usd", "context_tokens"]
+human = ["model_turns", "input_tokens", "output_tokens", "cost_usd", "context_tokens"]
+
 [governance]
 enable_native_subagents = true
 allowed_subagent_types = ["general", "explore", "scout"]
@@ -23,7 +27,7 @@ human_transport = "arg"
 max_arg_bytes = 100000
 
 [session]
-handling = "manual"
+handling = "native_resume"
 
 [permission_modes.default]
 supported = true

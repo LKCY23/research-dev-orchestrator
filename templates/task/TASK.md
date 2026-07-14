@@ -2,6 +2,7 @@
 
 ```yaml
 task_id: {{TASK_ID}}
+profile: {{PROFILE}}
 goal: {{GOAL}}
 allowed_paths:
 {{ALLOWED_PATHS}}

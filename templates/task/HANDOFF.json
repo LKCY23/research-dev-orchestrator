@@ -5,6 +5,15 @@
   "commands_run": [],
   "files_changed": [],
   "known_limitations": [],
+  "self_review": {
+    "acceptance_checked": false,
+    "changed_paths_checked": false,
+    "tests_passed": false,
+    "diff_check_passed": false,
+    "findings": [],
+    "fixes_applied": [],
+    "passed": false
+  },
   "needs_coordinator": false,
   "blocker_type": "",
   "blocking_reason": ""

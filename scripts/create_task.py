@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from config import load_config
-from protocol import append_event, render_template, repo_root, utc_now, write_json
+from protocol import EXECUTION_PROFILES, append_event, render_template, repo_root, utc_now, write_json
 from strategy import DEFAULT_EXECUTION_POLICY
 
 
@@ -34,6 +34,12 @@ def main() -> int:
     parser.add_argument("--allowed-paths", nargs="+", required=True)
     parser.add_argument("--forbidden-paths", nargs="*", default=[])
     parser.add_argument("--dependencies", nargs="*", default=[])
+    parser.add_argument(
+        "--profile",
+        choices=sorted(EXECUTION_PROFILES),
+        default="full",
+        help="direct=self-reviewed worker; delegated=coordinator code review; full=strategy-gated workflow",
+    )
     parser.add_argument("--branch", default="")
     parser.add_argument("--worktree", default="")
     args = parser.parse_args()
@@ -65,6 +71,7 @@ def main() -> int:
 
     status = {
         "task_id": args.task_id,
+        "profile": args.profile,
         "state": "pending",
         "previous_state": None,
         "owner": "",
@@ -93,6 +100,7 @@ def main() -> int:
     task_values = {
         "TASK_ID": args.task_id,
         "GOAL": args.goal,
+        "PROFILE": args.profile,
         "ALLOWED_PATHS": render_list(args.allowed_paths),
         "FORBIDDEN_PATHS": render_list(args.forbidden_paths),
         "DEPENDENCIES": render_list(args.dependencies),
@@ -111,6 +119,7 @@ def main() -> int:
             "run_id": args.run_id,
             "task_id": args.task_id,
             "goal": args.goal,
+            "profile": args.profile,
             "allowed_paths": args.allowed_paths,
             "forbidden_paths": args.forbidden_paths,
         },

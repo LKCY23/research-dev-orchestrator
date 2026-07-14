@@ -95,6 +95,8 @@ def render_worker_prompt(
     phase: str = "execution",
     strategy_path: str = "",
 ) -> str:
+    status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+    profile = status.get("profile", "full")
     if phase == "planning":
         strategy_action = "revise" if any((task_dir / "strategy").glob("STRATEGY-v*.json")) else "submit"
         phase_rules = [
@@ -102,6 +104,7 @@ def render_worker_prompt(
             "",
             "- Inspect the task and worktree read-only. Do not edit, commit, or run implementation workflows.",
             "- Design all anticipated workflows, subagents, permissions, dependencies, budgets, and completion gates.",
+            "- On revision > 1, explicitly preserve compatible prior work with workflow.resume = {from_attempt, from_workflow, mode}; use mode=reuse only when no rerun is needed and mode=revalidate when outputs remain useful but checks must run again.",
             f"- Set strategy.backend_id to {worker_backend!r}; an approved strategy cannot execute through another backend.",
             f"- Write the strategy JSON outside the worktree, then run: python3 {Path(__file__).resolve().parent / 'rdo.py'} strategy {strategy_action} --task-dir {task_dir} --file <strategy-file>.",
             "- The complete minimal schema is embedded below. Adapt it to the task; do not inspect RDO source code or tests to rediscover the protocol.",
@@ -117,17 +120,37 @@ def render_worker_prompt(
         phase_rules = [
             "## Execution Phase",
             "",
-            f"- Execute only the approved strategy at: {strategy_path}",
-            f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} workflow start|heartbeat|complete for workflow instances.",
-            f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> [--acceptance] -- <command> for bounded commands.",
-            "- A new workflow kind, larger budget, wider permission, or exhaustive search requires a strategy revision and checkpoint.",
         ]
+        if profile == "full":
+            phase_rules.extend([
+                f"- Execute only the approved strategy at: {strategy_path}",
+                f"- Read {attempt_dir / 'runtime' / 'RESUME_CONTEXT.json'} first. Do not rerun carried_forward_workflows; execute only remaining_workflows.",
+                f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} workflow start|heartbeat|complete for workflow instances.",
+                f"- For an independent review workflow, each declared native reviewer writes a non-empty artifact under {attempt_dir / 'runtime' / 'reviews'}; complete it with one --review-evidence REVIEWER_ID=ARTIFACT_PATH per reviewer. Reviewer IDs must match observed backend agent instances.",
+                f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> [--acceptance] -- <command> for bounded commands.",
+                f"- After every required workflow completes, finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state review --summary <summary>.",
+                "- A new workflow kind, larger budget, wider permission, or exhaustive search requires a strategy revision and checkpoint.",
+            ])
+        elif profile == "direct":
+            phase_rules.extend([
+                "- Implement the task, run the acceptance commands, inspect the complete diff, and fix every self-review finding.",
+                "- You own the final review. The coordinator will enforce only mechanical merge gates.",
+                f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state verified --self-review-passed --summary <summary> [--command <command>].",
+                "- If independent judgment is needed, hand off blocked and request escalation to delegated instead of self-approving.",
+            ])
+        else:
+            phase_rules.extend([
+                "- Implement the task, run acceptance commands, and self-review the diff before handoff.",
+                "- The coordinator owns the independent code review and merge decision.",
+                f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state review --summary <summary> [--command <command>].",
+            ])
     return "\n".join(
         [
             "# Worker Task Prompt",
             "",
             f"You are a {worker_backend} worker. Execute only this task packet.",
             f"Agent name: {agent_name or worker_backend}.",
+            f"Execution profile: {profile}.",
             "",
             "## Protocol File Paths",
             "",
@@ -152,9 +175,8 @@ def render_worker_prompt(
             "- Do not edit STATUS.json. Dispatch owns task state transitions.",
             "- Use the provided rdo command for strategy submission or final handoff; do not hand-edit task state.",
             "- If blocked, blocker_type must be one of: needs_coordinator, needs_user, environment, budget, irrecoverable.",
-            "- Remove RDO_TEMPLATE markers from EVIDENCE.md or HANDOFF.md before ending.",
-            "- Write substantive EVIDENCE.md and HANDOFF.md before ending.",
-            "- HANDOFF.json is required for handoff. Set _template=false and keep HANDOFF.md as the human-readable source.",
+            "- Do not hand-edit EVIDENCE.md, HANDOFF.md, HANDOFF.json, or COMPLETION.json; rdo strategy/finalize writes them atomically.",
+            "- Call the final strategy submission or finalize command once, after its prerequisites pass.",
             "- Keep code changes inside allowed_paths.",
             "",
             *phase_rules,
@@ -163,10 +185,10 @@ def render_worker_prompt(
             read_text(task_dir / "TASK.md"),
             "",
             "## CONTEXT.md",
-            read_text(task_dir / "CONTEXT.md"),
+            read_text(task_dir / "CONTEXT.md") if (task_dir / "CONTEXT.md").exists() else "Context is included in TASK.md.",
             "",
             "## ACCEPTANCE.md",
-            read_text(task_dir / "ACCEPTANCE.md"),
+            read_text(task_dir / "ACCEPTANCE.md") if (task_dir / "ACCEPTANCE.md").exists() else "Acceptance criteria are included in TASK.md.",
             "",
         ]
     )

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 
+from completion import validate_completion
 from supervisor import run_supervised
 
 
@@ -20,7 +21,28 @@ def main() -> int:
     parser.add_argument("--shell-command", required=True)
     parser.add_argument("--strategy-id", default="")
     parser.add_argument("--strategy-sha256", default="")
+    parser.add_argument("--completion-path", default="")
+    parser.add_argument("--task-dir", default="")
+    parser.add_argument("--attempt-id", default="")
+    parser.add_argument("--completion-grace-seconds", type=float, default=0.5)
+    parser.add_argument("--finalization-path", default="")
+    parser.add_argument("--finalization-timeout-seconds", type=float, default=90.0)
     args = parser.parse_args()
+    completion_state: dict[str, object] = {"valid": False, "reasons": [], "payload": None}
+
+    def completion_requested() -> bool:
+        if not args.completion_path:
+            return False
+        path = Path(args.completion_path)
+        if not path.exists():
+            return False
+        result = validate_completion(path, task_dir=Path(args.task_dir), attempt_id=args.attempt_id)
+        completion_state.update(valid=result.valid, reasons=list(result.reasons), payload=result.payload)
+        return result.valid
+
+    def finalization_started() -> bool:
+        return bool(args.finalization_path) and Path(args.finalization_path).exists()
+
     result = run_supervised(
         ["/bin/bash", "-c", args.shell_command],
         timeout_seconds=args.timeout_seconds,
@@ -30,10 +52,18 @@ def main() -> int:
         stdout=1,
         stderr=2,
         state_path=Path(args.result).parent / "runtime" / "supervisor.json",
+        completion_requested=completion_requested if args.completion_path else None,
+        completion_grace_seconds=args.completion_grace_seconds,
+        finalization_started=finalization_started if args.finalization_path else None,
+        finalization_timeout_seconds=args.finalization_timeout_seconds,
     )
     payload = {
         "exit_code": result.exit_code,
+        "child_exit_code": result.child_exit_code,
         "timed_out": result.timed_out,
+        "completion_requested": result.completion_requested,
+        "finalization_timed_out": result.finalization_timed_out,
+        "completion": completion_state if args.completion_path else None,
         "elapsed_seconds": result.elapsed_seconds,
         "observed_pids": list(result.observed_pids),
         "observed_pgids": list(result.observed_pgids),

@@ -17,6 +17,7 @@ python3 "${RDO_ROOT}/scripts/protocol_cli.py" create-attempt \
   --attempt-id "${attempt_id}" \
   --task-id T001-status \
   --agent-name test-worker \
+  --worker-id W-test \
   --session-id "" \
   --phase execution \
   --command true \

@@ -12,6 +12,8 @@ Options:
   --permission <mode>       default | auto | yolo
   --agent-name <name>       worker display name
   --session-id <id>         backend session id for manual resume metadata
+  --worker-id <id>          stable logical worker id (normally auto-detected)
+  --execution-mode <mode>   start | resume | replace (normally auto-detected)
   --command <shell-command> explicit command override, mainly for tests
   --phase <phase>           planning | execution (auto-detected when omitted)
 EOF
@@ -50,6 +52,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --session-id)
       export RDO_BACKEND_SESSION_ID="$2"
+      shift 2
+      ;;
+    --worker-id)
+      export RDO_WORKER_ID="$2"
+      shift 2
+      ;;
+    --execution-mode)
+      export RDO_EXECUTION_MODE="$2"
       shift 2
       ;;
     --command)

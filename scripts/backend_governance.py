@@ -21,6 +21,28 @@ class BackendGovernanceError(ValueError):
     """Raised when backend governance cannot be compiled without weakening policy."""
 
 
+RESOURCE_METRICS = {
+    "max_model_turns": "model_turns",
+    "max_input_tokens": "input_tokens",
+    "max_output_tokens": "output_tokens",
+    "max_cost_usd": "cost_usd",
+    "max_context_tokens": "context_tokens",
+    "max_no_progress_turns": "model_turns",
+}
+
+
+def require_resource_observability(profile: dict[str, Any], io_mode: str) -> None:
+    if io_mode not in {"machine", "human"}:
+        raise BackendGovernanceError(f"invalid io mode {io_mode!r}")
+    budget = profile.get("resource_budget", {})
+    observed = set(profile.get("usage_observability", {}).get(io_mode, []))
+    missing = sorted({metric for field, metric in RESOURCE_METRICS.items() if field in budget and metric not in observed})
+    if missing:
+        raise BackendGovernanceError(
+            f"hard resource budget is not observable for {profile.get('backend_id')} + {io_mode}: {missing}"
+        )
+
+
 def _merge_governance(backend_id: str, shipped: dict[str, Any], project: dict[str, Any]) -> dict[str, Any]:
     errors = validate_project_governance(backend_id, project)
     if errors:
@@ -82,6 +104,7 @@ def compile_backend_profile(
     backend_id: str,
     phase: str,
     strategy_path: Path | None = None,
+    io_mode: str | None = None,
 ) -> dict[str, Any]:
     if phase not in {"planning", "execution"}:
         raise BackendGovernanceError("phase must be planning or execution")
@@ -95,18 +118,24 @@ def compile_backend_profile(
     project_policy = config_result.config.backend_policies.get(backend_id, {})
     governance = _merge_governance(backend_id, backend.get("governance", {}), project_policy)
     policy = validate_execution_policy(load_json(task_dir / "EXECUTION_POLICY.json"))
+    status_path = task_dir / "STATUS.json"
+    status = load_json(status_path) if status_path.exists() else {}
+    task_profile = status.get("profile", "full") if isinstance(status, dict) else "full"
+    if task_profile not in {"direct", "delegated", "full"}:
+        raise BackendGovernanceError(f"invalid task execution profile {task_profile!r}")
 
     strategy: dict[str, Any] | None = None
     strategy_sha256: str | None = None
     if phase == "execution":
-        if strategy_path is None or not strategy_path.exists():
+        if task_profile == "full" and (strategy_path is None or not strategy_path.exists()):
             raise BackendGovernanceError("execution profile requires an approved strategy path")
-        strategy = validate_strategy(load_json(strategy_path), policy)
-        if strategy["backend_id"] != backend_id:
-            raise BackendGovernanceError(
-                f"approved strategy backend {strategy['backend_id']!r} does not match dispatch backend {backend_id!r}"
-            )
-        strategy_sha256 = canonical_digest(strategy)
+        if strategy_path is not None and strategy_path.exists():
+            strategy = validate_strategy(load_json(strategy_path), policy)
+            if strategy["backend_id"] != backend_id:
+                raise BackendGovernanceError(
+                    f"approved strategy backend {strategy['backend_id']!r} does not match dispatch backend {backend_id!r}"
+                )
+            strategy_sha256 = canonical_digest(strategy)
 
     global_budget = strategy["global_budget"] if strategy else policy
     agent_limits = {"max_parallel": int(global_budget["max_parallel_subagents"])}
@@ -120,6 +149,10 @@ def compile_backend_profile(
     native_agents_declared = any(
         workflow.get("executor", {}).get("mode") == "native_subagents"
         and int(workflow.get("executor", {}).get("max_agents", 0)) > 0
+        for workflow in (strategy.get("workflows", []) if strategy else [])
+    )
+    independent_review_declared = any(
+        workflow.get("review", {}).get("mode") == "independent"
         for workflow in (strategy.get("workflows", []) if strategy else [])
     )
     codex_stream_required = False
@@ -177,7 +210,9 @@ def compile_backend_profile(
             int(governance.get("max_agent_threads", agent_limits["max_parallel"])),
             agent_limits["max_parallel"],
         )
-        codex_stream_required = multi_agent_enabled and bool(agent_limits["enforce_max_spawns"])
+        codex_stream_required = multi_agent_enabled and (
+            bool(agent_limits["enforce_max_spawns"]) or independent_review_declared
+        )
         backend_settings["config_overrides"] = [
             f"features.multi_agent={'true' if multi_agent_enabled else 'false'}",
             "features.multi_agent_v2=false",
@@ -308,9 +343,12 @@ def compile_backend_profile(
         "schema_version": 1,
         "backend_id": backend_id,
         "phase": phase,
+        "task_profile": task_profile,
         "strategy_id": strategy.get("strategy_id") if strategy else None,
         "strategy_sha256": strategy_sha256,
         "capabilities": backend.get("capabilities", {}),
+        "usage_observability": backend.get("usage_observability", {}),
+        "resource_budget": strategy.get("resource_budget", {}) if strategy else {},
         "governance": governance,
         "controls": controls,
         "native_agent_limits": agent_limits,
@@ -327,6 +365,8 @@ def compile_backend_profile(
         ),
     }
     profile["profile_sha256"] = canonical_digest(profile)
+    if io_mode is not None:
+        require_resource_observability(profile, io_mode)
     return profile
 
 

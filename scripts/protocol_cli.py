@@ -113,6 +113,7 @@ def cmd_append_event(args: argparse.Namespace) -> int:
         "worker_exit_without_valid_status",
         "worker_blocked",
         "worker_review_ready",
+        "worker_verified",
         "strategy_review_ready",
     }
     payload: dict[str, Any] = {
@@ -126,6 +127,10 @@ def cmd_append_event(args: argparse.Namespace) -> int:
     if args.event_name == "task_dispatched":
         payload["worker"] = args.agent_name
         payload["worker_backend"] = getattr(args, "worker_backend", "")
+        status = load_json(Path(args.status_path))
+        assigned = status.get("assigned_worker") or {}
+        payload["worker_id"] = assigned.get("worker_id", "")
+        payload["execution_mode"] = getattr(args, "execution_mode", "")
     if args.event_name == "worker_blocked":
         status = load_json(Path(args.status_path))
         payload["blocker_type"] = status.get("blocker_type", "")
@@ -166,7 +171,10 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
         "agent_name": args.agent_name,
         "backend_session_id": args.session_id,
         "session_id": args.session_id,
+        "worker_id": args.worker_id,
+        "parent_attempt_id": args.parent_attempt_id or None,
         "execution_mode": args.execution_mode,
+        "resume_reason": args.resume_reason,
         "permission_mode": args.permission_mode,
         "state": "created",
         "handoff_valid": None,
@@ -198,12 +206,16 @@ def cmd_transition_running(args: argparse.Namespace) -> int:
     status["blocking_reason"] = ""
     status["blocker_type"] = ""
     status["current_attempt_id"] = args.attempt_id
+    previous_worker = status.get("assigned_worker") if isinstance(status.get("assigned_worker"), dict) else {}
     status["assigned_worker"] = {
+        "worker_id": args.worker_id,
         "backend_id": args.worker_backend,
         "agent": args.worker_backend,
         "agent_name": args.agent_name,
         "backend_session_id": args.session_id,
         "session_id": args.session_id,
+        "first_attempt_id": previous_worker.get("first_attempt_id") or args.attempt_id,
+        "latest_attempt_id": args.attempt_id,
         "role": "worker",
     }
     status.setdefault("state_history", []).append({
@@ -221,6 +233,29 @@ def cmd_set_attempt_running(args: argparse.Namespace) -> int:
     attempt = load_json(path)
     attempt["state"] = "running"
     write_json(path, attempt)
+    return 0
+
+
+def cmd_record_session(args: argparse.Namespace) -> int:
+    session_path = Path(args.session_path)
+    if not session_path.exists():
+        return 0
+    session = load_json(session_path)
+    session_id = session.get("session_id") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        return 0
+    attempt_path = Path(args.attempt_path)
+    attempt = load_json(attempt_path)
+    attempt["backend_session_id"] = session_id
+    attempt["session_id"] = session_id
+    write_json(attempt_path, attempt)
+    status_path = Path(args.status_path)
+    status = load_json(status_path)
+    assigned = status.get("assigned_worker")
+    if isinstance(assigned, dict) and assigned.get("worker_id") == attempt.get("worker_id"):
+        assigned["backend_session_id"] = session_id
+        assigned["session_id"] = session_id
+        write_json(status_path, status)
     return 0
 
 
@@ -256,6 +291,19 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
         for reason in result.reasons:
             print(f"- {reason}", file=sys.stderr)
         return 4
+    if (
+        isinstance(status, dict)
+        and attempt.get("state") == "completed"
+        and attempt.get("handoff_valid") is True
+        and status.get("current_attempt_id") == args.attempt_id
+        and status.get("state") == attempt.get("handoff_state")
+    ):
+        try:
+            request = load_json(task_dir / "HANDOFF.json")
+        except Exception:
+            request = None
+        if isinstance(request, dict) and request.get("requested_state") == attempt.get("handoff_state"):
+            return 0
     attempt["ended_at"] = utc_now()
     attempt["exit_code"] = result.exit_code
 
@@ -430,6 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     event.add_argument("--event-name", required=True)
     event.add_argument("--agent-name", required=True)
     event.add_argument("--worker-backend", default="")
+    event.add_argument("--execution-mode", default="")
     event.add_argument("--status-path", required=True)
     event.set_defaults(func=cmd_append_event)
 
@@ -438,9 +487,12 @@ def build_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--attempt-id", required=True)
     attempt.add_argument("--task-id", required=True)
     attempt.add_argument("--agent-name", required=True)
+    attempt.add_argument("--worker-id", required=True)
+    attempt.add_argument("--parent-attempt-id", default="")
     attempt.add_argument("--session-id", default="")
     attempt.add_argument("--worker-backend", default="claude-code")
     attempt.add_argument("--execution-mode", default="start")
+    attempt.add_argument("--resume-reason", default="")
     attempt.add_argument("--phase", choices=["planning", "execution"], required=True)
     attempt.add_argument("--strategy-id", default="")
     attempt.add_argument("--strategy-sha256", default="")
@@ -461,6 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     transition.add_argument("--status-path", required=True)
     transition.add_argument("--fsm-path", required=True)
     transition.add_argument("--attempt-id", required=True)
+    transition.add_argument("--worker-id", required=True)
     transition.add_argument("--agent-name", required=True)
     transition.add_argument("--session-id", default="")
     transition.add_argument("--worker-backend", default="claude-code")
@@ -470,6 +523,12 @@ def build_parser() -> argparse.ArgumentParser:
     set_running = sub.add_parser("set-attempt-running")
     set_running.add_argument("--attempt-path", required=True)
     set_running.set_defaults(func=cmd_set_attempt_running)
+
+    record_session = sub.add_parser("record-session")
+    record_session.add_argument("--status-path", required=True)
+    record_session.add_argument("--attempt-path", required=True)
+    record_session.add_argument("--session-path", required=True)
+    record_session.set_defaults(func=cmd_record_session)
 
     validate = sub.add_parser("validate-handoff")
     validate.add_argument("--status-path", required=True)

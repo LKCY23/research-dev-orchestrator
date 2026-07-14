@@ -10,13 +10,16 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Sequence
+from typing import Callable, IO, Sequence
 
 
 @dataclass(frozen=True)
 class SupervisedResult:
     exit_code: int
+    child_exit_code: int
     timed_out: bool
+    completion_requested: bool
+    finalization_timed_out: bool
     elapsed_seconds: float
     observed_pids: tuple[int, ...]
     observed_pgids: tuple[int, ...]
@@ -49,6 +52,18 @@ def descendants(root_pid: int, table: dict[int, tuple[int, int]] | None = None) 
                 found.add(pid)
                 changed = True
     return found
+
+
+def current_termination_targets(
+    root_pid: int,
+    table: dict[int, tuple[int, int]],
+) -> tuple[set[int], set[int]]:
+    """Return only process identities that belong to the current descendant tree."""
+
+    pids = descendants(root_pid, table)
+    pgids = {table[pid][1] for pid in pids if pid in table}
+    pgids.add(root_pid)
+    return pids, pgids
 
 
 def pid_alive(pid: int) -> bool:
@@ -112,6 +127,10 @@ def run_supervised(
     stderr: IO[bytes] | int | None = None,
     grace_seconds: float = 2.0,
     state_path: Path | None = None,
+    completion_requested: Callable[[], bool] | None = None,
+    completion_grace_seconds: float = 0.5,
+    finalization_started: Callable[[], bool] | None = None,
+    finalization_timeout_seconds: float = 90.0,
 ) -> SupervisedResult:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
@@ -126,14 +145,21 @@ def run_supervised(
     )
     observed_pids: set[int] = {process.pid}
     observed_pgids: set[int] = {process.pid}
+    termination_pids: set[int] = {process.pid}
+    termination_pgids: set[int] = {process.pid}
     timed_out = False
+    completed_by_signal = False
+    finalization_started_at: float | None = None
+    finalization_timed_out = False
     last_state_write = 0.0
     while process.poll() is None:
         try:
             table = _process_table()
-            current = descendants(process.pid, table)
+            current, current_pgids = current_termination_targets(process.pid, table)
             observed_pids.update(current)
-            observed_pgids.update(table[pid][1] for pid in current if pid in table)
+            observed_pgids.update(current_pgids)
+            termination_pids = current
+            termination_pgids = current_pgids
         except (OSError, subprocess.SubprocessError):
             pass
         if state_path and time.monotonic() - last_state_write >= 0.5:
@@ -157,14 +183,55 @@ def run_supervised(
         if time.monotonic() - started >= timeout_seconds:
             timed_out = True
             break
+        if completion_requested is not None and completion_requested():
+            completed_by_signal = True
+            deadline = time.monotonic() + max(0, completion_grace_seconds)
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            break
+        if finalization_started is not None and finalization_started():
+            if finalization_started_at is None:
+                finalization_started_at = time.monotonic()
+            elif time.monotonic() - finalization_started_at >= finalization_timeout_seconds:
+                timed_out = True
+                finalization_timed_out = True
+                break
         time.sleep(0.1)
+    try:
+        table = _process_table()
+        current, current_pgids = current_termination_targets(process.pid, table)
+        observed_pids.update(current)
+        observed_pgids.update(current_pgids)
+        termination_pids = current
+        termination_pgids = current_pgids
+    except (OSError, subprocess.SubprocessError):
+        pass
     if timed_out:
-        survivors = terminate_processes(observed_pgids, observed_pids, grace_seconds=grace_seconds)
+        survivors = terminate_processes(termination_pgids, termination_pids, grace_seconds=grace_seconds)
         process.wait()
         exit_code = 124
+    elif completed_by_signal:
+        if process.poll() is None:
+            survivors = terminate_processes(termination_pgids, termination_pids, grace_seconds=grace_seconds)
+        else:
+            survivors = terminate_processes(
+                termination_pgids,
+                termination_pids - {process.pid},
+                grace_seconds=grace_seconds,
+            )
+        child_exit_code = int(process.wait())
+        exit_code = 0
     else:
         exit_code = int(process.wait())
-        survivors = terminate_processes(observed_pgids, observed_pids - {process.pid}, grace_seconds=grace_seconds)
+        survivors = terminate_processes(
+            termination_pgids,
+            termination_pids - {process.pid},
+            grace_seconds=grace_seconds,
+        )
+    if timed_out:
+        child_exit_code = int(process.returncode)
+    elif not completed_by_signal:
+        child_exit_code = exit_code
     if state_path:
         state_path.write_text(
             json.dumps(
@@ -176,6 +243,9 @@ def run_supervised(
                     "observed_pgids": sorted(observed_pgids),
                     "surviving_pids": list(survivors),
                     "exit_code": exit_code,
+                    "child_exit_code": child_exit_code,
+                    "completion_requested": completed_by_signal,
+                    "finalization_timed_out": finalization_timed_out,
                 },
                 indent=2,
             )
@@ -184,7 +254,10 @@ def run_supervised(
         )
     return SupervisedResult(
         exit_code=exit_code,
+        child_exit_code=child_exit_code,
         timed_out=timed_out,
+        completion_requested=completed_by_signal,
+        finalization_timed_out=finalization_timed_out,
         elapsed_seconds=round(time.monotonic() - started, 6),
         observed_pids=tuple(sorted(observed_pids)),
         observed_pgids=tuple(sorted(observed_pgids)),

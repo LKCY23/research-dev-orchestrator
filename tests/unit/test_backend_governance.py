@@ -7,7 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from backend_governance import BackendGovernanceError, compile_backend_profile, materialize_backend_profile
+from backend_governance import (
+    BackendGovernanceError, compile_backend_profile, materialize_backend_profile,
+    require_resource_observability,
+)
 from agent_backends import build_command
 from protocol import utc_now, write_json
 from strategy import DEFAULT_EXECUTION_POLICY
@@ -68,6 +71,31 @@ def strategy_payload(backend_id: str = "claude-code"):
 
 
 class BackendGovernanceTests(unittest.TestCase):
+    def test_native_resume_commands_reuse_backend_session(self):
+        claude = build_command(
+            backend_id="claude-code",
+            io_mode="machine",
+            permission_mode="auto",
+            cwd="/tmp/repo",
+            prompt="continue",
+            agent_name="worker",
+            execution_mode="resume",
+            session_id="11111111-1111-1111-1111-111111111111",
+        ).argv
+        self.assertEqual(claude[1:3], ["--resume", "11111111-1111-1111-1111-111111111111"])
+
+        codex = build_command(
+            backend_id="codex",
+            io_mode="machine",
+            permission_mode="default",
+            cwd="/tmp/repo",
+            prompt="continue",
+            agent_name="worker",
+            execution_mode="resume",
+            session_id="22222222-2222-2222-2222-222222222222",
+        ).argv
+        self.assertIn("resume", codex)
+        self.assertEqual(codex[-2:], ["22222222-2222-2222-2222-222222222222", "continue"])
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -132,6 +160,15 @@ class BackendGovernanceTests(unittest.TestCase):
             "max_parallel": 1,
             "enforce_max_spawns": False,
         })
+
+    def test_hard_budget_requires_metric_observability_for_io_mode(self):
+        strategy = strategy_payload()
+        strategy["resource_budget"] = {"max_model_turns": 10, "max_cost_usd": 1.0}
+        write_json(self.strategy, strategy)
+        profile = self.compile()
+        require_resource_observability(profile, "machine")
+        with self.assertRaisesRegex(BackendGovernanceError, "not observable"):
+            require_resource_observability(profile, "human")
 
     def test_materialize_writes_attempt_local_settings_and_hooks(self):
         runtime = self.root / "attempt" / "runtime"

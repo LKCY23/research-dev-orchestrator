@@ -47,6 +47,8 @@ def cmd_command(args: argparse.Namespace) -> int:
         prompt=prompt,
         agent_name=args.agent_name,
         backend_profile=args.backend_profile,
+        execution_mode=args.execution_mode,
+        session_id=args.session_id,
     )
     if args.json:
         print(json.dumps(rendered.__dict__, indent=2))
@@ -75,6 +77,8 @@ def main() -> int:
     command.add_argument("--prompt-path", default="")
     command.add_argument("--agent-name", default="")
     command.add_argument("--backend-profile", default="")
+    command.add_argument("--execution-mode", choices=["start", "resume", "replace"], default="start")
+    command.add_argument("--session-id", default="")
     command.add_argument("--json", action="store_true")
     command.set_defaults(func=cmd_command)
 
