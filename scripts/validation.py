@@ -73,8 +73,20 @@ def load_handoff_request(task_dir: Path) -> tuple[dict[str, Any] | None, list[st
         reasons.append("HANDOFF.json needs_coordinator must be boolean")
     if requested_state == "verified":
         self_review = request.get("self_review")
-        if not isinstance(self_review, dict) or self_review.get("passed") is not True:
-            reasons.append("verified handoff requires self_review.passed=true")
+        required_self_review = {
+            "acceptance_checked",
+            "changed_paths_checked",
+            "tests_passed",
+            "diff_check_passed",
+            "passed",
+        }
+        if not isinstance(self_review, dict) or any(
+            self_review.get(field) is not True for field in required_self_review
+        ):
+            reasons.append("verified handoff requires every self-review gate to be true")
+        commands = request.get("commands_run")
+        if not isinstance(commands, list) or not any(is_non_empty_string(item) for item in commands):
+            reasons.append("verified handoff requires at least one recorded acceptance command")
     return request, reasons
 
 

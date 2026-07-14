@@ -13,6 +13,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 
 - The coordinator owns intent, task routing, acceptance criteria, and merge decisions. It owns independent code review for Delegated and Full tasks; Direct workers own their own implementation review.
 - Workers own execution: implement only assigned task packets, test, self-review, fix their findings, and call `rdo finalize`. RDO derives evidence and handoff artifacts atomically; workers must not edit `STATUS.json` terminal state.
+- Execution workers commit task changes on their assigned branch and leave the worktree clean before final handoff.
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.

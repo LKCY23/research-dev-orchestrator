@@ -91,6 +91,8 @@ Suggested next action
 
 Workers call `rdo finalize`; it sets `_template=false` and writes the request atomically. Direct requests `verified|blocked`; Delegated requests `review|blocked`; Full may request `strategy_review|review|blocked`.
 
+Before a final `verified` or `review` handoff, execution workers commit all task changes on the assigned branch and leave the task worktree clean. Finalization derives `files_changed` from the task's first pre-execution fingerprint rather than from unstaged Git diff alone.
+
 ```json
 {
   "_template": false,

@@ -194,12 +194,14 @@ def render_worker_prompt(
                 f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} workflow start|heartbeat|complete for workflow instances.",
                 f"- For an independent review workflow, each declared native reviewer writes a non-empty artifact under {attempt_dir / 'runtime' / 'reviews'}; complete it with one --review-evidence REVIEWER_ID=ARTIFACT_PATH per reviewer. Reviewer IDs must match observed backend agent instances.",
                 f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> [--acceptance] -- <command> for bounded commands.",
+                "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 f"- After every required workflow completes, finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state review --summary <summary>.",
                 "- A new workflow kind, larger budget, wider permission, or exhaustive search requires a strategy revision and checkpoint.",
             ])
         elif profile == "direct":
             phase_rules.extend([
                 "- Implement the task, run the acceptance commands, inspect the complete diff, and fix every self-review finding.",
+                "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 "- You own the final review. The coordinator will enforce only mechanical merge gates.",
                 f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state verified --self-review-passed --summary <summary> [--command <command>].",
                 "- If independent judgment is needed, hand off blocked and request escalation to delegated instead of self-approving.",
@@ -207,6 +209,7 @@ def render_worker_prompt(
         else:
             phase_rules.extend([
                 "- Implement the task, run acceptance commands, and self-review the diff before handoff.",
+                "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 "- The coordinator owns the independent code review and merge decision.",
                 f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state review --summary <summary> [--command <command>].",
             ])

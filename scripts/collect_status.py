@@ -111,6 +111,20 @@ def validate_attempt(
     violations: list[str] = []
     warnings: list[str] = []
     state = status.get("state")
+    profile = status.get("profile", "full")
+    policy_path = task_dir / "EXECUTION_POLICY.json"
+    if policy_path.exists():
+        try:
+            policy = load_json(policy_path)
+        except Exception as exc:
+            violations.append(f"{task_dir.name}: EXECUTION_POLICY.json is unreadable: {exc}")
+        else:
+            expected_strategy_required = profile == "full"
+            if policy.get("strategy_required") is not expected_strategy_required:
+                violations.append(
+                    f"{task_dir.name}: EXECUTION_POLICY.strategy_required must be "
+                    f"{expected_strategy_required} for profile {profile!r}"
+                )
     attempt_id = status.get("current_attempt_id")
     if not attempt_id:
         return violations, warnings, None
@@ -206,7 +220,25 @@ def validate_attempt(
             violations.append(
                 f"{task_dir.name}: STATUS strategy_review requires HANDOFF.json requested_state=strategy_review"
             )
+    elif state == "verified":
+        if profile != "direct":
+            violations.append(f"{task_dir.name}: STATUS verified requires profile='direct'")
+        if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "verified":
+            violations.append(f"{task_dir.name}: STATUS verified requires completed attempt with handoff_state=verified")
+        if attempt.get("exit_code") != 0:
+            violations.append(f"{task_dir.name}: STATUS verified requires worker exit_code=0")
+        if not has_substantive_content(task_dir / "HANDOFF.md"):
+            violations.append(f"{task_dir.name}: STATUS verified requires substantive HANDOFF.md")
+        if not has_substantive_content(task_dir / "EVIDENCE.md"):
+            violations.append(f"{task_dir.name}: STATUS verified requires substantive EVIDENCE.md")
+        request, request_reasons = load_handoff_request(task_dir)
+        for reason in request_reasons:
+            violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
+        if isinstance(request, dict) and request.get("requested_state") != "verified":
+            violations.append(f"{task_dir.name}: STATUS verified requires HANDOFF.json requested_state=verified")
     elif state == "review":
+        if profile not in {"delegated", "full"}:
+            violations.append(f"{task_dir.name}: STATUS review requires profile='delegated' or profile='full'")
         if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "review":
             violations.append(f"{task_dir.name}: STATUS review requires completed attempt with handoff_state=review")
         if attempt.get("exit_code") != 0:
@@ -235,7 +267,7 @@ def validate_attempt(
         else:
             violations.append(f"{task_dir.name}: STATUS blocked requires completed or invalid_handoff attempt")
 
-    if attempt.get("phase") == "execution":
+    if profile == "full" and attempt.get("phase") == "execution":
         try:
             from strategy import canonical_digest, load_approved_strategy
 

@@ -10,6 +10,8 @@ python3 "${RDO_ROOT}/scripts/create_task.py" --run-id direct-run --task-id T001-
 worker="${repo}/direct-worker.sh"
 make_verified_worker "${worker}"
 RDO_WORKER_COMMAND="${worker}" "${RDO_ROOT}/scripts/dispatch_agent.sh" direct-run T001-direct >/dev/null
+python3 "${RDO_ROOT}/scripts/collect_status.py" --run-id direct-run --json > "${repo}/direct-status.json"
+assert_json_expr "${repo}/direct-status.json" "payload['valid'] is True"
 
 python3 - "${repo}/.agent-collab/runs/direct-run/tasks/T001-direct" <<'PY'
 import json, sys
@@ -23,4 +25,6 @@ assert attempt["phase"] == "execution"
 assert attempt["strategy_id"] is None
 assert attempt["worker_id"] == status["assigned_worker"]["worker_id"]
 assert attempt["execution_mode"] == "start"
+policy = json.loads((task / "EXECUTION_POLICY.json").read_text())
+assert policy["strategy_required"] is False
 PY

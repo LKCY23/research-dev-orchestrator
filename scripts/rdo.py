@@ -17,6 +17,7 @@ from completion import write_completion
 from protocol import SKILL_ROOT, append_event, load_json, parse_iso, utc_now, write_json
 from strategy import StrategyValidationError, canonical_digest, load_approved_strategy, review_strategy, submit_strategy
 from supervisor import run_supervised, terminate_processes
+from worktree_fingerprint import fingerprint
 
 
 def task_dir(value: str) -> Path:
@@ -64,6 +65,38 @@ def atomic_text(path: Path, text: str) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
+
+
+def derive_task_changed_files(task: Path, attempt_path: Path, cwd: Path) -> list[str]:
+    before_paths = sorted((attempt_path.parent).glob("*/runtime/worktree-before.json"))
+    if not before_paths:
+        raise SystemExit("cannot derive task changes: no worktree-before fingerprint exists")
+    before_payload = load_json(before_paths[0])
+    before = {item["path"]: item["sha256"] for item in before_payload.get("entries", [])}
+    after_payload = fingerprint(cwd)
+    after = {item["path"]: item["sha256"] for item in after_payload.get("entries", [])}
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+
+
+def require_clean_task_worktree(cwd: Path, expected_branch: str) -> None:
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=cwd, text=True, capture_output=True, check=False
+    )
+    if branch.returncode != 0 or branch.stdout.strip() != expected_branch:
+        raise SystemExit(
+            f"task worktree must be on assigned branch {expected_branch!r}, got {branch.stdout.strip()!r}"
+        )
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise SystemExit(f"cannot inspect task worktree status: {status.stderr.strip()}")
+    if status.stdout.strip():
+        raise SystemExit("task worktree must be committed and clean before final handoff")
 
 
 def strategy_submit(args: argparse.Namespace) -> int:
@@ -466,11 +499,17 @@ def handoff(args: argparse.Namespace) -> int:
         metadata = load_json(attempt_path / "ATTEMPT.json")
         cwd = metadata.get("runtime", {}).get("cwd") if isinstance(metadata.get("runtime"), dict) else None
         if isinstance(cwd, str) and cwd:
-            result = subprocess.run(
-                ["git", "diff", "--name-only"], cwd=cwd, text=True, capture_output=True, check=False
-            )
-            if result.returncode == 0:
-                files = [line for line in result.stdout.splitlines() if line]
+            cwd_path = Path(cwd).resolve()
+            require_clean_task_worktree(cwd_path, str(status.get("branch") or ""))
+            derived_files = derive_task_changed_files(path, attempt_path, cwd_path)
+            if files and sorted(set(files)) != derived_files:
+                raise SystemExit(
+                    "explicit --file values do not match the task worktree diff: "
+                    f"explicit={sorted(set(files))}, derived={derived_files}"
+                )
+            files = derived_files
+    if profile == "direct" and args.state == "verified" and not commands:
+        raise SystemExit("direct verified handoff requires at least one recorded acceptance command")
     evidence_lines = ["# Evidence", "", "## Commands Run", ""]
     evidence_lines.extend(f"- `{item}`" for item in commands)
     evidence_lines.extend(["", "## Files Changed", ""])

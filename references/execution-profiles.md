@@ -12,6 +12,8 @@ RDO routes each task through the lightest profile that still gives the task an a
 
 Profile selection is a routing decision, not a quality level. Every profile keeps Git isolation, bounded supervision, evidence, valid handoff, and merge gates. Direct removes independent coordinator code review; it does not remove worker testing or self-review.
 
+Execution workers commit all task changes on the assigned task branch before final handoff. `rdo finalize` requires a clean task worktree and derives changed-file evidence from the first attempt's worktree fingerprint, so committed, staged, unstaged, untracked, and deleted paths cannot silently disappear from the handoff.
+
 Escalate `direct -> delegated -> full` by creating a revision task when scope or acceptance materially changes. If uncertainty is discovered before substantive execution, the coordinator may replace the task with a higher-profile task while preserving the original audit trail.
 
 ## Identity and Continuity
@@ -44,5 +46,7 @@ Authors should reason about a small set of canonical concerns even when compatib
 - `ATTEMPT.json`: one execution slice and its lineage/session metadata.
 - `HANDOFF.json`: machine-readable worker completion request, including Direct self-review attestation.
 - logs and evidence: execution facts used by the responsible reviewer.
+
+Direct reaches `verified` after worker-owned self-review and recorded acceptance commands. Delegated reaches `review` and requires an explicit coordinator decision before `approved`. Direct `verified` and Delegated/Full `approved` both require coordinator-owned merge mechanics before `merged`.
 
 `CONTEXT.md` and `ACCEPTANCE.md` are optional normalization files when their content is already complete in `TASK.md`. `HANDOFF.md`, `EVIDENCE.md`, summaries, and dashboards are human-readable or derived views; they must not introduce a second conflicting decision source.

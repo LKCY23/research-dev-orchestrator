@@ -94,6 +94,7 @@ def main() -> int:
 
     (task_dir / "STATUS.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
     execution_policy = copy.deepcopy(DEFAULT_EXECUTION_POLICY)
+    execution_policy["strategy_required"] = args.profile == "full"
     execution_policy["allowed_paths"] = list(args.allowed_paths)
     execution_policy["forbidden_paths"] = list(args.forbidden_paths)
     write_json(task_dir / "EXECUTION_POLICY.json", execution_policy)

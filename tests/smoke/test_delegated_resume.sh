@@ -12,20 +12,18 @@ make_review_worker "${worker}"
 RDO_WORKER_COMMAND="${worker}" "${RDO_ROOT}/scripts/dispatch_agent.sh" delegated-run T001-delegated >/dev/null
 
 task="${repo}/.agent-collab/runs/delegated-run/tasks/T001-delegated"
-python3 - "${task}/STATUS.json" <<'PY'
-import json, sys
-from datetime import datetime, timezone
-path = sys.argv[1]
-status = json.load(open(path, encoding="utf-8"))
-assert status["state"] == "review"
-now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-status["previous_state"] = "review"
-status["state"] = "changes_requested"
-status["updated_at"] = now
-status["state_history"].append({"from": "review", "to": "changes_requested", "actor": "coordinator", "at": now})
-json.dump(status, open(path, "w", encoding="utf-8"), indent=2)
-PY
+python3 "${RDO_ROOT}/scripts/collect_status.py" --run-id delegated-run --json > "${repo}/delegated-first.json"
+assert_json_expr "${repo}/delegated-first.json" "payload['valid'] is True"
+mkdir -p "${task}/reviews"
+printf '# Findings\n\n- Apply the requested focused fix.\n' > "${task}/reviews/findings.md"
+python3 "${RDO_ROOT}/scripts/rdo.py" task review \
+  --task-dir "${task}" \
+  --decision changes_requested \
+  --reviewer codex \
+  --findings-file "${task}/reviews/findings.md" >/dev/null
 RDO_WORKER_COMMAND="${worker}" "${RDO_ROOT}/scripts/dispatch_agent.sh" delegated-run T001-delegated >/dev/null
+python3 "${RDO_ROOT}/scripts/collect_status.py" --run-id delegated-run --json > "${repo}/delegated-second.json"
+assert_json_expr "${repo}/delegated-second.json" "payload['valid'] is True"
 
 python3 - "${task}" <<'PY'
 import json, sys
@@ -41,4 +39,8 @@ assert first["session_id"] == second["session_id"]
 assert second["parent_attempt_id"] == first["attempt_id"]
 assert second["execution_mode"] == "resume"
 assert second["resume_reason"] == "changes_requested"
+policy = json.loads((task / "EXECUTION_POLICY.json").read_text())
+assert policy["strategy_required"] is False
+pointer = json.loads((task / "reviews" / "CURRENT_TASK_REVIEW.json").read_text())
+assert pointer["revision"] == 1
 PY

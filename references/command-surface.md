@@ -8,6 +8,7 @@ Coordinator-only commands:
 
 ```text
 rdo strategy approve|changes
+rdo task review
 rdo worker message|interrupt|terminate
 rdo status
 ```
