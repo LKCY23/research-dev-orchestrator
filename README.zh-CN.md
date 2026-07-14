@@ -138,27 +138,24 @@ flowchart TB
 预期流程是顺序的，但可以随时 resume：
 
 ```text
-requirements
--> design method selection
--> architecture / experiment design
--> task packet
--> 只读策略规划
--> coordinator 策略审查
--> supervisor 监管的执行派发
--> worker handoff
--> collect status
--> Codex review
--> merge
--> close session
+Direct:    worker 实现 -> 测试 -> 自审并修复 -> verified -> merge gate
+Delegated: worker 实现 -> 测试 -> 自审并修复 -> coordinator review -> merge gate
+Full:      strategy planning -> coordinator strategy review -> execution -> coordinator review -> merge gate
 ```
+
+三个 profile 都保留 Git 隔离、有界 attempt supervision、evidence 和 handoff 校验。详见 [execution profiles](references/execution-profiles.md)。
 
 一个 run 会记录完整生命周期：需求、设计笔记、实验计划、任务、attempt、review、结果、诊断和记忆。
 
 ## Execution Strategy 与监督
 
-新任务默认使用 `strategy_required=true`。Planning worker 可以读取仓库，但不能修改 task worktree；它提交版本化的 `STRATEGY-vNNN.json`，声明可配置的 workflow 定义、依赖、权限、实例/并发上限、时间预算和完成条件。Coordinator 批准的是 strategy 的精确 digest，而不是一个可变文件名。
+Full task 使用 strategy gate。Planning worker 可以读取仓库，但不能修改 task worktree；它提交版本化的 `STRATEGY-vNNN.json`，声明可配置的 workflow 定义、依赖、权限、实例/并发上限、时间预算和完成条件。Coordinator 批准的是 strategy 的精确 digest，而不是一个可变文件名。Direct 和 Delegated task 跳过策略规划。
 
 Execution worker 可以在批准的 envelope 内灵活启动多个 workflow instance 并使用已声明的 subagent；新增 workflow 类型、扩大路径或权限、提高预算，或启动无界搜索时，必须提交新的 strategy revision。`supervise_attempt.py` 独立于模型自身 timeout，负责 attempt 总时限和进程清理；`rdo.py exec` 负责 command budget。详见 [execution strategy](references/execution-strategy.md)、[attempt supervision](references/attempt-supervision.md) 与 [tmux control](references/tmux-control.md)。
+
+Strategy revision 可以显式跨 attempt 或 backend 复用已完成工作。Dispatch 会校验 source attempt 已终止、source workflow 已完成且 worktree digest 完全一致，再通过 attempt-local `RESUME_CONTEXT.json` 告诉 worker 哪些 workflow 已继承、哪些仍需执行；acceptance evidence 始终在当前 attempt 重新生成。
+
+Full strategy 也可以声明模型轮次、token、费用、context、首个进展和无进展轮次的硬预算。RDO 只对当前 backend/I/O adapter 确实可观测的指标启用预算，将统一用量写入 `runtime/USAGE.ndjson`，越界即终止。独立 review workflow 必须提交不同且可观测的 reviewer agent 身份与带哈希的 review artifact，主 worker 不能自行声称完成了独立 review。
 
 Backend governance 是长期且由各 adapter 独立定义的。Strategy schema v2 将执行绑定到一个 backend；dispatch 在获取 task lock 前，将 backend policy、task 上限和已批准 strategy 纯编译为单次 attempt profile。Claude Code 使用 attempt-local settings 和 Hook；Codex 使用单次 invocation 的 multi-agent 设置；Kimi Code 使用临时治理 home；OpenCode 使用单次 attempt 的 permission/session supervisor。Claude/Codex 的累计启动限制可选且默认关闭，Kimi/OpenCode 不施加累计启动限制。所有路径都不修改用户的全局 CLI 配置。详见 [backend governance](references/backend-governance.md)。
 
@@ -212,7 +209,7 @@ Backend governance 是长期且由各 adapter 独立定义的。Strategy schema 
 - `dashboard.html`：由 `render_dashboard.py` 生成的人类可读 derived monitor。
 - `EVIDENCE.md`：commands、tests、metrics、outputs 和 logs。
 - `HANDOFF.md`：worker handoff summary 和 known limitations。
-- `HANDOFF.json`：worker 请求进入 `strategy_review`、`review` 或 `blocked` 的机器可读 handoff request。
+- `HANDOFF.json`：worker 请求进入 `strategy_review`、`verified`、`review` 或 `blocked` 的 canonical machine-readable handoff；`rdo finalize` 会同时生成对应的人类 evidence view。
 
 协议细节见 [references/state-machine.md](references/state-machine.md)、[references/status-schema.md](references/status-schema.md)、[references/attempt-lifecycle.md](references/attempt-lifecycle.md) 和 [references/events-schema.md](references/events-schema.md)。
 
@@ -220,9 +217,9 @@ Backend governance 是长期且由各 adapter 独立定义的。Strategy schema 
 
 执行状态模型把 work progress 和 worker execution 分开。
 
-Task 是持久化工作项：intent、constraints、acceptance criteria，以及 coordinator-owned progress。Attempt 是某个 task 下的一次有边界 worker execution trajectory，以 attempt directory 的形式物化，包含 prompt、runtime metadata、transcript、result、evidence 和 handoff request。
+Task 是持久化工作项：intent、constraints、acceptance criteria，以及 coordinator-owned progress。Worker 是逻辑执行者。Attempt 是一次有边界的 supervision/audit slice，包含 prompt、runtime metadata、transcript、result、evidence 和 handoff request。后续 attempt 默认复用同一个 worker、worktree 和 backend 原生会话。
 
-Dispatch 是 worker execution 与 task state 的边界。系统先启动只读 planning attempt，提交不可变的多 workflow strategy；coordinator 审查并批准其精确 SHA-256 digest，之后新的 execution attempt 才能在 attempt-local deterministic supervisor 下运行。Execution 可以请求 `review`、`blocked` 或新的 `strategy_review`，但状态只能由 dispatch 校验后修改。
+Dispatch 是 worker execution 与 task state 的边界。Direct 和 Delegated 直接进入 execution；Full 先通过不可变 strategy review。普通 review feedback 会创建新 attempt，并以 `execution_mode=resume` 恢复原 worker 会话；只有显式更换 worker/backend 时才记录 `replace`。
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"},"flowchart":{"curve":"basis"}}}%%
@@ -284,7 +281,7 @@ flowchart LR
   classDef bad fill:#fff1f2,stroke:#e11d48,color:#881337;
 ```
 
-Worker 失败会先影响 attempt，而不是直接让 task 失败。Completed attempt 是 review-ready evidence，不是自动 task completion。这样系统可以 retry、inspect、compare 和 recover worker executions，同时不丢失 task 的 intent 或历史。
+Worker 失败会先影响 attempt，而不是直接让 task 失败。Completed attempt 表示合法 protocol handoff，不必然表示通过 review。这样系统可以 resume、inspect、compare 和 recover，同时保留 worker 上下文与 task 历史。
 
 ## Agent And Runtime Backends
 

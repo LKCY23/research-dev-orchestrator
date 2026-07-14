@@ -11,8 +11,8 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 
 ## Core Rules
 
-- The coordinator owns intent: requirements, experiment design, architecture decisions, task decomposition, acceptance criteria, review, and merge decisions.
-- Workers own execution: implement only assigned task packets and write evidence plus a `HANDOFF.json` transition request. Workers must not edit `STATUS.json` terminal state.
+- The coordinator owns intent, task routing, acceptance criteria, and merge decisions. It owns independent code review for Delegated and Full tasks; Direct workers own their own implementation review.
+- Workers own execution: implement only assigned task packets, test, self-review, fix their findings, and call `rdo finalize`. RDO derives evidence and handoff artifacts atomically; workers must not edit `STATUS.json` terminal state.
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.
@@ -22,14 +22,16 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - `scripts/protocol.py` is the script-internal source for protocol constants and low-level helpers. `scripts/validation.py` owns shared protocol validation rules used by online dispatch gates and offline status audit. Neither file is a user interface or public SDK.
 - `.agent-collab/rdo.toml` and `scripts/config.py` own operational defaults only. They must not configure protocol states, schema fields, events, blocker types, or protocol version.
 - Worker runtime backend is an execution detail. Default to `plain`; use `tmux` only when the user wants attachable long-running worker observation. Backend choice must not change protocol truth sources.
-- Before execution, use a read-only planning attempt and coordinator-reviewed immutable strategy revision. A strategy may contain multiple workflows and configurable budgets.
+- Use a read-only planning attempt and coordinator-reviewed immutable strategy revision for Full tasks. Direct and Delegated tasks intentionally skip this ceremony.
+- Full strategy revisions must explicitly preserve compatible prior work with workflow `resume` declarations. Dispatch validates the referenced terminal attempt, completed source workflow, and exact worktree digest before carrying a checkpoint forward.
+- Optional Full resource budgets are hard only when the selected backend/I/O adapter exposes the metric; unobservable configurations fail before dispatch. Independent review requires observed reviewer agents and attempt-local review artifacts, never primary-worker self-attestation.
 - Treat backend-native tool timeouts as advisory. Attempt-local deterministic supervision owns the final process-group deadline and cleanup boundary.
 - Coordinator intents are structured natural-language requests for human control. They are not Codex slash commands and must still follow all protocol invariants.
 - Do not destructively overwrite or reinitialize audit-bearing artifacts. Use a new run, new attempt, or revision task.
 
-## Default Progression and Stage Entry
+## Profile Routing and Stage Entry
 
-Follow the Standard Workflow by default unless the user explicitly requests a different process. Do not treat an RDO invocation as permission to continue substantive work in ad hoc documents outside the workflow.
+Choose the lightest execution profile whose verification boundary matches the task: Direct for small low-risk changes, Delegated for moderate single-worker changes needing independent review, and Full for ambiguous, experimental, multi-workflow, permission-sensitive, or high-risk work. Read `references/execution-profiles.md` before routing or changing task execution semantics.
 
 On every activation or resumption, perform a read-only phase audit before substantive work or protocol state mutation:
 
@@ -49,7 +51,7 @@ When the user explicitly requests entry at a later stage, treat that request as 
 - Do not redo completed research, design, implementation, or review work.
 - Proceed to the requested stage as soon as its prerequisites are satisfied.
 
-An explicit request to skip or alter the workflow may waive soft planning ceremony, but record the waiver and its consequences in the available audit trail. It never waives Git isolation, FSM validity, immutable strategy approval, attempt supervision, handoff validation, review gates, or merge gates.
+Profile selection may remove planning or independent coordinator review by design. It never waives Git isolation, FSM validity, attempt supervision, profile-appropriate handoff validation, or merge gates.
 
 Synchronize approved decisions to canonical artifacts before continuing:
 
@@ -62,7 +64,7 @@ Synchronize approved decisions to canonical artifacts before continuing:
 
 If no Git repository exists, remain in pre-run planning: canonical planning artifacts may be created or normalized, but do not initialize RDO runs, create worktrees, dispatch workers, or claim execution readiness.
 
-## Standard Workflow
+## Full Workflow
 
 This is the canonical default progression. A stage-aware entry may begin later only after the phase audit above confirms or normalizes its prerequisites.
 
@@ -94,7 +96,8 @@ Read references only when they are needed:
 - `references/state-machine.md`: use for human-readable FSM semantics.
 - `references/state-machine.json`: use as the authoritative machine-readable FSM.
 - `references/status-schema.md`: use before writing or reviewing `STATUS.json`.
-- `references/attempt-lifecycle.md`: use before dispatching workers or auditing running/review/blocked invariants.
+- `references/execution-profiles.md`: use before routing Direct, Delegated, or Full tasks and before replacing a worker.
+- `references/attempt-lifecycle.md`: use before dispatching workers or auditing running/review/verified/blocked invariants.
 - `references/configuration.md`: use when changing `.agent-collab/rdo.toml`, config defaults, env overrides, stale thresholds, or task branch/worktree defaults.
 - `references/runtime-backends.md`: use before enabling `RDO_RUNTIME_BACKEND=tmux` or auditing backend-specific attempt metadata.
 - `references/execution-strategy.md`: use before planning, approving, revising, or running a multi-workflow strategy.
@@ -138,7 +141,7 @@ Users may invoke the skill explicitly with `$research-dev-orchestrator` or selec
 ```text
 $research-dev-orchestrator init project=<slug> objective="<text>" [target=<branch>]
 $research-dev-orchestrator plan run=<run-id> [scope=requirements|design|experiment|all]
-$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>]
+$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>] [profile=direct|delegated|full]
 $research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
 $research-dev-orchestrator status run=<run-id> [json] [summary] [dashboard] [diagnostics]
 $research-dev-orchestrator review run=<run-id> task=<task-id>
@@ -164,7 +167,9 @@ Read `references/command-surface.md` before acting on these intents. `review` do
 
 `dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; dispatch remains responsible for locks, worktrees, process supervision, and handoff validation.
 
-`dispatch_agent.sh` is the generic worker dispatch entrypoint. Automatic dispatch maps `pending|blocked|changes_requested -> planning`, and maps `strategy_review -> running` only when an immutable strategy revision has coordinator approval for the exact digest. A coordinator may explicitly dispatch `blocked -> running` to retry a still-approved strategy. Dispatch atomically acquires `.dispatch-lock`, creates a phase-tagged attempt, runs the worker through the attempt supervisor, and validates `HANDOFF.json`. Valid planning handoff produces `strategy_review`; valid execution handoff produces `review`, `blocked`, or a revised `strategy_review`. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
+`dispatch_agent.sh` is the generic worker dispatch entrypoint. Direct and Delegated tasks map `pending|blocked|changes_requested -> running`. Full tasks map `pending -> planning`, `strategy_review -> running` after exact-digest approval, and ordinary `blocked|changes_requested -> running` while the strategy remains valid. Each dispatch creates a new bounded attempt but normally resumes the same logical worker and native backend session. Valid Direct execution produces `verified`; Delegated execution produces `review`; Full planning/execution produces `strategy_review`, `review`, or `blocked`. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
+
+For Full execution, dispatch materializes `runtime/RESUME_CONTEXT.json`. A `reuse` checkpoint becomes `workflow_carried_forward` and satisfies dependencies without another model workflow; a `revalidate` checkpoint remains in `remaining_workflows`. Acceptance command records are attempt-local and are never carried forward.
 
 Worker backend configuration:
 
@@ -209,7 +214,7 @@ Use these files to recover context after days or weeks:
 - `reviews/*`: Codex review records.
 - `tasks/*/attempts/*`: worker execution records.
 
-`HANDOFF.json` is the machine-readable worker handoff request. It does not replace `HANDOFF.md`; dispatch validates it and applies terminal task state transitions.
+`HANDOFF.json` is the canonical machine-readable worker handoff request; `HANDOFF.md` and `EVIDENCE.md` are generated human views. Worker-side `rdo strategy submit|revise` and `rdo finalize` atomically commit an attempt-bound `COMPLETION.json` after all artifacts are durable. For `tmux + human`, the supervisor may use that exact-digest signal to quiesce an otherwise idle TUI, but it must not treat it as coordinator approval or skip dispatch's final worktree and handoff validation.
 
 Do not force a separate `DECISIONS.md` in the first version. Put non-architecture session decisions and tradeoffs in `JOURNAL.md`; add ADRs only when a decision should be durable architecture/design record.
 
