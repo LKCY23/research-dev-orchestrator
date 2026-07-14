@@ -141,6 +141,59 @@ class DispatchAssetsTests(unittest.TestCase):
             self.assertIn("Correct the documented API status names.", prompt)
             self.assertIn("Reviewer: codex", prompt)
 
+    def test_planning_prompt_embeds_digest_bound_strategy_review_feedback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary)
+            strategy_dir = task / "strategy"
+            strategy_dir.mkdir()
+            strategy = {
+                "strategy_id": "T101-example-S004",
+                "task_id": "T101-example",
+                "revision": 4,
+            }
+            strategy_path = strategy_dir / "STRATEGY-v004.json"
+            strategy_path.write_text(json.dumps(strategy), encoding="utf-8")
+            canonical = json.dumps(
+                strategy,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            (strategy_dir / "REVIEW-v004.json").write_text(
+                json.dumps(
+                    {
+                        "strategy_id": "T101-example-S004",
+                        "strategy_sha256": hashlib.sha256(canonical).hexdigest(),
+                        "decision": "changes_requested",
+                        "reviewer": "codex",
+                        "notes": ["Resume from the terminal execution attempt."],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task / "STATUS.json").write_text(
+                json.dumps({"task_id": "T101-example", "state": "changes_requested"}),
+                encoding="utf-8",
+            )
+            (task / "EXECUTION_POLICY.json").write_text(
+                json.dumps(DEFAULT_EXECUTION_POLICY), encoding="utf-8"
+            )
+            for name in ("TASK.md", "CONTEXT.md", "ACCEPTANCE.md"):
+                (task / name).write_text(name, encoding="utf-8")
+
+            prompt = render_worker_prompt(
+                worktree_path="/tmp/worktree",
+                task_dir=task,
+                status_path=task / "STATUS.json",
+                attempt_dir=task / "attempts" / "A008",
+                worker_backend="opencode",
+                phase="planning",
+            )
+
+            self.assertIn("## Strategy Revision Feedback", prompt)
+            self.assertIn("Rejected revision: 4", prompt)
+            self.assertIn("Resume from the terminal execution attempt.", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

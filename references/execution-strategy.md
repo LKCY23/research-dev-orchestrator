@@ -141,3 +141,9 @@ A new strategy revision is required before introducing a new workflow kind, incr
 `REVIEW-vNNN.json` contains `strategy_id`, `strategy_sha256`, `decision`, `reviewer`, `reviewed_at`, and `notes`. Decisions are `approved` or `changes_requested`. The coordinator never edits worker strategy in place.
 
 An approval applies atomically to the complete strategy revision. Changes requested cause a new planning attempt and a new immutable revision.
+
+When the latest strategy review decision is `changes_requested`, dispatch binds
+the review to its strategy digest and includes the reviewer notes in the next
+planning prompt. A revision worker must not be expected to discover rejected
+strategy feedback by scanning protocol files without that explicit prompt
+context.

@@ -99,6 +99,7 @@ def render_worker_prompt(
     status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
     profile = status.get("profile", "full")
     coordinator_feedback = ""
+    strategy_feedback = ""
     review_pointer = task_dir / "reviews" / "CURRENT_TASK_REVIEW.json"
     if review_pointer.exists():
         pointer = json.loads(review_pointer.read_text(encoding="utf-8"))
@@ -126,6 +127,43 @@ def render_worker_prompt(
                 ]
             )
     if phase == "planning":
+        strategy_reviews = sorted((task_dir / "strategy").glob("REVIEW-v*.json"))
+        if strategy_reviews:
+            strategy_review = json.loads(
+                strategy_reviews[-1].read_text(encoding="utf-8")
+            )
+            if strategy_review.get("decision") == "changes_requested":
+                revision = int(strategy_reviews[-1].stem.removeprefix("REVIEW-v"))
+                reviewed_strategy_path = (
+                    task_dir / "strategy" / f"STRATEGY-v{revision:03d}.json"
+                )
+                reviewed_strategy = json.loads(
+                    reviewed_strategy_path.read_text(encoding="utf-8")
+                )
+                canonical = json.dumps(
+                    reviewed_strategy,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                digest = hashlib.sha256(canonical).hexdigest()
+                if digest != strategy_review.get("strategy_sha256"):
+                    raise ValueError(
+                        "strategy review digest does not match the reviewed strategy"
+                    )
+                notes = strategy_review.get("notes") or []
+                strategy_feedback = "\n".join(
+                    [
+                        "## Strategy Revision Feedback",
+                        "",
+                        f"Rejected revision: {revision}",
+                        f"Strategy: {strategy_review.get('strategy_id')}",
+                        f"Reviewer: {strategy_review.get('reviewer')}",
+                        "",
+                        *[f"- {note}" for note in notes],
+                        "",
+                    ]
+                )
         strategy_action = "revise" if any((task_dir / "strategy").glob("STRATEGY-v*.json")) else "submit"
         phase_rules = [
             "## Planning Phase",
@@ -209,6 +247,7 @@ def render_worker_prompt(
             "",
             *phase_rules,
             "",
+            strategy_feedback,
             coordinator_feedback,
             "## TASK.md",
             read_text(task_dir / "TASK.md"),
