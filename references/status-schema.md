@@ -1,12 +1,17 @@
 # STATUS.json Schema
 
-`STATUS.json` is the task state source of truth. Keep it valid JSON.
+`STATUS.json` is the coordinator-owned task-state source of truth. It is not a
+worker result, command log, or handoff artifact. Artifact Protocol v2 is the
+default for new tasks; recognized historical tasks are read only through the
+explicit legacy-v0.5 or legacy-v1 compatibility path selected by their
+discriminator.
 
-## Shape
+## V2 shape
 
 ```json
 {
   "task_id": "T001-name",
+  "artifact_protocol_version": 2,
   "profile": "delegated",
   "state": "review",
   "previous_state": "running",
@@ -15,7 +20,7 @@
   "worktree": ".agent-worktrees/T001-name",
   "updated_at": "2026-07-03T12:00:00Z",
   "needs_coordinator": false,
-  "summary": "",
+  "summary": "Implementation is ready for coordinator review.",
   "blocking_reason": "",
   "blocker_type": "",
   "current_attempt_id": "A001-claude-x4p9a",
@@ -25,7 +30,7 @@
     "agent_name": "claude-worker-1",
     "worker_id": "W-claude-code-T001-name",
     "first_attempt_id": "A001-claude-x4p9a",
-    "latest_attempt_id": "A002-claude-h7q2b",
+    "latest_attempt_id": "A001-claude-x4p9a",
     "backend_session_id": "s8d21",
     "session_id": "s8d21",
     "role": "worker"
@@ -37,8 +42,8 @@
   },
   "state_history": [
     {
-      "from": "pending",
-      "to": "planning",
+      "from": "running",
+      "to": "review",
       "actor": "dispatch",
       "at": "2026-07-03T12:00:00Z"
     }
@@ -46,73 +51,105 @@
 }
 ```
 
-## Required Fields
+V2 requires `artifact_protocol_version = 2`. Always include `task_id`,
+`profile`, `state`, `previous_state`, `owner`, `branch`, `worktree`,
+`updated_at`, `needs_coordinator`, `summary`, `blocking_reason`,
+`blocker_type`, `current_attempt_id`, `assigned_worker`, `evidence`, and
+`state_history`. For `pending`, `previous_state`, `current_attempt_id`, and
+`assigned_worker` may be `null`.
 
-Always include `task_id`, `profile`, `state`, `previous_state`, `owner`, `branch`, `worktree`, `updated_at`, `needs_coordinator`, `summary`, `blocking_reason`, `blocker_type`, `current_attempt_id`, `assigned_worker`, `evidence`, and `state_history`. `profile` is `direct|delegated|full`; legacy tasks without it are interpreted as Full.
+The `evidence` object remains in the shared status shape for compatibility and
+compact display. It is not a v2 evidence index and cannot satisfy a gate. V2
+consumers resolve the current attempt and validate its exact
+`TASK_INPUTS.json`, `EVIDENCE.json`, `HANDOFF.json`, and
+`runtime/HANDOFF_READY.json` bindings. They never fall back to task-root
+handoff/evidence files.
 
-For `pending`, `previous_state`, `current_attempt_id`, and `assigned_worker` may be `null`.
+## Blocker types
 
 For `blocked`, `blocker_type` is required and must be one of:
 
 ```text
-needs_coordinator
-needs_user
-environment
-budget
-irrecoverable
+needs_coordinator  coordinator judgment, review, merge, split, or clarification
+needs_user         user input, authorization, preference, data, or research decision
+environment        dependency, data, hardware, service, permission, or runtime condition
+budget             time, token, compute, cost, or context boundary
+irrecoverable      cannot complete under the current task contract
 ```
 
-Meanings:
+## Attempt and state invariants
+
+`current_attempt_id` points to
+`attempts/<current_attempt_id>/ATTEMPT.json`. That attempt references its
+attempt-local `TASK_INPUTS.json` by exact path and digest; it does not duplicate
+the four canonical input digests.
+
+`STATUS.state = planning|running` requires matching `LOCK` metadata, an active
+`.dispatch-lock`, and an attempt whose state is `created` or `running`. The
+attempt phase must match task state. The sole v2 exception is the short
+dispatcher inter-write recovery window: `ATTEMPT.state = completed` with a
+matching valid publication may coexist temporarily with active `STATUS` only
+while the matching dispatch PID is alive and the configured grace period has
+not elapsed. `ATTEMPT.ended_at` must not be in the future; future timestamps do
+not extend or reset the recovery window. Audit reports the bounded case as a
+warning; otherwise it is a protocol violation. A tmux wait timeout before the
+attempt-local `exit_code` appears
+leaves both task and attempt running and retains the lock until Lock Recovery
+Review.
+
+`STATUS.state = strategy_review` requires a completed Full planning or
+execution-revision attempt, a valid immutable submitted strategy revision bound
+to the handoff, and no active dispatch lock.
+
+`STATUS.state = review` requires all of the following:
 
 ```text
-needs_coordinator
-  Needs coordinator judgment, task split, design decision, review, merge/conflict handling, or acceptance clarification.
-
-needs_user
-  Needs user input, authorization, preference, data access, or research decision.
-
-environment
-  Blocked by dependency, data, hardware, service, permission, filesystem, or local/remote runtime condition.
-
-budget
-  Continuing would exceed or has exceeded time, token, compute, cost, or context budget.
-
-irrecoverable
-  Worker believes the task cannot be completed under current requirements; coordinator must decide failed, revision task, or scope change.
+profile = delegated|full
+previous_state = running
+current ATTEMPT.state = completed
+ATTEMPT.handoff_valid = true
+ATTEMPT.handoff_state = review
+worker exit_code = 0
+current attempt has a complete, digest-valid v2 publication bundle
+HANDOFF.json.requested_state = review
+HANDOFF/EVIDENCE source_commit equals the clean task-worktree HEAD frozen by finalize
+required rdo check records and required outputs satisfy frozen ACCEPTANCE.md
+final running -> review transition was written by dispatch
 ```
 
-## Evidence Summary
+`STATUS.state = verified` is Direct-only. It requires the same completed,
+zero-exit, digest-valid publication and source-commit boundary, plus
+`HANDOFF.json.requested_state = verified` and a substantive
+`direct_self_review` with `performed = true` and `passed = true`.
 
-`STATUS.json.evidence` is only an index and summary. The evidence sources of truth are:
+`STATUS.state = blocked` requires `previous_state = planning|running`, a valid
+`blocker_type`, and a non-empty `blocking_reason`. A normal blocked request has
+a completed attempt, a valid attempt-local publication with
+`HANDOFF.json.requested_state = blocked`, and a concrete
+`conditional_blocker`. An invalid or missing publication instead produces
+`ATTEMPT.state = invalid_handoff`, `handoff_valid = false`, and coordinator
+triage. Dispatch, never the worker, writes the final task transition.
+Monitoring reports candidate bytes from this invalid-handoff case as
+`publication_state = rejected`; the bundle remains null and strict consumers
+must not treat those bytes as published evidence.
 
-```text
-EVIDENCE.md
-logs/*
-attempts/*/result.md
-```
-
-If the summary conflicts with evidence files, report a protocol violation and do not auto-repair it.
-
-Template-only `EVIDENCE.md` or `HANDOFF.md` files with `RDO_TEMPLATE` markers are not valid evidence or handoff content.
-
-## Attempt Invariants
-
-`current_attempt_id` points to the current `attempts/<attempt-id>/ATTEMPT.json`.
-
-`STATUS.state = planning|running` requires matching `LOCK` metadata, an active `.dispatch-lock`, and an attempt whose state is `created` or `running`. The attempt phase must match the task state.
-
-For tmux dispatch timeout before the attempt-local `exit_code` file appears, `STATUS.state` remains `running`, `ATTEMPT.state` remains `running`, and `.dispatch-lock` remains in place until Lock Recovery Review.
-
-`STATUS.state = review` requires `previous_state = running`, a completed attempt with `handoff_valid = true`, `handoff_state = review`, worker `exit_code = 0`, substantive `EVIDENCE.md` and `HANDOFF.md`, and `HANDOFF.json` with `requested_state = review`. The final `running -> review` state transition is written by `dispatch`, not by the worker.
-
-`STATUS.state = verified` is Direct-only. It requires a completed attempt with `handoff_valid = true`, `handoff_state = verified`, worker `exit_code = 0`, and `HANDOFF.json.self_review.passed = true`. The worker must test, review its diff, and fix its own findings before requesting this state.
+`STATUS.state = approved` requires an immutable coordinator review decision.
+For v2, that decision binds the exact clean source commit and the current
+attempt's task-input, evidence, handoff, and READY artifact digests.
 
 `STATUS.state = merged` requires a matching `task_merged` event whose exact
-commit is contained by `RUN.json.target_branch`. For reviewed tasks, that commit
-must be the immutable `approved_commit` in the current task review decision.
-For Direct tasks, the current task worktree must still match the completed
-verified attempt's `worktree-after` fingerprint at merge time.
+commit is contained by `RUN.json.target_branch`. Delegated/Full merge revalidates
+the approved review binding. Direct merge revalidates the completed verified
+attempt's exact source commit and artifact bundle. A content fingerprint is an
+additional check, never a substitute for the Git commit boundary. Every v2
+merge event contains `verification`; when `verification.passed = false`, the
+irreversible Git fact remains `merged` but dependency resolution exposes
+`merged_unverified`, which cannot satisfy another task's
+`required_state = merged` readiness gate.
 
-`STATUS.state = strategy_review` requires a completed planning or execution revision attempt with `handoff_state = strategy_review`, exit code `0`, and a handoff digest matching an immutable submitted strategy revision. No `.dispatch-lock` may remain active.
+## Legacy boundary
 
-`STATUS.state = blocked` requires `previous_state = planning|running`, valid `blocker_type`, and non-empty `blocking_reason`. A normal blocked handoff also requires a completed attempt with `handoff_valid = true`, `handoff_state = blocked`, substantive `HANDOFF.md`, and `HANDOFF.json` with `requested_state = blocked`. An invalid worker handoff may instead use `ATTEMPT.state = invalid_handoff`, `handoff_valid = false`, and `blocker_type = needs_coordinator` for coordinator triage. The final transition is written by `dispatch`, not by the worker.
+Recognized legacy-v0.5/v1 tasks retain their historical task-root `HANDOFF.md`,
+`HANDOFF.json`, `EVIDENCE.md`, status evidence summary, and attempt
+`COMPLETION.json` rules. Those artifacts are valid only for the legacy decoder;
+they must not be copied into, inferred as, or used to satisfy a v2 task.

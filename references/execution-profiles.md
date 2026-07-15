@@ -12,7 +12,10 @@ RDO routes each task through the lightest profile that still gives the task an a
 
 Profile selection is a routing decision, not a quality level. Every profile keeps Git isolation, bounded supervision, evidence, valid handoff, and merge gates. Direct removes independent coordinator code review; it does not remove worker testing or self-review.
 
-Execution workers commit all task changes on the assigned task branch before final handoff. `rdo finalize` requires a clean task worktree and derives changed-file evidence from the first attempt's worktree fingerprint, so committed, staged, unstaged, untracked, and deleted paths cannot silently disappear from the handoff.
+Execution workers commit all task changes on the assigned task branch before
+final handoff. `rdo finalize` requires a clean task worktree, freezes the exact
+source commit, and derives changed paths from the attempt's frozen task-base
+commit. The attempt-local before/after snapshots remain raw worktree facts.
 
 Escalate `direct -> delegated -> full` by creating a revision task when scope or acceptance materially changes. If uncertainty is discovered before substantive execution, the coordinator may replace the task with a higher-profile task while preserving the original audit trail.
 
@@ -39,14 +42,30 @@ Session reuse is best effort only when a backend cannot expose a native session 
 
 ## Artifact Boundary
 
-Authors should reason about a small set of canonical concerns even when compatibility files are materialized separately:
+Artifact Protocol v2 separates canonical task inputs from attempt-owned
+outputs:
 
-- `TASK.md`: human intent, scope, context, and acceptance contract.
+- `TASK.md`: Objective, Deliverables, Invariants, Non-goals, Dependencies.
+- `CONTEXT.md`: non-normative frozen decisions, interfaces, code map, and
+  necessary background.
+- `ACCEPTANCE.md`: the only canonical acceptance commands, outputs, and human
+  merge/blocking criteria.
+- `EXECUTION_POLICY.json`: path boundaries, context sources, and execution
+  limits.
 - `STATUS.json`: coordinator-owned task state, profile, and worker assignment.
-- `ATTEMPT.json`: one execution slice and its lineage/session metadata.
-- `HANDOFF.json`: machine-readable worker completion request, including Direct self-review attestation.
-- logs and evidence: execution facts used by the responsible reviewer.
+- `TASK_INPUTS.json`: immutable attempt-local binding to all four task inputs,
+  the task base, and resolved dependencies.
+- `ATTEMPT.json`: one execution slice and the exact task-input binding.
+- `EVIDENCE.json`: frozen attempt-local review index over raw command, log,
+  reviewer, commit, and worktree facts.
+- `HANDOFF.json`: minimal attempt-local transition request, including Direct
+  self-review when applicable.
+- `HANDOFF_READY.json`: final supervisor publication marker, never approval or
+  completion state.
 
 Direct reaches `verified` after worker-owned self-review and recorded acceptance commands. Delegated reaches `review` and requires an explicit coordinator decision before `approved`. Direct `verified` and Delegated/Full `approved` both require coordinator-owned merge mechanics before `merged`.
 
-`CONTEXT.md` and `ACCEPTANCE.md` are optional normalization files when their content is already complete in `TASK.md`. `HANDOFF.md`, `EVIDENCE.md`, summaries, and dashboards are human-readable or derived views; they must not introduce a second conflicting decision source.
+All four task inputs are required. V2 has no task-root `HANDOFF.md`,
+`HANDOFF.json`, or `EVIDENCE.md`; summaries and dashboards render derived views
+without creating another protocol truth source. Historical runs retain those
+files only through the explicit legacy decoder.

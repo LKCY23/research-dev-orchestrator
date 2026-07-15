@@ -4,6 +4,17 @@ This file collects user-facing constants that scripts and references should keep
 
 The script-level source for these constants is `scripts/protocol.py`. This reference is the human-readable explanation, not an import target.
 
+## Artifact protocol
+
+```text
+2  current default for every new task and attempt
+1  recognized legacy-v1 compatibility decoder only
+```
+
+V2 artifacts declare their own `schema_version` and task status declares
+`artifact_protocol_version: 2`. Unknown versions fail closed; an unversioned
+artifact is never guessed to be v2.
+
 ## Worker Backends
 
 ```text

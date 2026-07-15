@@ -1,9 +1,9 @@
 # Backend Governance And Attempt Compilation
 
-Status: Claude Code, Codex, Kimi Code, and OpenCode baselines implemented in v0.4. Backend contracts,
-project policy, strategy binding, pure profile compilation, attempt-local
-settings, native-agent governance, profile integrity checks, and handoff
-violation gates are implemented with adapter-specific enforcement.
+Status: Claude Code, Codex, Kimi Code, and OpenCode baselines are implemented.
+Backend contracts, project policy, strategy binding, pure profile compilation,
+attempt-local settings, native-agent governance, profile integrity checks, and
+handoff violation gates use adapter-specific enforcement.
 
 ## Purpose And Scope
 
@@ -34,6 +34,7 @@ The design separates durable policy from task intent and attempt-local settings.
 | Task limits | `EXECUTION_POLICY.json` | one task | task creator/coordinator |
 | Approved execution intent | `STRATEGY-vNNN.json` and review digest | one strategy revision | worker proposes, coordinator approves |
 | Compiled backend profile | `attempts/<id>/runtime/BACKEND_PROFILE.json` | one attempt | dispatch |
+| Compiled read policy | `attempts/<id>/runtime/READ_POLICY.json` | one attempt | dispatch |
 | Native CLI settings | attempt-local settings, environment, hooks, and argv | one attempt process | backend adapter |
 | Runtime facts | supervisor, workflow, command, usage, and backend event logs | one attempt | supervisor and backend monitor |
 
@@ -83,7 +84,49 @@ process_level_native_agent_control = false
 
 Capability names and backend-specific validation may differ between adapters.
 RDO must not add placeholder capabilities merely to make backend files look
-uniform.
+uniform. Context access uses a thin, versioned backend adapter rather than
+duplicating native tool facts as booleans. The compiled profile records
+the selected adapter, its version, enforced tools, known gaps, and one of these
+enforcement levels:
+
+| Backend | Attempt-local interception | Declared level |
+| --- | --- | --- |
+| Claude Code | `PreToolUse` for `Read`, `Grep`, and `Glob` | `tool_blocking` |
+| Kimi Code | `PreToolUse` for `Read`, `Grep`, and `Glob` | `fail_open_tool_blocking` |
+| OpenCode | `tool.execute.before` plugin for `read`, `grep`, and `glob` | `tool_blocking` |
+| Codex | `PreToolUse` classification of common Bash reads/searches | `best_effort` |
+
+These labels are intentionally not flattened into a claim that every backend
+has the same enforcement strength.
+
+The levels describe interception of the listed native read/search tools only.
+Even `tool_blocking` is not arbitrary filesystem mediation: shell commands,
+Python scripts, alternate tools, backend bugs, or unsupported native surfaces
+may bypass it. Context governance is a deterministic efficiency,
+discovery-shaping, and audit guardrail; it is not a confidentiality boundary
+or hostile sandbox. Security isolation must come from the backend sandbox or
+operating system.
+
+## Context Access
+
+`EXECUTION_POLICY.json.read_paths` is independent of writable
+`allowed_paths`. New tasks default it to the write scope for a narrow starting
+surface; existing policies without the field retain `.` for compatibility.
+`CONTEXT.md` is a frozen decision capsule. Explicit on-demand source exceptions
+come only from `EXECUTION_POLICY.json.context_sources`; Markdown formatting is
+never interpreted as access policy.
+
+The attempt-local `READ_POLICY.json` is generated, not hand-maintained. The
+Context Broker uses `rg` for bounded search and a deterministic Markdown heading
+parser for section retrieval. Results include source digests and request
+metadata. It does not call an LLM or a document-extraction agent.
+
+The first policy version is deliberately stateless: it rejects other
+worktrees, forbidden/out-of-scope paths, and unbounded reads of large Markdown
+outside the write scope. It has no cumulative byte budget, counter, or lock.
+The same evaluator is used by native hooks/plugins and the CLI Broker. Backend
+adapters only normalize tool names and arguments; policy semantics remain in
+one deterministic Python module.
 
 ### Shipped Governance Defaults
 
@@ -233,7 +276,7 @@ Example `BACKEND_PROFILE.json`:
       "enforcement": "post_validated"
     }
   ],
-  "generated_files": ["claude-settings.json"],
+  "generated_files": ["READ_POLICY.json", "claude-settings.json"],
   "environment": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
@@ -342,6 +385,18 @@ multi-agent off. Execution is stricter: a strategy that declares
 All Codex settings are passed as one-invocation `-c` overrides. RDO does not
 write `~/.codex/config.toml`.
 
+RDO also injects one attempt-scoped `PreToolUse` hook for `Bash`. It recognizes
+common direct reads (`cat`, `head`, `tail`, bounded `sed`), searches
+(`rg`, `grep`), and listings (`find`, `ls`), then evaluates their resolved paths
+against `READ_POLICY.json`. RDO worker launches use
+`--dangerously-bypass-hook-trust` because dispatch already generated and bound
+the exact hook command; the flag bypasses hook-definition trust, not command
+approvals or sandbox policy. This
+adapter is recorded as `best_effort`: complex shell
+syntax, indirect Python/shell scripts, and native file tools that do not expose
+a stable hook payload can bypass its classifier. It is an efficiency guardrail,
+not a filesystem security boundary.
+
 Codex `plain + machine` worker invocations use `codex exec
 --ignore-user-config` and all Codex worker invocations set
 `skills.include_instructions=false` for the attempt. Authentication is still
@@ -368,12 +423,15 @@ hook rules. It never edits `~/.kimi-code`.
 - `KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY` bounds swarm fanout;
 - `background.max_running_tasks` bounds background tasks;
 - `PreToolUse` and subagent lifecycle hooks audit foreground concurrency;
+- a separate `Read|Grep|Glob` `PreToolUse` hook evaluates the common read policy;
 - Kimi's native subagents have depth one, recorded as a backend-native limit.
 
 Kimi documents hooks as fail-open on crash or timeout. RDO therefore does not
 claim that foreground hook admission is an absolute security boundary. A hook
 failure or post-start excess is a hard violation that invalidates handoff. The
-native swarm/background controls remain independent of hook execution.
+native swarm/background controls remain independent of hook execution. Context
+interception carries the same fail-open qualification and is recorded as
+`fail_open_tool_blocking` rather than absolute enforcement.
 
 ## OpenCode Adapter
 
@@ -395,6 +453,13 @@ The local server is bound to `127.0.0.1` with a random per-attempt password and 
 terminated with the attempt process group. `OPENCODE_CONFIG_CONTENT` is applied
 only to that server. Project policy may additionally request `--pure` to disable
 external plugins.
+
+When pure mode is off, dispatch also supplies an attempt-local OpenCode plugin
+directory. Its `tool.execute.before` hook normalizes `read`, `grep`, and `glob`
+arguments and calls the shared policy evaluator before execution. Adapter errors
+fail closed. Pure mode cannot load the plugin, so the compiled profile downgrades
+context access to the prompt-and-CLI advisory adapter instead of claiming hard
+interception.
 
 ## Runtime Events And Violations
 

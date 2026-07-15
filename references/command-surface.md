@@ -18,17 +18,23 @@ Worker-only commands:
 ```text
 rdo strategy submit|revise
 rdo workflow start|heartbeat|complete [--review-evidence REVIEWER_ID=ARTIFACT_PATH]
-rdo exec --attempt-dir <path> --workflow-id <id> --instance-id <id> --timeout <seconds> [--acceptance] -- <command>
-rdo finalize --task-dir <path> --state verified|review|blocked --summary <text>
+rdo exec --attempt-dir <path> --workflow-id <id> --instance-id <id> --timeout <seconds> -- <non-acceptance-command>
+rdo check --attempt-dir <path> --check-id <acceptance-id>
+rdo finalize --attempt-dir <path> --state verified|review|blocked --summary <text>
 ```
 
 Workers may submit artifacts and runtime events, but may not approve strategy, mutate `STATUS.json`, or merge.
-`rdo strategy submit|revise` and `rdo finalize` commit an attempt-bound
-`COMPLETION.json` only after their handoff artifacts are durable. In
-`tmux + human`, this allows deterministic worker shutdown; it does not perform
-coordinator review or a task-state transition.
+`rdo check` selects exact `argv`, `cwd`, and timeout from the attempt's frozen
+acceptance contract and appends a structured supervised record. Free text and
+`rdo exec --acceptance` cannot satisfy a v2 acceptance gate.
 
-`rdo handoff` remains a compatibility surface. New prompts use `rdo finalize`, which derives acceptance commands and changed files instead of requiring workers to hand-author three overlapping handoff artifacts.
+`rdo strategy submit|revise` and `rdo finalize` publish the attempt-local
+`HANDOFF_READY.json` only after immutable handoff and evidence artifacts are
+durable. In `tmux + human`, this allows deterministic worker shutdown; it does
+not perform coordinator review or a task-state transition.
+
+`rdo handoff`, task-root handoff/evidence, free-text command evidence, and
+`COMPLETION.json` remain legacy-v0.5/v1 compatibility surfaces only.
 
 `--review-evidence` is accepted only when completing a strategy-declared independent review workflow. Repeat it once per reviewer; artifacts must be non-empty files under the current attempt's `runtime/reviews/`, and reviewer IDs must match observed backend agent lifecycle events.
 
@@ -103,7 +109,10 @@ $research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>"
 
 Purpose: create a task packet with an explicit execution profile. Use Direct for small low-risk work, Delegated for independent coordinator review without strategy ceremony, and Full for strategy-gated work.
 
-Action: run `scripts/create_task.py`, then fill task context and acceptance details when needed.
+Action: run `scripts/create_task.py`, then complete every required v2
+task/context/acceptance section and machine contract before dispatch. The
+scaffold intentionally remains unready until those coordinator-owned details
+are supplied.
 
 ### dispatch
 
@@ -163,7 +172,8 @@ Action:
 
 ```text
 load references/review-rubric.md
-inspect STATUS.json, ATTEMPT.json, EVIDENCE.md, HANDOFF.md, logs, branch diff, allowed_paths
+resolve the current attempt bundle, then inspect STATUS.json, ATTEMPT.json,
+TASK_INPUTS.json, EVIDENCE.json, HANDOFF.json, logs, branch diff, and path policy
 produce findings and recommendation
 ```
 
@@ -192,9 +202,10 @@ transition, and appends review events. When the decision is
 `changes_requested`, subsequent planning and execution prompts include the
 digest-verified findings until a newer task review decision supersedes them.
 
-An `approved` decision also binds the exact clean task-branch commit, source
-branch, run target branch/commit, and current evidence/handoff digests. Merge
-rejects any task commit or reviewed artifact changed after approval.
+An `approved` v2 decision binds the exact clean task-branch commit, source
+branch, run target branch/commit, task inputs, handoff, evidence, and READY
+digests. Merge rejects any task commit or reviewed artifact changed after
+approval.
 
 ### merge
 
@@ -203,8 +214,6 @@ python scripts/rdo.py task merge \
   --task-dir <task-dir> \
   --target-worktree <path> \
   --expected-commit <commit> \
-  [--verify-command "pytest -q"] \
-  [--verification-timeout 300] \
   --coordinator <coordinator-id>
 ```
 
@@ -219,16 +228,30 @@ same command resumes verification and protocol recording. Repeated completed
 invocations do not duplicate `task_merged` events. No `MERGE.json` artifact is
 created.
 
-Optional post-merge commands run as parsed argv without a shell and write one
-task-local `logs/post-merge.log`. A failed post-merge command returns non-zero
-but the task remains truthfully `merged`, because RDO never rewinds a target
-branch after Git has accepted the commit.
+For v2, pre/post-merge commands come only from the frozen canonical
+`ACCEPTANCE.md`; free `--verify-command` input is rejected. A failed post-merge
+command returns non-zero but the task remains truthfully `merged`, because RDO
+never rewinds a target branch after Git has accepted the commit. Legacy-v1
+retains its historical optional `--verify-command` surface.
+
+Every v2 merge records a verification object. If `verification.passed` is
+false, Git truth remains `merged` and the merge command returns non-zero, but
+dependency resolution exposes the task as `merged_unverified`; it cannot
+satisfy another task's `required_state = merged` readiness gate. The
+coordinator must arrange explicit remediation or a revision/repair task rather
+than pretending the target branch was unmerged. The command appends the
+`task_merged` event before advancing `STATUS.json`; replay can complete a
+missing status transition. A historical `STATUS = merged`/missing-event crash
+window is recovered conservatively with `verification.passed = false`.
 
 Natural-language intent:
 
 ```text
-$research-dev-orchestrator merge run=<run-id> task=<task-id> target-worktree=<path> [commit=<sha>] [verify="<command>"]
+$research-dev-orchestrator merge run=<run-id> task=<task-id> target-worktree=<path> [commit=<sha>]
 ```
+
+Only an explicitly recognized legacy-v0.5/v1 task may map a separately supplied
+verification command to its compatibility CLI option.
 
 ### recover-lock
 

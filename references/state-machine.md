@@ -15,7 +15,10 @@ Task state models task progress only. Worker/process lifecycle belongs in `ATTEM
 - `review`: dispatch validated the worker's `review` request and evidence/handoff artifacts.
 - `changes_requested`: the coordinator reviewed the task and requires fixes before approval.
 - `approved`: the coordinator reviewed the diff and evidence, verified mergeability against the target branch, and passed required integration smoke tests. The task is ready to merge but has not yet been merged.
-- `merged`: the approved branch has been merged into the target branch, post-merge status is recorded, post-merge smoke test result is recorded if required by `ACCEPTANCE.md`, and result/final artifacts are updated when applicable.
+- `merged`: the approved branch commit is contained by the target branch and
+  the post-merge result is recorded. This is an irreversible Git fact, not an
+  assertion that post-merge verification passed; a failed v2 verification is
+  exposed to dependencies as `merged_unverified`.
 - `failed`: the coordinator determines the task should stop under current requirements.
 
 ## Writer Boundaries
@@ -28,7 +31,9 @@ Task state models task progress only. Worker/process lifecycle belongs in `ATTEM
 - Execution may request `running -> strategy_review` with a checkpoint and valid new strategy revision.
 - Workers must not mutate `STATUS.json` terminal state. Direct workers request `verified`; Delegated and Full workers request `review`; any profile may request `blocked`.
 - Dispatch applies validated `running -> verified|review|blocked` transitions after worker exit.
-- Coordinator review may perform `review -> approved`, `review -> changes_requested`, `review -> failed`, `blocked -> failed`, and `approved -> merged`.
+- Coordinator review may perform `review -> approved`, `review -> changes_requested`,
+  `review -> failed`, and `blocked -> failed`. The coordinator-owned merge gate
+  performs `verified|approved -> merged`.
 - `collect_status.py` is read-only and must never mutate state.
 
 Workers must not write `STATUS.json` states. Planning workers request strategy review through immutable strategy artifacts; execution workers request `review`, `blocked`, or a strategy revision through validated handoff artifacts. If a worker believes failure is irrecoverable, it must request `blocked` with a concrete reason.
@@ -49,8 +54,9 @@ Create a new task such as `T001R1-*` when scope, acceptance criteria, design, or
 
 Do not mark `approved` because code appears reasonable. Before `review -> approved`, Codex must verify diff quality, acceptance evidence, allowed/forbidden paths, mergeability, integration smoke tests, and lock/blocker state.
 
-The immutable task review decision binds the exact approved task commit and
-reviewed evidence/handoff digests. `rdo task merge` is the public coordinator
-surface for `approved|verified -> merged`; it performs only a fast-forward merge
-and reconciles a prior Git merge by ancestry instead of relying on an additional
-merge transaction artifact.
+For v2, the immutable task review decision binds the exact approved task commit
+and the reviewed task-input/evidence/handoff/READY digests. Direct `verified`
+binds the same attempt-local closure plus its worker self-review. `rdo task
+merge` is the public coordinator surface for `approved|verified -> merged`; it
+performs only a fast-forward merge and reconciles a prior Git merge by ancestry
+instead of relying on an additional merge transaction artifact.

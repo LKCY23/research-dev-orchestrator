@@ -3,6 +3,14 @@
 `EVENTS.ndjson` is the append-only machine-readable timeline for a run. It is required for long-running, cross-session work.
 
 Each line is one JSON object. Do not rewrite old lines during normal operation.
+Protocol writers serialize appends with an event-journal lock, use `O_APPEND`
+complete-write loops, and `fsync` before returning. If a process is interrupted
+mid-record, readers may ignore only one malformed unterminated final record;
+malformed complete or interior records remain violations. The next protocol
+append quarantines that trailing byte fragment under `diagnostics/`, truncates
+only the fragment, and then durably appends the new event.
+`.EVENTS.ndjson.lock` is an internal advisory writer lock and may persist after
+an append; its existence does not mean a dispatch or worker is active.
 
 ## Required Fields
 
@@ -72,10 +80,12 @@ Attempt-local `runtime/USAGE.ndjson` is a separate high-volume ledger, not part 
 `dispatch_lock_removed` records a user-approved recovery action that removed a stale `.dispatch-lock`. It must include `task_id`, should include `attempt_id` when known, and should include `reason` plus a diagnostics `snapshot` path.
 
 `task_merged` records the exact merged `commit`, source branch, target branch,
-and coordinator identity. When post-merge verification was requested, it also
-contains structured command results and the task-local log path. A matching
-`task_id + commit` identifies an already-recorded merge for idempotent replay;
-no separate merge identifier or `MERGE.json` is required.
+and coordinator identity. Every v2 event also contains `attempt_id`, the exact
+`artifact_binding`, and a `verification` object; only legacy verification is
+optional. A matching `task_id + commit` identifies an already-recorded merge
+for idempotent replay; no separate merge identifier or `MERGE.json` is
+required. A v2 event with `verification.passed = false` preserves Git truth but
+does not satisfy downstream merged dependencies.
 
 ## Validation
 

@@ -38,6 +38,10 @@ STATUS.state = running but ATTEMPT.state is completed or invalid_handoff
 
 These are triggers for judgment, not automatic deletion rules.
 
+A completed attempt with an active `STATUS.json` may be the recoverable
+dispatcher inter-write window. Retry the same handoff validation before
+considering manual lock removal; never repair `STATUS.json` by hand.
+
 ## Review Checklist
 
 Inspect:
@@ -47,11 +51,13 @@ STATUS.json
 ATTEMPT.json
 LOCK
 .dispatch-lock/*
-attempts/<attempt>/transcript.log
+attempts/<attempt>/runtime/STARTUP.json
+attempts/<attempt>/runtime/transcript.log
 attempts/<attempt>/result.md
+attempts/<attempt>/runtime/HANDOFF_READY.json
+attempts/<attempt>/HANDOFF.json
+attempts/<attempt>/EVIDENCE.json
 recent EVENTS.ndjson entries
-HANDOFF.md
-EVIDENCE.md
 git worktree and branch state
 .dispatch-lock/pid liveness
 whether transcript.log is still growing
@@ -94,11 +100,14 @@ Will:
 Will not:
   modify STATUS.json
   modify ATTEMPT.json
-  modify HANDOFF.md
-  modify EVIDENCE.md
+  modify TASK_INPUTS.json, HANDOFF.json, EVIDENCE.json, or HANDOFF_READY.json
   remove LOCK
   change FSM state
 ```
+
+For a recognized legacy-v0.5/v1 task, also inspect and preserve its historical
+task-root `HANDOFF.md`, `HANDOFF.json`, and `EVIDENCE.md`. Those paths are not
+used by v2 recovery.
 
 ## Mechanical Cleanup
 

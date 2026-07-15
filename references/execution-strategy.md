@@ -9,7 +9,11 @@ backends accept only controls their adapters implement. See
 
 Execution strategy is a task-level, coordinator-reviewed contract. It allows workers to use multiple workflows, skills, and subagents without giving unreviewed work an unlimited runtime or scope.
 
-`EXECUTION_POLICY.json` copies the task's allowed and forbidden paths into the deterministic policy envelope. A workflow may narrow an allowed path, but may not widen it or overlap a forbidden path.
+`EXECUTION_POLICY.json` separates writable `allowed_paths` from discovery
+`read_paths` and carries forbidden paths in the deterministic policy envelope.
+A workflow may narrow an allowed path, but may not widen it or overlap a
+forbidden path. Attempt compilation combines this boundary with the
+explicit `EXECUTION_POLICY.json.context_sources` in `runtime/READ_POLICY.json`.
 
 ## Artifacts
 
@@ -124,11 +128,22 @@ Acceptance command records are deliberately attempt-local. A strategy whose requ
 
 An independent review workflow must declare `kind: "review"` and `review: {"mode": "independent", "required_reviewers": N}`. It must use read-only `native_subagents` with `max_agents >= N`. Each reviewer writes a non-empty artifact under `runtime/reviews/`; completion supplies `--review-evidence REVIEWER_ID=ARTIFACT_PATH`. RDO accepts completion only when the reviewer IDs are distinct and appear in backend lifecycle events. A primary worker cannot declare its own scan to be independent review.
 
-Commands run through `rdo exec` are bounded and audited. Only commands explicitly marked `--acceptance` participate in `completion_gate.acceptance_commands_pass`; exploratory failures remain evidence but do not permanently poison a later valid handoff.
+Non-acceptance workflow commands run through `rdo exec` are bounded and
+audited as workflow activity. Required acceptance commands run only through
+`rdo check --check-id <id>`, which selects the exact argv, cwd, and timeout from
+the frozen `ACCEPTANCE.md` contract and writes attempt-local structured command
+records. Legacy `rdo exec --acceptance` records cannot satisfy a v2 completion
+gate; exploratory command failures likewise do not become acceptance evidence.
 
 Completion gates are enforced at the earliest deterministic boundary. When completing a workflow would satisfy all required workflows, `rdo workflow complete` validates required workflow completion, acceptance command records, command outcomes, and timeout policy before appending `workflow_completed`. A failed gate leaves the workflow instance active so the worker may add the missing acceptance record and retry completion without consuming another `max_instances` slot.
 
-After the final required workflow completes, RDO writes attempt-local `runtime/FINALIZATION.json`. The worker must call `rdo finalize` once; it derives command evidence and changed paths, then atomically writes `EVIDENCE.md`, `HANDOFF.md`, `HANDOFF.json`, and `COMPLETION.json`.
+After the final required workflow completes, RDO writes attempt-local
+`runtime/FINALIZATION.json`. Required acceptance commands must already have run
+through `rdo check`. The worker then calls `rdo finalize` once; it validates
+those structured records and the clean committed worktree, freezes
+`EVIDENCE.json` and `HANDOFF.json`, and publishes `runtime/HANDOFF_READY.json`
+last. Legacy-v1 retains its historical Markdown/COMPLETION artifacts only on
+the explicit compatibility path.
 
 ## Multiple Workflows
 

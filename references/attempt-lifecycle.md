@@ -25,7 +25,8 @@ terminates as `worker_startup_failed`. Tmux human startup records
 `tui_process_started -> prompt_submitted`, with `tui_startup_failed` when the
 best-effort submission path fails. Startup evidence is separate from handoff
 evidence and does not grant a task terminal state.
-collect_status.py validates invariants across STATUS, ATTEMPT, LOCK, EVENTS, EVIDENCE, and HANDOFF.
+collect_status.py validates invariants across task status, the current attempt,
+locks, events, and the version-routed artifact publication.
 No destructive overwrite; use a new run, new attempt, or revision task.
 ```
 
@@ -46,14 +47,19 @@ If `.dispatch-lock` exists while `STATUS.state` is neither `planning` nor `runni
 
 ```json
 {
+  "schema_version": 2,
+  "artifact_protocol_version": 2,
   "attempt_id": "A001-claude-x4p9a",
   "task_id": "T001-name",
+  "task_inputs_ref": "TASK_INPUTS.json",
+  "task_inputs_sha256": "...",
   "role": "worker",
   "phase": "execution",
   "strategy_id": "T001-S001",
   "strategy_sha256": "...",
   "backend_profile_sha256": "...",
   "backend_settings_sha256": "...",
+  "read_policy_sha256": "...",
   "backend_id": "claude-code",
   "agent": "claude-code",
   "agent_name": "claude-worker-1",
@@ -104,6 +110,7 @@ phase: planning|execution
 strategy_id/strategy_sha256: required for Full execution; null for planning and Direct/Delegated execution
 backend_profile_sha256: digest of the pure compiled backend profile
 backend_settings_sha256: digest of generated native settings when the backend uses them
+read_policy_sha256: digest of runtime/READ_POLICY.json; handoff fails if it drifts
 started_at: non-empty valid ISO timestamp
 ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff
 exit_code: null for created/running; integer for completed; integer or null for invalid_handoff
@@ -123,7 +130,11 @@ verified_commit: exact finalize-time Git HEAD for a completed Direct verified at
 
 - `created`: `ATTEMPT.json` exists, but the worker has not been launched yet. This should be brief; stale `created` attempts should be reported as warnings.
 - `running`: the worker process is executing.
-- `completed`: the worker exited, wrote a valid `HANDOFF.json` request, and dispatch applied the requested terminal task state.
+- `completed`: dispatch validated the handoff and durably recorded the terminal
+  attempt result. It normally applies the corresponding task transition
+  immediately afterward. A crash between those writes may temporarily leave
+  `STATUS.json` active while the attempt is completed; replay must revalidate
+  the same publication and complete only the missing transition.
 - `invalid_handoff`: the worker exited but did not produce a legal handoff request, evidence bundle, or process result.
 
 If a tmux runner writes an empty or non-integer `exit_code` file, classify the attempt as `invalid_handoff`, set `ended_at`, leave `exit_code = null`, append `worker_exit_without_valid_status`, and release `.dispatch-lock` after diagnostics.
@@ -137,7 +148,7 @@ Do not use attempt state to represent task success. `completed` means the attemp
 `handoff_valid` must be:
 
 ```text
-true   when dispatch validated HANDOFF.json and applied STATUS.state to strategy_review, verified, review, or blocked
+true   when dispatch validated and persisted the handoff; the matching STATUS transition normally follows immediately, except during the recoverable inter-write crash window
 false  when the worker exited without a legal handoff
 null   before handoff validation
 ```
@@ -152,37 +163,40 @@ blocked
 null
 ```
 
-## Interactive Completion Signal
+## Interactive Handoff Publication
 
-`COMPLETION.json` is an attempt-local commit marker used only to end a
-`tmux + human` worker that may otherwise remain at its TUI input prompt:
+Artifact Protocol v2 uses
+`attempts/<attempt-id>/runtime/HANDOFF_READY.json` only to end a supervised
+worker that may otherwise remain at its input prompt:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "artifact_protocol_version": 2,
+  "publication": "handoff_ready",
   "task_id": "T001-name",
   "attempt_id": "A001-claude-x4p9a",
-  "phase": "planning",
-  "requested_state": "strategy_review",
+  "attempt_ref": "ATTEMPT.json",
+  "attempt_binding_sha256": "...",
+  "task_inputs_ref": "TASK_INPUTS.json",
+  "task_inputs_sha256": "...",
+  "handoff_ref": "HANDOFF.json",
   "handoff_sha256": "...",
-  "strategy_sha256": "...",
-  "source_commit": null,
-  "completed_at": "2026-07-14T00:00:00Z"
+  "evidence_ref": "EVIDENCE.json",
+  "evidence_sha256": "...",
+  "requested_state": "review",
+  "source_commit": "...",
+  "source_commit_sha256": "..."
 }
 ```
 
-It is written atomically and last by `rdo strategy submit|revise` or `rdo
-handoff`. It is not task state, approval, or final handoff validation. A valid
-signal lets the attempt supervisor stop the interactive process; dispatch still
-owns worktree checks, `HANDOFF.json` validation, `ATTEMPT.json` completion, and
-the task FSM transition. A previous attempt's signal cannot complete a newer
-attempt.
-
-For a Direct `verified` handoff, `rdo finalize` freezes the clean task branch
-HEAD in both `HANDOFF.json.source_commit` and `COMPLETION.json.source_commit`.
-The completion digest binds the handoff, and dispatch requires the worktree HEAD
-after worker exit to remain equal to that frozen commit before it records
-`ATTEMPT.json.verified_commit` or grants `STATUS.state = verified`.
+It is create-once and written last by `rdo strategy submit|revise` or `rdo
+finalize`. It is not task state, approval, or final handoff validation. A valid
+marker lets the attempt supervisor stop the process; dispatch still owns
+worktree comparison, bundle and acceptance validation, `ATTEMPT.json`
+completion, source-commit comparison, and the task FSM transition. A previous
+attempt's marker cannot complete a newer attempt. Recognized legacy-v0.5/v1 attempts
+retain their historical `COMPLETION.json` decoder.
 
 ## Task State Invariants
 
@@ -200,7 +214,15 @@ the current attempt phase is execution
 for Full tasks, the referenced strategy revision has an approved matching SHA-256 review
 ```
 
-`STATUS.state = planning` has the same active-attempt and lock invariants, but requires `ATTEMPT.phase = planning`. A planning attempt may not mutate the task worktree.
+The only v2 recovery exception is a completed, valid, publication-matching
+attempt during the bounded dispatcher inter-write grace period. It still
+requires the matching live dispatch PID and both locks; audit emits a warning
+until replay completes the missing task transition. After the grace period, or
+when any identity/binding check fails, the same shape is a violation.
+
+`STATUS.state = planning` has the same active-attempt and lock invariants, but
+requires `profile = full` and `ATTEMPT.phase = planning`. A planning attempt may
+not mutate the task worktree.
 
 `STATUS.state = strategy_review` requires no active `.dispatch-lock`, a completed planning or revision-request attempt, and a valid immutable strategy revision awaiting or holding coordinator review.
 
@@ -210,15 +232,17 @@ for Full tasks, the referenced strategy revision has an approved matching SHA-25
 ATTEMPT.state = completed
 ATTEMPT.handoff_valid = true
 ATTEMPT.handoff_state = review
-HANDOFF.json exists with _template=false and requested_state=review
+HANDOFF.json exists in the current attempt with requested_state=review
 STATUS.state_history ends with running -> review by actor dispatch
 STATUS.previous_state = running
 worker exit_code = 0
-EVIDENCE.md has substantive content
-HANDOFF.md has substantive content
+the current attempt has a valid immutable EVIDENCE.json/HANDOFF.json/READY bundle
 ```
 
-`STATUS.state = verified` requires a Direct task, the same completed/valid/zero-exit invariants, `ATTEMPT.handoff_state = verified`, `HANDOFF.json.requested_state = verified`, and `HANDOFF.json.self_review.passed = true`.
+`STATUS.state = verified` requires a Direct task, the same
+completed/valid/zero-exit invariants, `ATTEMPT.handoff_state = verified`, the
+current attempt's `HANDOFF.json.requested_state = verified`, and
+`HANDOFF.json.direct_self_review.performed/passed = true`.
 
 `STATUS.state = blocked` requires:
 
@@ -227,8 +251,9 @@ Either:
   ATTEMPT.state = completed
   ATTEMPT.handoff_valid = true
   ATTEMPT.handoff_state = blocked
-  HANDOFF.json exists with _template=false and requested_state=blocked
-  HANDOFF.md has substantive content
+  current attempt has a valid immutable EVIDENCE.json/HANDOFF.json/READY bundle
+  HANDOFF.json.requested_state = blocked
+  HANDOFF.json.conditional_blocker states the concrete condition
   worker exit_code may be zero or nonzero
 or:
   ATTEMPT.state = invalid_handoff
@@ -243,7 +268,17 @@ blocking_reason non-empty
 
 If a worker mutates `STATUS.json` directly, dispatch must not trust that terminal state. It should mark the attempt `invalid_handoff`, move the task to `blocked` with `blocker_type = needs_coordinator`, and leave evidence for coordinator triage.
 
-If `STATUS.state = running` and `ATTEMPT.state` is `completed` or `invalid_handoff`, report a protocol violation. Dispatch normally moves terminal attempts to `review` or `blocked`; a running task with a terminal attempt means supervision or protocol mutation failed.
+Monitoring labels any candidate handoff bytes from an `invalid_handoff`
+attempt as `publication_state = rejected`. They remain available for audit,
+but the resolved bundle is null and review, approval, merge, and dependency
+consumers must reject them.
+
+If `STATUS.state` is active while `ATTEMPT.state = completed` and
+`handoff_valid = true`, first treat it as the recoverable dispatcher
+inter-write window: replay the same validation and apply only the missing
+transition. If replay fails, identities differ, or no matching publication
+exists, report a protocol violation. An active task with
+`ATTEMPT.state = invalid_handoff` remains a protocol violation.
 
 For `runtime.backend = tmux`, if `attempts/<current_attempt_id>/exit_code` exists while `STATUS.state = running` and `ATTEMPT.state = running`, classify it by supervision evidence:
 
@@ -268,12 +303,16 @@ STATUS.json
 TASK.md
 CONTEXT.md
 ACCEPTANCE.md
-EVIDENCE.md
-HANDOFF.md
+EXECUTION_POLICY.json
 attempts/*
 EVENTS.ndjson
 JOURNAL.md
 reviews/*
 ```
+
+Within a v2 attempt, `TASK_INPUTS.json`, `EVIDENCE.json`, `HANDOFF.json`, and
+`runtime/HANDOFF_READY.json` are create-once immutable. Historical task-root
+`EVIDENCE.md`/`HANDOFF.md` are audit-bearing only for recognized legacy-v0.5/v1
+tasks; they are not v2 protocol files.
 
 Use a new attempt for implementation retries, normally with `execution_mode=resume` and the same worker/session. Use a revision task such as `T001R1-*` when task scope, acceptance criteria, profile, or design changes.

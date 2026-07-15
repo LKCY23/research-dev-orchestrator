@@ -13,6 +13,13 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 
 - The coordinator owns intent, task routing, acceptance criteria, and merge decisions. It owns independent code review for Delegated and Full tasks; Direct workers own their own implementation review.
 - Workers own execution: implement only assigned task packets, test, self-review, fix their findings, and call `rdo finalize`. RDO derives evidence and handoff artifacts atomically; workers must not edit `STATUS.json` terminal state.
+- Artifact Protocol v2 is the default for new tasks. Dispatch must validate and
+  freeze `TASK.md`, `CONTEXT.md`, `ACCEPTANCE.md`, and
+  `EXECUTION_POLICY.json` before any attempt, lock, worktree, or running-state
+  mutation. Recognized v1 runs use only the explicit legacy decoder.
+- Run required acceptance commands through `rdo check`; legacy `rdo exec --acceptance`,
+  free-text command claims, and task-root handoff/evidence files
+  cannot satisfy a v2 gate.
 - Execution workers commit task changes on their assigned branch and leave the worktree clean before final handoff.
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
@@ -75,7 +82,10 @@ This is the canonical default progression. A stage-aware entry may begin later o
 4. Decompose work into task packets using `references/task-packet-template.md`.
 5. Create a run with `scripts/init_run.py` if no run exists.
 6. Create tasks with `scripts/create_task.py`.
-7. Dispatch a planning attempt, review its strategy revision, then dispatch execution only when task state and approved strategy digest allow it.
+7. Route the task by profile. Direct and Delegated dispatch execution after
+   readiness; Full dispatches a read-only planning attempt, reviews the exact
+   strategy revision, and dispatches execution only after digest-bound
+   approval.
 8. Collect state with `scripts/collect_status.py`; use `--json` for machine consumers and `--write-summary` for `SUMMARY.md`. Use `scripts/render_dashboard.py` when the user wants a visual run monitor.
 9. Review tasks manually using `references/review-rubric.md`.
 10. Only mark `approved` after diff review, evidence review, mergeability verification, and required integration smoke tests pass.
@@ -94,6 +104,8 @@ Read references only when they are needed:
 - `references/reproducibility-template.md`: use for environment, seed, data, command, and expected-output contracts.
 - `references/result-ledger-template.md`: use to record experiment results and claim support.
 - `references/task-packet-template.md`: use before creating or editing task packets.
+- `references/artifact-protocol-v2.md`: use before dispatch, finalization,
+  attempt-artifact review, approval, merge, or legacy/v2 compatibility work.
 - `references/state-machine.md`: use for human-readable FSM semantics.
 - `references/state-machine.json`: use as the authoritative machine-readable FSM.
 - `references/status-schema.md`: use before writing or reviewing `STATUS.json`.
@@ -146,7 +158,7 @@ $research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>"
 $research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
 $research-dev-orchestrator status run=<run-id> [json] [summary] [dashboard] [diagnostics]
 $research-dev-orchestrator review run=<run-id> task=<task-id>
-$research-dev-orchestrator merge run=<run-id> task=<task-id> target-worktree=<path> [commit=<sha>] [verify="<command>"]
+$research-dev-orchestrator merge run=<run-id> task=<task-id> target-worktree=<path> [commit=<sha>]
 $research-dev-orchestrator recover-lock run=<run-id> task=<task-id>
 $research-dev-orchestrator close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
 ```
@@ -155,7 +167,10 @@ Read `references/command-surface.md` before acting on these intents. `review` do
 
 `init_run.py` scaffolds only. It must not make substantive research, design, or architecture decisions.
 
-`create_task.py` creates `pending` tasks only. It must not overwrite existing tasks, dispatch, create locks, or merge.
+`create_task.py` creates `pending` v2 task scaffolds only. It must not overwrite
+existing tasks, dispatch, create locks, or merge. The coordinator must complete
+the required task/context/acceptance contract before readiness permits
+dispatch.
 
 `protocol.py` is used by scripts for constants, template rendering, JSON helpers, and event append. Users should not call it directly.
 
@@ -175,8 +190,10 @@ legal `review -> approved|changes_requested|failed` transition, and makes
 
 `rdo.py task merge` is the coordinator-owned merge mutation. It derives the
 approved source and run target from protocol state, permits only a clean
-fast-forward merge, verifies exact approval/fingerprint binding, and reconciles
-Git ancestry with `STATUS.json` plus the existing `task_merged` event. It does
+fast-forward merge, verifies the exact source commit and v2 artifact binding,
+and reconciles Git ancestry with `STATUS.json` plus the existing `task_merged`
+event. V2 pre/post-merge commands come only from frozen `ACCEPTANCE.md`; an ad
+hoc verification command is a legacy-v0.5/v1 compatibility option. The command does
 not create a separate merge transaction artifact or call an internal FSM helper
 from ad hoc agent code.
 
@@ -210,7 +227,7 @@ machine acknowledgement.
 
 `render_dashboard.py` writes only derived `dashboard.html` by reading the same status report as `collect_status.py`. It must not mutate protocol truth.
 
-`remove_dispatch_lock.py` is a user-approved mechanical recovery tool. Use it only after a Lock Recovery Review and explicit user confirmation. It snapshots `.dispatch-lock`, removes only `.dispatch-lock`, and appends `dispatch_lock_removed`; it must not modify `STATUS.json`, `ATTEMPT.json`, `LOCK`, `HANDOFF.md`, `EVIDENCE.md`, or FSM state.
+`remove_dispatch_lock.py` is a user-approved mechanical recovery tool. Use it only after a Lock Recovery Review and explicit user confirmation. It snapshots `.dispatch-lock`, removes only `.dispatch-lock`, and appends `dispatch_lock_removed`; it must not modify `STATUS.json`, `ATTEMPT.json`, `LOCK`, the attempt-local handoff/evidence bundle, or FSM state.
 
 `close_session.py` is the standard session closeout command. It updates derived `SUMMARY.md`, appends a human-readable `JOURNAL.md` entry, and appends a `session_closed` event to `EVENTS.ndjson`.
 
@@ -229,17 +246,30 @@ Use these files to recover context after days or weeks:
 - `reviews/*`: Codex review records.
 - `tasks/*/attempts/*`: worker execution records.
 
-`HANDOFF.json` is the canonical machine-readable worker handoff request; `HANDOFF.md` and `EVIDENCE.md` are generated human views. Worker-side `rdo strategy submit|revise` and `rdo finalize` atomically commit an attempt-bound `COMPLETION.json` after all artifacts are durable. For `tmux + human`, the supervisor may use that exact-digest signal to quiesce an otherwise idle TUI, but it must not treat it as coordinator approval or skip dispatch's final worktree and handoff validation.
+For v2, the current attempt's `HANDOFF.json` is the canonical minimal worker
+request and `EVIDENCE.json` is its frozen structured review index. Worker-side
+`rdo strategy submit|revise` and `rdo finalize` publish
+`runtime/HANDOFF_READY.json` last, binding the exact attempt inputs, source
+commit, handoff, and evidence. The supervisor may use that marker to quiesce an
+otherwise idle TUI, but it cannot approve the strategy/task or skip dispatch's
+final validation. Task-root Markdown handoff/evidence and `COMPLETION.json`
+exist only on recognized legacy-v0.5/v1 paths.
 
-Do not force a separate `DECISIONS.md` in the first version. Put non-architecture session decisions and tradeoffs in `JOURNAL.md`; add ADRs only when a decision should be durable architecture/design record.
+Do not force a separate `DECISIONS.md`. Put non-architecture session decisions
+and tradeoffs in `JOURNAL.md`; add ADRs only when a decision should be a durable
+architecture/design record.
 
 ## Review Gate
 
 Before changing `review -> approved`, verify all of the following:
 
 - The diff stays within `allowed_paths` and avoids `forbidden_paths`.
-- `EVIDENCE.md`, logs, and `STATUS.json.evidence` are consistent enough to support `ACCEPTANCE.md`.
-- Required commands and metrics passed, or failures are explicitly scoped and acceptable.
+- Resolve and validate the current attempt's complete
+  `TASK_INPUTS.json`/`EVIDENCE.json`/`HANDOFF.json`/`HANDOFF_READY.json` bundle.
+- Every required command has an exact passing `rdo check` record from this
+  attempt, and every selected log/artifact digest still matches.
+- Every required output is a tracked regular Git blob whose path, mode, object
+  ID, and content digest match the frozen source commit.
 - `ACCEPTANCE.md` lists review gate recipes: required commands, smoke tests, expected outputs, metrics or thresholds, merge preconditions, and failure handoff conditions.
 - The task branch is mergeable into the target branch, preferably with a dry-run or temporary integration worktree.
 - Required integration smoke tests pass.

@@ -47,7 +47,9 @@ The design is built around four rules:
    Requirements, experiment design, task decomposition, acceptance criteria, review, and merge decisions stay with the coordinator.
 
 2. **Workers own execution**
-   A worker receives one task packet, works in one branch/worktree, and writes evidence plus a handoff request. Dispatch owns the resulting `STATUS.json` terminal transition.
+   A worker receives one task packet, works in one branch/worktree, and publishes
+   an immutable attempt-local evidence bundle plus a handoff request. Dispatch
+   validates that bundle and owns the resulting `STATUS.json` transition.
 
 3. **Filesystem is the protocol**
    Agents communicate through repo-local files such as `STATUS.json`, `ATTEMPT.json`, `EVENTS.ndjson`, and `JOURNAL.md`.
@@ -132,7 +134,7 @@ Implementation details are intentionally secondary in the diagram:
 | Coordinator | Requirements, design, task split, review, merge decisions | `SKILL.md`, `$research-dev-orchestrator` intent surface |
 | Planning | Durable research intent and task contracts | `REQUIREMENTS.md`, `DESIGN_BRIEF.md`, `ADR/`, `EXPERIMENT_PLAN.md`, `TASK.md`, `ACCEPTANCE.md` |
 | Execution | Strategy-gated dispatch, attempt supervision, Git-isolated execution | `dispatch_agent.sh`, `dispatch_claude.sh`, `dispatch_assets.py`, agent backend registry, plain/tmux runtimes, Git worktree |
-| Run Store | Repo-local system of record for task state, attempt lifecycle, handoff evidence, event timeline, memory, results, and recovery context | `.agent-collab/runs/<run-id>/`, `STATUS.json`, `ATTEMPT.json`, `EVIDENCE.md`, `HANDOFF.md`, `EVENTS.ndjson`, `JOURNAL.md`, `RESULT_LEDGER.md` |
+| Run Store | Repo-local system of record for task state, attempt lifecycle, handoff evidence, event timeline, memory, results, and recovery context | `.agent-collab/runs/<run-id>/`, `STATUS.json`, attempt-local `TASK_INPUTS.json`/`EVIDENCE.json`/`HANDOFF.json`/`HANDOFF_READY.json`, `EVENTS.ndjson`, `JOURNAL.md`, `RESULT_LEDGER.md` |
 | Validation & recovery | Deterministic gates, read-only audit, derived reports, user-approved recovery | `validation.py`, `protocol_cli.py`, `collect_status.py`, `SUMMARY.md`, `diagnostics/` |
 
 ## Workflow
@@ -158,13 +160,13 @@ A run captures the full lifecycle: requirements, design notes, experiment plans,
 
 Full tasks use strategy-gated execution. A planning worker may inspect the repository but cannot modify the task worktree; it submits a versioned `STRATEGY-vNNN.json` containing configurable workflow definitions, dependencies, permissions, instance/concurrency limits, time budgets, and completion gates. Coordinator approval binds the exact strategy digest, not a mutable filename. Direct and Delegated tasks skip strategy planning.
 
-Execution remains flexible inside that approved envelope. A worker may start multiple instances of approved workflows and use declared subagents, but new workflow kinds, wider paths or permissions, larger budgets, or unbounded search require a new strategy revision. `supervise_attempt.py` enforces the attempt wall clock and process cleanup independently of model timeout settings; `rdo.py exec` enforces command budgets. See [execution strategy](references/execution-strategy.md), [attempt supervision](references/attempt-supervision.md), and [tmux control](references/tmux-control.md).
+Execution remains flexible inside that approved envelope. A worker may start multiple instances of approved workflows and use declared subagents, but new workflow kinds, wider paths or permissions, larger budgets, or unbounded search require a new strategy revision. `supervise_attempt.py` enforces the attempt wall clock and process cleanup independently of model timeout settings; `rdo exec` supervises non-acceptance workflow commands, while `rdo check` selects and records exact commands from the frozen acceptance contract. See [execution strategy](references/execution-strategy.md), [attempt supervision](references/attempt-supervision.md), and [tmux control](references/tmux-control.md).
 
 Strategy revisions can explicitly reuse completed work across attempts and backend changes. Dispatch verifies the terminal source attempt, source workflow completion, and exact worktree digest, then exposes carried and remaining workflows through attempt-local `RESUME_CONTEXT.json`. Acceptance evidence is always regenerated in the current attempt.
 
 Full strategies may also declare hard model-turn, token, cost, context, first-progress, and no-progress budgets. RDO enables them only for metrics the selected backend/I/O adapter can observe, records normalized usage in `runtime/USAGE.ndjson`, and terminates on violation. Independent review workflows require distinct observed reviewer agents and hashed review artifacts; the primary worker cannot self-attest independence.
 
-Backend governance is durable and adapter-specific. Strategy schema v2 binds execution to one backend; dispatch compiles backend policy, task limits, and the approved strategy before acquiring the task lock. Claude Code uses attempt-local settings and hooks; Codex uses per-invocation multi-agent settings; Kimi Code uses a temporary governed home; OpenCode uses a per-attempt permission/session supervisor. Cumulative launch enforcement is optional and disabled by default for Claude/Codex, and is not imposed on Kimi/OpenCode. User-global CLI configuration is not edited. See [backend governance](references/backend-governance.md).
+Backend governance is durable and adapter-specific. Strategy schema v2 binds execution to one backend; dispatch compiles backend policy, task limits, and the approved strategy before acquiring the task lock. Claude Code and Kimi Code use attempt-local `PreToolUse` hooks, OpenCode uses an attempt-local `tool.execute.before` plugin, and Codex uses a best-effort Bash `PreToolUse` hook. All four consume the same generated read policy and deterministic CLI Context Broker; only their interception guarantees differ. Cumulative launch enforcement is optional and disabled by default for Claude/Codex, and is not imposed on Kimi/OpenCode. User-global CLI configuration is not edited. See [backend governance](references/backend-governance.md).
 
 ## Protocol Files
 
@@ -188,39 +190,63 @@ The target repository gets a local `.agent-collab/` directory:
           TASK.md
           CONTEXT.md
           ACCEPTANCE.md
-          STATUS.json
           EXECUTION_POLICY.json
+          STATUS.json
           strategy/
             STRATEGY-v001.json
             REVIEW-v001.json
             CURRENT.json
-          EVIDENCE.md
-          HANDOFF.md
-          HANDOFF.json
           attempts/
             <attempt-id>/
-          ATTEMPT.json
-          COMPLETION.json
-          prompt.md
-              runtime/STARTUP.json
-              transcript.log
+              ATTEMPT.json
+              TASK_INPUTS.json
+              EVIDENCE.json
+              HANDOFF.json
+              prompt.md
               result.md
+              runtime/
+                HANDOFF_READY.json
+                ARTIFACT_LOCK
+                COMMANDS.ndjson
+                transcript.log
+                worktree-before.json
+                worktree-after.json
 ```
 
 Key files:
 
 - `STATUS.json`: task progress and finite-state-machine state.
-- `ATTEMPT.json`: worker execution lifecycle for one attempt.
+- `TASK.md`, `CONTEXT.md`, `ACCEPTANCE.md`, and
+  `EXECUTION_POLICY.json`: the four canonical task inputs. Dispatch refuses an
+  incomplete or inconsistent packet.
+- `attempts/<attempt-id>/TASK_INPUTS.json`: immutable derived binding to those
+  four inputs, the task base commit, and resolved dependency commits.
+- `ATTEMPT.json`: worker execution lifecycle and the exact `TASK_INPUTS.json`
+  ref/digest for one attempt.
 - `EVENTS.ndjson`: append-only machine-readable timeline.
 - `JOURNAL.md`: human-readable session memory.
 - `SUMMARY.md`: derived dashboard generated by `collect_status.py`.
 - `dashboard.html`: derived human monitor generated by `render_dashboard.py`.
-- `EVIDENCE.md`: commands, tests, metrics, outputs, and logs.
-- `HANDOFF.md`: worker handoff summary and known limitations.
-- `HANDOFF.json`: canonical machine-readable worker request for `strategy_review`, `verified`, `review`, or `blocked`; `rdo finalize` derives it together with human evidence views.
-- `attempts/<attempt-id>/COMPLETION.json`: atomic, attempt-bound request for an interactive supervisor to quiesce the worker after durable handoff; never an approval or FSM transition by itself.
+- `attempts/<attempt-id>/runtime/COMMANDS.ndjson`: raw supervised acceptance
+  facts produced only by `rdo check`.
+- `attempts/<attempt-id>/EVIDENCE.json`: frozen structured review index over
+  command records, worktree facts, required-output Git blob/mode/content
+  bindings, logs, generic artifacts, and reviewer evidence.
+- `attempts/<attempt-id>/HANDOFF.json`: minimal machine-readable request for
+  `strategy_review`, `verified`, `review`, or `blocked`.
+- `attempts/<attempt-id>/runtime/HANDOFF_READY.json`: immutable publication
+  marker written last. It asks the supervisor to quiesce the worker; it is not
+  approval, merge, or an FSM transition.
 
-See [references/state-machine.md](references/state-machine.md), [references/status-schema.md](references/status-schema.md), [references/attempt-lifecycle.md](references/attempt-lifecycle.md), and [references/events-schema.md](references/events-schema.md) for protocol details.
+Artifact Protocol v2 never creates task-root mutable handoff/evidence files.
+Recognized v0.5/v1 runs remain readable through an explicit legacy decoder and
+retain their historical `HANDOFF.md`, `EVIDENCE.md`, and `COMPLETION.json`
+layout.
+
+See [Artifact Protocol v2](references/artifact-protocol-v2.md),
+[references/state-machine.md](references/state-machine.md),
+[references/attempt-lifecycle.md](references/attempt-lifecycle.md), and
+[references/events-schema.md](references/events-schema.md) for protocol details.
 
 ## Execution State Model: Tasks and Attempts
 
@@ -294,8 +320,9 @@ Worker failure affects an attempt first, not the task directly. A completed atte
 
 ## Agent And Runtime Backends
 
-v0.5 retains the v0.4 backend and reviewed-strategy model and adds
-attempt-bound completion for interactive workers:
+Artifact Protocol v2 preserves the worker/runtime split while using
+attempt-local `HANDOFF_READY.json` as the publication signal for every new
+attempt:
 
 ```text
 worker backend  = claude-code | codex | opencode | kimi-code
@@ -315,8 +342,8 @@ delivers the initial prompt through exactly one adapter-declared channel, and
 requires a valid backend startup event within the configured startup timeout.
 `tmux + human` launches an attachable TUI and records prompt submission as
 best-effort evidence. After `rdo strategy submit|revise` or `rdo finalize`
-commits a validated attempt-bound completion signal, the supervisor quiesces
-the TUI process group; coordinator review and final dispatch validation remain
+publishes a validated attempt-bound READY marker, the supervisor quiesces the
+TUI process group; coordinator review and final dispatch validation remain
 separate.
 Unsupported pairs fail before attempt, worktree, lock, or task-state mutation.
 
@@ -419,8 +446,29 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" \
   --run-id <run-id> \
   --task-id T001-data-loader \
   --goal "Implement the dataset loader and smoke tests" \
-  --allowed-paths src tests
+  --allowed-paths src tests \
+  --read-paths src tests pyproject.toml
 ```
+
+`create_task.py` scaffolds a v2 packet; it does not invent deliverables,
+invariants, interfaces, or acceptance checks. Before dispatch, complete all
+required sections in `TASK.md`, `CONTEXT.md`, and `ACCEPTANCE.md`, including at
+least one executable required command. Dispatch runs readiness before any
+attempt, lock, worktree, or running-state mutation and rejects an incomplete
+packet.
+
+`read_paths` is a discovery boundary distinct from writable `allowed_paths`. If
+omitted for a new task it defaults to `allowed_paths`. Put frozen decisions in
+`CONTEXT.md` and list exceptional large documents explicitly in
+`EXECUTION_POLICY.json.context_sources`; workers can retrieve bounded sections
+through the deterministic Context Broker.
+The broker and policy evaluator are backend-neutral and model-free. Backend
+adapters translate supported native tool calls into that common policy. Across
+all backends this is a deterministic efficiency, discovery-shaping, and audit
+guardrail, not a confidentiality boundary or hostile filesystem sandbox;
+shell/Python indirection, alternate tools, backend bugs, and unsupported native
+surfaces may bypass it. Codex interception is additionally declared
+best-effort because its stable hook surface is narrower.
 
 Dispatch a worker:
 
@@ -478,7 +526,15 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" \
   --write-summary
 ```
 
-`dashboard.html` and `SUMMARY.md` are derived monitors, not protocol truth. The source of truth remains `RUN.json`, task `STATUS.json`, attempt `ATTEMPT.json`, `EVENTS.ndjson`, `EVIDENCE.md`, `HANDOFF.md`, `HANDOFF.json`, and `RESULT_LEDGER.md`. Protocol warnings and recovery snapshots are written under `diagnostics/`.
+`dashboard.html` and `SUMMARY.md` are derived monitors, not protocol truth. For
+v2, the source of truth remains `RUN.json`, task `STATUS.json`, the current
+attempt's `ATTEMPT.json`, `TASK_INPUTS.json`, `EVIDENCE.json`, `HANDOFF.json`,
+and `runtime/HANDOFF_READY.json`, plus `EVENTS.ndjson` and
+`RESULT_LEDGER.md`. Protocol warnings and recovery snapshots are written under
+`diagnostics/`. Monitoring may label candidate bytes `rejected` after an
+invalid handoff, but strict consumers still require a validated `published`
+bundle. Recognized legacy-v0.5/v1 runs are resolved through their separate
+historical artifact layouts.
 
 ## Versioning
 

@@ -43,17 +43,23 @@ Dispatch remains synchronous from the protocol perspective:
 
 ```text
 dispatch starts worker
-worker command commits attempt-bound COMPLETION.json
-attempt supervisor quiesces an interactive process after validating that signal
+worker finalizer publishes attempt-bound HANDOFF_READY.json last
+attempt supervisor validates that exact bundle and quiesces an interactive process
 runner writes exit_code after the process is quiescent
 dispatch waits for exit_code
 dispatch records worker exit_code
-dispatch validates handoff
-dispatch updates ATTEMPT.json and EVENTS.ndjson
+dispatch independently validates against pre-launch expected bindings
+dispatch persists the completed ATTEMPT.json result
+dispatch applies the terminal STATUS.json transition
+dispatch records events
 dispatch releases .dispatch-lock only after validation
 ```
 
-Do not introduce watcher, daemon, queue, RPC, or fire-and-forget semantics in the first version.
+Recognized legacy-v0.5/v1 attempts retain their historical `COMPLETION.json`
+publication decoder. It is not a valid v2 signal.
+
+Do not introduce watcher, daemon, queue, RPC, or fire-and-forget semantics into
+this runtime boundary.
 
 ## Configuration
 
@@ -167,21 +173,24 @@ For `tmux`:
 
 Generated tmux session names must be sanitized to avoid tmux target separators such as `:`.
 
-## Tmux Completion Truth
+## Tmux Publication And Exit Truth
 
 Do not rely only on `tmux wait-for`. It can miss fast signals if dispatch starts waiting after the runner signals completion.
 
-There are two deliberately separate artifacts:
+There are two deliberately separate boundaries:
 
 ```text
-COMPLETION.json  worker request to quiesce an interactive process
-exit_code        runner proof that the supervised process has ended
+runtime/HANDOFF_READY.json  immutable worker publication requesting quiescence
+exit_code                   runner proof that the supervised process has ended
 ```
 
-`COMPLETION.json` is valid only when its task, current attempt, phase, requested
-state, and `HANDOFF.json` digest match. It cannot advance the FSM. The runner's
-attempt-local `exit_code` remains the dispatch synchronization source of truth;
-full handoff and worktree validation happen only after it exists.
+The READY marker is valid only when it is under the current active attempt and
+its task/attempt IDs, task-input binding, requested state, source commit, and
+`HANDOFF.json`/`EVIDENCE.json` digests all validate. It cannot advance the FSM.
+Stale, partial, foreign-attempt, or digest-mismatched markers are ignored by the
+supervisor. The runner's attempt-local `exit_code` remains the dispatch
+synchronization source of truth; full acceptance, worktree, and publication
+validation happens again after it exists.
 
 Runner behavior:
 
@@ -245,4 +254,4 @@ Timeout diagnostics should record:
 
 ## Tmux Missing
 
-If `RDO_WORKER_BACKEND=tmux` and `tmux` is unavailable, dispatch must fail before creating an attempt, writing `LOCK`, acquiring `.dispatch-lock`, or moving `STATUS.json` to `running`.
+If `RDO_RUNTIME_BACKEND=tmux` and `tmux` is unavailable, dispatch must fail before creating an attempt, writing `LOCK`, acquiring `.dispatch-lock`, or moving `STATUS.json` to `running`.

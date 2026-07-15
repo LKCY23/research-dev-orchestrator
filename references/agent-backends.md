@@ -33,7 +33,7 @@ python scripts/agent_backend_cli.py validate --backend all
 
 ## Runtime Combinations
 
-v0.3 supports only:
+The current runtime matrix supports only:
 
 ```text
 plain + machine

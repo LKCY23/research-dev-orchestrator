@@ -17,10 +17,14 @@ prompt automatically and cannot recognize every backend-specific TUI screen.
 
 An interactive CLI may return to its input prompt after a worker has submitted
 strategy or handoff artifacts. RDO does not require the model to type `/exit`.
-The worker command atomically writes an attempt-bound `COMPLETION.json`; the
-attempt supervisor validates it, allows a short grace period, and then
-quiesces the recorded worker process group. This path does not approve the
-strategy or task. Coordinator review remains a separate FSM action.
+For Artifact Protocol v2, the finalizer publishes attempt-local
+`runtime/HANDOFF_READY.json` after the immutable handoff/evidence package is
+durable. The attempt supervisor validates every bound digest, allows a short
+grace period, and then quiesces the recorded worker process group. A partial,
+stale, or invalid marker does not stop the worker. This path does not approve
+the strategy or task; dispatch validation and coordinator review remain
+separate actions. Recognized legacy-v0.5/v1 attempts use their historical
+`COMPLETION.json` decoder only on the compatibility path.
 
 With `RDO_TMUX_KEEP_SESSION=1`, the runner leaves a login shell in the pane after
 the worker process has been quiesced, so an attached observer can still inspect

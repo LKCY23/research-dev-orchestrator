@@ -1,118 +1,59 @@
-# Task Packet Template
+# Task Packet Contract
 
-Each task packet lives under `.agent-collab/runs/<run-id>/tasks/<task-id>/`.
+Artifact Protocol v2 gives each task-root input one responsibility. All four
+files are required and dispatch validates them before allocating an attempt,
+acquiring locks, creating a worktree, or mutating task execution state.
 
-## Required Files
+## Canonical inputs
 
-```text
-TASK.md
-STATUS.json
-HANDOFF.md
-HANDOFF.json
-EVIDENCE.md
-logs/
-attempts/
-```
+- `TASK.md` contains exactly Objective, Deliverables, Invariants, Non-goals,
+  and Dependencies. Dependencies live in the single
+  `json rdo-task-dependencies` block and resolve to merged task commits.
+- `CONTEXT.md` is non-normative. It contains Frozen Decisions, Required
+  Interfaces, Local Code Map, and Necessary Background. It cannot add task
+  obligations or read-policy paths.
+- `ACCEPTANCE.md` contains one `json rdo-acceptance-contract` block with exact
+  required commands, required outputs, and pre/post-merge commands. Its prose
+  sections carry behavioral and coordinator judgment.
+- `EXECUTION_POLICY.json` owns profile-independent limits and the explicit
+  `allowed_paths`, `read_paths`, `forbidden_paths`, and `context_sources`.
 
-`TASK.md` and `STATUS.json` are canonical. `CONTEXT.md` and `ACCEPTANCE.md` are optional normalization files when that information is not already complete in `TASK.md`. Handoff prose and evidence views support humans; `HANDOFF.json` remains the transition request.
+`STATUS.json` owns task state, profile, branch, worktree, and current attempt.
+Those controls do not belong in `TASK.md`.
 
-`LOCK` is human-readable ownership metadata. `.dispatch-lock/` is present only while an active planning or execution dispatch is held. `create_task.py` must not create either file.
+`create_task.py` intentionally leaves visible `RDO_TEMPLATE_INCOMPLETE`
+markers in fields that require coordinator authorship. A task with any marker
+is not dispatchable.
 
-## TASK.md
+## Derived attempt inputs
 
-```yaml
-task_id:
-profile: direct|delegated|full
-goal:
-allowed_paths:
-forbidden_paths:
-dependencies:
-branch:
-worktree:
-non_goals:
-```
+After a successful readiness check, dispatch derives immutable
+`attempts/<attempt-id>/TASK_INPUTS.json`. It binds the four input digests, task
+base commit, resolved dependency commits, and a stable contract digest.
+`ATTEMPT.json` references this file by path and exact digest. A later attempt
+with a different stable contract is rejected and requires a revision task.
 
-Keep `allowed_paths` narrow. If two tasks have overlapping critical paths, do not dispatch them in parallel.
+## Attempt outputs
 
-## CONTEXT.md
-
-Include only task-relevant context:
-
-- requirement/design links
-- related ADRs
-- current interfaces and expected data flow
-- constraints that the worker must not rediscover
-
-Do not paste the entire conversation.
-
-## ACCEPTANCE.md
-
-Include:
+Workers never author task-root handoff or evidence files. Required acceptance
+commands run through:
 
 ```text
-Required commands
-Expected outputs
-Smoke tests
-Metrics or thresholds
-Merge preconditions
-Failure handoff conditions
-Post-merge smoke test, if required
+rdo check --attempt-dir <attempt-dir> --check-id <id>
 ```
 
-Treat this file as the review gate recipe. It should answer what the worker must run, what artifacts must exist, what thresholds matter, and what Codex must verify before approval or merge.
-
-## EVIDENCE.md
-
-`rdo finalize` generates this human-readable evidence view from workflow and command records:
+Finalization publishes, in order:
 
 ```text
-Commands Run
-Tests Passed
-Metrics / Outputs
-Logs
-Known Limitations
+attempts/<attempt-id>/EVIDENCE.json
+attempts/<attempt-id>/HANDOFF.json
+attempts/<attempt-id>/runtime/HANDOFF_READY.json
 ```
 
-## HANDOFF.md
+The first two files are create-once and immutable; the READY marker binds their
+digests and is written last. `HANDOFF.json` is only a transition request.
+`EVIDENCE.json` is a frozen index over raw command, log, review, commit, and
+worktree facts.
 
-`rdo finalize` generates this human-readable summary from the worker's final summary and recorded evidence:
-
-```text
-What changed
-What failed
-Evidence
-Decision needed
-Suggested next action
-```
-
-## HANDOFF.json
-
-`HANDOFF.json` is the canonical machine-readable transition request. `HANDOFF.md` is its generated human-readable companion.
-
-Workers call `rdo finalize`; it sets `_template=false` and writes the request atomically. Direct requests `verified|blocked`; Delegated requests `review|blocked`; Full may request `strategy_review|review|blocked`.
-
-Before a final `verified` or `review` handoff, execution workers commit all task changes on the assigned branch and leave the task worktree clean. Finalization derives `files_changed` from the task's first pre-execution fingerprint rather than from unstaged Git diff alone.
-
-```json
-{
-  "_template": false,
-  "requested_state": "review",
-  "summary": "Implemented loader and added tests.",
-  "commands_run": ["pytest -q tests/test_loader.py"],
-  "files_changed": ["src/loader.py", "tests/test_loader.py"],
-  "known_limitations": [],
-  "needs_coordinator": false,
-  "blocker_type": "",
-  "blocking_reason": ""
-}
-```
-
-Direct handoff additionally sets `self_review.passed = true` and records findings/fixes after inspecting the final diff.
-
-Dispatch validates this request and applies `STATUS.json` terminal transitions. Workers must not edit `STATUS.json` directly. `collect_status.py` may also display this index for dashboards and summaries.
-
-## Fix Routing
-
-Use a new attempt in the same task for a small fix with the same acceptance criteria. Resume the same logical worker and native backend session unless there is a recorded reason to replace it.
-
-Create a new task such as `T001R1-*` when scope, acceptance criteria, design, ownership, or allowed paths change.
+See [artifact-protocol-v2.md](artifact-protocol-v2.md) for the complete schemas,
+ownership rules, publication order, and explicit legacy compatibility route.
