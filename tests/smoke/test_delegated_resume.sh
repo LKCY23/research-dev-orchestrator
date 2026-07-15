@@ -7,6 +7,7 @@ repo="$(setup_smoke_repo)"
 cd "${repo}"
 python3 "${RDO_ROOT}/scripts/init_run.py" --run-id delegated-run --project-slug smoke --objective smoke --target-branch main >/dev/null
 python3 "${RDO_ROOT}/scripts/create_task.py" --run-id delegated-run --task-id T001-delegated --goal delegated --profile delegated --allowed-paths file.txt >/dev/null
+complete_task_contract delegated-run T001-delegated delegated
 worker="${repo}/delegated-worker.sh"
 make_review_worker "${worker}"
 RDO_WORKER_COMMAND="${worker}" "${RDO_ROOT}/scripts/dispatch_agent.sh" delegated-run T001-delegated >/dev/null

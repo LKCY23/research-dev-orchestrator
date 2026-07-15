@@ -56,6 +56,124 @@ init_raw_run_and_task() {
     --task-id "${task_id}" \
     --goal "${goal}" \
     --allowed-paths file.txt >/dev/null
+
+  complete_task_contract "${run_id}" "${task_id}" "${goal}"
+}
+
+complete_task_contract() {
+  local run_id="$1"
+  local task_id="$2"
+  local goal="${3:-smoke}"
+  # create_task intentionally leaves semantic v2 fields incomplete.  Smoke
+  # tests exercise dispatch, not coordinator authoring, so freeze one small,
+  # valid contract immediately after task creation.
+  python3 - "${run_id}" "${task_id}" "${goal}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_id, task_id, goal = sys.argv[1:]
+task = Path.cwd() / ".agent-collab" / "runs" / run_id / "tasks" / task_id
+status = json.loads((task / "STATUS.json").read_text(encoding="utf-8"))
+
+(task / "TASK.md").write_text(f"""# Task {task_id}
+
+## Objective
+
+Complete the {goal} smoke scenario.
+
+## Deliverables
+
+- Preserve the required `file.txt` output.
+
+## Invariants
+
+- The smoke repository remains a valid Git worktree.
+
+## Non-goals
+
+- No production feature work is part of this fixture.
+
+## Dependencies
+
+```json rdo-task-dependencies
+{{
+  "schema_version": 2,
+  "dependencies": []
+}}
+```
+""", encoding="utf-8")
+
+(task / "CONTEXT.md").write_text("""# Context
+
+## Frozen Decisions
+
+- Use the deterministic smoke command and existing fixture file.
+
+## Required Interfaces
+
+- `file.txt` remains present in the task worktree.
+
+## Local Code Map
+
+- `file.txt` is the complete smoke fixture surface.
+
+## Necessary Background
+
+- This task validates RDO protocol behavior rather than application logic.
+""", encoding="utf-8")
+
+acceptance = {
+    "schema_version": 2,
+    "required_commands": [{
+        "id": "smoke",
+        "argv": ["/usr/bin/true"],
+        "cwd": ".",
+        "timeout_seconds": 10,
+    }],
+    "required_outputs": ["file.txt"],
+    "pre_merge_commands": [],
+    "post_merge_commands": [],
+}
+(task / "ACCEPTANCE.md").write_text("""# Acceptance
+
+```json rdo-acceptance-contract
+""" + json.dumps(acceptance, indent=2) + """
+```
+
+## Behavioral Checks
+
+- The requested smoke lifecycle reaches its expected state.
+
+## Merge Preconditions
+
+- The immutable attempt bundle validates successfully.
+
+## Blocked Conditions
+
+- Dispatch or deterministic validation cannot complete safely.
+
+## Pre-Merge Checks
+
+- None.
+
+## Post-Merge Checks
+
+- None.
+""", encoding="utf-8")
+
+policy_path = task / "EXECUTION_POLICY.json"
+policy = json.loads(policy_path.read_text(encoding="utf-8"))
+policy.update(
+    schema_version=2,
+    strategy_required=status["profile"] == "full",
+    allowed_paths=["file.txt"],
+    read_paths=["file.txt"],
+    forbidden_paths=[],
+    context_sources=[],
+)
+policy_path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+PY
 }
 
 init_run_and_task() {
@@ -150,6 +268,20 @@ write_json(status_path, status)
 PY
 }
 
+freeze_worker_rdo_root() {
+  local path="$1"
+  python3 - "${path}" "${RDO_ROOT}" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+path.write_text(
+    path.read_text(encoding="utf-8").replace("${RDO_ROOT}", sys.argv[2]),
+    encoding="utf-8",
+)
+PY
+}
+
 make_review_worker() {
   local path="$1"
   cat > "${path}" <<'SH'
@@ -157,27 +289,16 @@ make_review_worker() {
 set -euo pipefail
 prompt="$(mktemp)"
 cat > "${prompt}"
-EVIDENCE_PATH="$(awk -F': ' '/^- EVIDENCE_PATH:/ {print $2}' "${prompt}")"
-HANDOFF_PATH="$(awk -F': ' '/^- HANDOFF_PATH:/ {print $2}' "${prompt}")"
-HANDOFF_JSON_PATH="$(awk -F': ' '/^- HANDOFF_JSON_PATH:/ {print $2}' "${prompt}")"
-printf '# Evidence\n\n## Commands Run\n- smoke\n\n## Tests Passed\n- yes\n' > "${EVIDENCE_PATH}"
-printf '# Handoff\n\n## What Changed\n- smoke worker completed\n' > "${HANDOFF_PATH}"
-if [[ -n "${HANDOFF_JSON_PATH}" ]]; then
-  cat > "${HANDOFF_JSON_PATH}" <<'JSON'
-{
-  "_template": false,
-  "requested_state": "review",
-  "summary": "smoke worker completed",
-  "commands_run": ["smoke"],
-  "files_changed": ["file.txt"],
-  "known_limitations": [],
-  "needs_coordinator": false,
-  "blocker_type": "",
-  "blocking_reason": ""
-}
-JSON
-fi
+ATTEMPT_DIR="$(awk -F': ' '/^- ATTEMPT_DIR:/ {print $2}' "${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" check \
+  --attempt-dir "${ATTEMPT_DIR}" \
+  --check-id smoke >/dev/null
+python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
+  --attempt-dir "${ATTEMPT_DIR}" \
+  --state review \
+  --summary "smoke worker completed" >/dev/null
 SH
+  freeze_worker_rdo_root "${path}"
   chmod +x "${path}"
 }
 
@@ -188,15 +309,17 @@ make_verified_worker() {
 set -euo pipefail
 prompt="$(mktemp)"
 cat > "${prompt}"
-EVIDENCE_PATH="$(awk -F': ' '/^- EVIDENCE_PATH:/ {print $2}' "${prompt}")"
-TASK_DIR="$(awk -F': ' '/^- TASK_DIR:/ {print $2}' "${prompt}")"
+ATTEMPT_DIR="$(awk -F': ' '/^- ATTEMPT_DIR:/ {print $2}' "${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" check \
+  --attempt-dir "${ATTEMPT_DIR}" \
+  --check-id smoke >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
-  --task-dir "${TASK_DIR}" \
+  --attempt-dir "${ATTEMPT_DIR}" \
   --state verified \
   --summary "direct worker completed and self-reviewed" \
-  --command smoke \
   --self-review-passed >/dev/null
 SH
+  freeze_worker_rdo_root "${path}"
   chmod +x "${path}"
 }
 
@@ -209,35 +332,33 @@ make_blocked_worker() {
 set -euo pipefail
 prompt="\$(mktemp)"
 cat > "\${prompt}"
-EVIDENCE_PATH="\$(awk -F': ' '/^- EVIDENCE_PATH:/ {print \$2}' "\${prompt}")"
-HANDOFF_PATH="\$(awk -F': ' '/^- HANDOFF_PATH:/ {print \$2}' "\${prompt}")"
-HANDOFF_JSON_PATH="\$(awk -F': ' '/^- HANDOFF_JSON_PATH:/ {print \$2}' "\${prompt}")"
-printf '# Evidence\n\n## Commands Run\n- smoke blocked\n\n## Tests Passed\n- no\n' > "\${EVIDENCE_PATH}"
-printf '# Handoff\n\n## What Failed\n- ${reason}\n\n## Decision Needed\n- coordinator triage\n' > "\${HANDOFF_PATH}"
-cat > "\${HANDOFF_JSON_PATH}" <<'JSON'
-{
-  "_template": false,
-  "requested_state": "blocked",
-  "summary": "smoke worker blocked",
-  "commands_run": ["smoke blocked"],
-  "files_changed": [],
-  "known_limitations": ["blocked"],
-  "needs_coordinator": true,
-  "blocker_type": "${blocker_type}",
-  "blocking_reason": "${reason}"
-}
-JSON
+ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
+  --attempt-dir "\${ATTEMPT_DIR}" \
+  --state blocked \
+  --summary "smoke worker blocked" \
+  --blocker-type "${blocker_type}" \
+  --blocking-reason "${reason}" >/dev/null
 SH
+  freeze_worker_rdo_root "${path}"
   chmod +x "${path}"
 }
 
 make_review_exit1_worker() {
   local path="$1"
-  make_review_worker "${path}"
-  {
-    echo
-    echo "exit 1"
-  } >> "${path}"
+  cat > "${path}" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+prompt="$(mktemp)"
+cat > "${prompt}"
+ATTEMPT_DIR="$(awk -F': ' '/^- ATTEMPT_DIR:/ {print $2}' "${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" check \
+  --attempt-dir "${ATTEMPT_DIR}" \
+  --check-id smoke >/dev/null
+exit 1
+SH
+  freeze_worker_rdo_root "${path}"
+  chmod +x "${path}"
 }
 
 make_sleep_worker() {
@@ -259,13 +380,14 @@ make_persistent_handoff_worker() {
 set -euo pipefail
 prompt="\$(mktemp)"
 cat > "\${prompt}"
-TASK_DIR="\$(awk -F': ' '/^- TASK_DIR:/ {print \$2}' "\${prompt}")"
-python3 "${RDO_ROOT}/scripts/rdo.py" handoff \
-  --task-dir "\${TASK_DIR}" \
+ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" check \
+  --attempt-dir "\${ATTEMPT_DIR}" \
+  --check-id smoke >/dev/null
+python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
+  --attempt-dir "\${ATTEMPT_DIR}" \
   --state review \
-  --summary "persistent interactive worker completed" \
-  --command "smoke" \
-  --file "file.txt"
+  --summary "persistent interactive worker completed" >/dev/null
 sleep 30
 SH
   chmod +x "${path}"

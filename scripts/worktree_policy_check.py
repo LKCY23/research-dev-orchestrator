@@ -21,8 +21,14 @@ def main() -> int:
     parser.add_argument("--strategy", default="")
     parser.add_argument("--policy", required=True)
     args = parser.parse_args()
-    before = {item["path"]: item["sha256"] for item in json.loads(Path(args.before).read_text())["entries"]}
-    after = {item["path"]: item["sha256"] for item in json.loads(Path(args.after).read_text())["entries"]}
+    before = {
+        item["path"]: (item.get("kind"), item.get("mode"), item.get("sha256"))
+        for item in json.loads(Path(args.before).read_text())["entries"]
+    }
+    after = {
+        item["path"]: (item.get("kind"), item.get("mode"), item.get("sha256"))
+        for item in json.loads(Path(args.after).read_text())["entries"]
+    }
     changed = sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
     policy = json.loads(Path(args.policy).read_text())
     if args.strategy:

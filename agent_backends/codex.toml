@@ -47,8 +47,8 @@ args = ["--dangerously-bypass-approvals-and-sandbox"]
 
 [commands.machine]
 command = "codex"
-args = ["{permission_args}", "-c", "skills.include_instructions=false", "exec", "--ignore-user-config", "--json", "--cd", "{cwd}", "{prompt}"]
+args = ["{permission_args}", "--dangerously-bypass-hook-trust", "-c", "skills.include_instructions=false", "exec", "--ignore-user-config", "--json", "--cd", "{cwd}", "{prompt}"]
 
 [commands.human]
 command = "codex"
-args = ["--cd", "{cwd}", "{permission_args}", "-c", "skills.include_instructions=false", "{prompt}"]
+args = ["--cd", "{cwd}", "{permission_args}", "--dangerously-bypass-hook-trust", "-c", "skills.include_instructions=false", "{prompt}"]

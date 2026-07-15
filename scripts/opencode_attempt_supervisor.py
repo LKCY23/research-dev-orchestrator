@@ -326,6 +326,8 @@ def main() -> int:
     environment = os.environ.copy()
     environment["OPENCODE_SERVER_PASSWORD"] = password
     environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_config(settings), separators=(",", ":"))
+    if settings.get("context_plugin_enabled"):
+        environment["OPENCODE_CONFIG_DIR"] = str(runtime / "opencode-config")
     command = ["opencode", "serve", "--hostname", "127.0.0.1", "--port", str(port)]
     if settings.get("pure_mode"):
         command.append("--pure")

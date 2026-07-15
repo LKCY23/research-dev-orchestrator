@@ -22,6 +22,7 @@ from pathlib import Path
 task = Path(".agent-collab/runs/smoke-run/tasks/T001-blocked")
 status = json.load(open(task / "STATUS.json", encoding="utf-8"))
 attempt = json.load(open(task / "attempts" / status["current_attempt_id"] / "ATTEMPT.json", encoding="utf-8"))
+attempt_dir = task / "attempts" / status["current_attempt_id"]
 assert status["blocking_reason"] == "dataset path needs user confirmation"
 assert status["state_history"][-1]["from"] == "running"
 assert status["state_history"][-1]["to"] == "blocked"
@@ -29,4 +30,9 @@ assert status["state_history"][-1]["actor"] == "dispatch"
 assert attempt["state"] == "completed"
 assert attempt["handoff_valid"] is True
 assert attempt["handoff_state"] == "blocked"
+ready = json.load(open(attempt_dir / "runtime" / "HANDOFF_READY.json", encoding="utf-8"))
+handoff = json.load(open(attempt_dir / "HANDOFF.json", encoding="utf-8"))
+assert ready["requested_state"] == "blocked"
+assert handoff["conditional_blocker"]["blocker_type"] == "needs_user"
+assert not (task / "HANDOFF.json").exists()
 PY

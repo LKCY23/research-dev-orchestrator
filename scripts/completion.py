@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Attempt-bound completion signals for interactive workers."""
+"""Attempt-bound publication signals for worker supervisors.
+
+Artifact Protocol v1 uses ``COMPLETION.json``.  Protocol v2 deliberately does
+not: its only supervisor signal is the validated, attempt-local
+``runtime/HANDOFF_READY.json`` publication marker.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from protocol import load_json, parse_iso, utc_now
+from protocol import ARTIFACT_PROTOCOL_VERSION, load_json, parse_iso, utc_now
+
+
+LEGACY_ARTIFACT_PROTOCOL_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -25,7 +33,116 @@ def file_sha256(path: Path) -> str:
 
 
 def completion_path(task_dir: Path, attempt_id: str) -> Path:
+    """Return the legacy-v1 completion path."""
+
     return task_dir / "attempts" / attempt_id / "COMPLETION.json"
+
+
+def handoff_ready_path(task_dir: Path, attempt_id: str) -> Path:
+    """Return the v2 publication-marker path for exactly one attempt."""
+
+    return task_dir / "attempts" / attempt_id / "runtime" / "HANDOFF_READY.json"
+
+
+def publication_path(task_dir: Path, attempt_id: str, artifact_protocol_version: int) -> Path:
+    """Resolve the signal path without inferring a protocol from file presence."""
+
+    if artifact_protocol_version == LEGACY_ARTIFACT_PROTOCOL_VERSION:
+        return completion_path(task_dir, attempt_id)
+    if artifact_protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        return handoff_ready_path(task_dir, attempt_id)
+    raise ValueError(f"unsupported artifact protocol version: {artifact_protocol_version!r}")
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+
+
+def validate_publication(
+    path: Path,
+    *,
+    artifact_protocol_version: int,
+    task_dir: Path,
+    attempt_id: str,
+) -> CompletionValidationResult:
+    """Validate one protocol-explicit supervisor publication signal.
+
+    V2 validates the complete HANDOFF/EVIDENCE/TASK_INPUTS digest closure via
+    :func:`artifact_bundle.load_bundle`.  Merely creating a file named
+    ``HANDOFF_READY.json`` can therefore never stop a worker.
+    """
+
+    try:
+        expected_path = publication_path(task_dir, attempt_id, artifact_protocol_version)
+    except ValueError as exc:
+        return CompletionValidationResult(False, (str(exc),))
+    if not _same_path(path, expected_path):
+        return CompletionValidationResult(
+            False,
+            (
+                "publication path does not belong to the supervised attempt: "
+                f"{path} != {expected_path}",
+            ),
+        )
+
+    if artifact_protocol_version == LEGACY_ARTIFACT_PROTOCOL_VERSION:
+        try:
+            status = load_json(task_dir / "STATUS.json")
+        except Exception as exc:
+            return CompletionValidationResult(False, (f"task status is unreadable: {exc}",))
+        declared = status.get("artifact_protocol_version") if isinstance(status, dict) else None
+        if declared is not None and (
+            not isinstance(declared, int)
+            or isinstance(declared, bool)
+            or declared != LEGACY_ARTIFACT_PROTOCOL_VERSION
+        ):
+            return CompletionValidationResult(
+                False,
+                ("legacy COMPLETION.json cannot finish an artifact-protocol-v2 task",),
+            )
+        return validate_completion(path, task_dir=task_dir, attempt_id=attempt_id)
+
+    try:
+        status = load_json(task_dir / "STATUS.json")
+    except Exception as exc:
+        return CompletionValidationResult(False, (f"task status is unreadable: {exc}",))
+    if not isinstance(status, dict):
+        return CompletionValidationResult(False, ("STATUS.json must be a JSON object",))
+    if status.get("artifact_protocol_version") != ARTIFACT_PROTOCOL_VERSION:
+        return CompletionValidationResult(
+            False,
+            ("v2 handoff publication requires STATUS.json artifact_protocol_version 2",),
+        )
+    if status.get("current_attempt_id") != attempt_id:
+        return CompletionValidationResult(
+            False,
+            ("handoff publication attempt is not the current task attempt",),
+        )
+    task_id = status.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return CompletionValidationResult(False, ("STATUS.json task_id must be non-empty",))
+
+    attempt_dir = task_dir / "attempts" / attempt_id
+    try:
+        from artifact_bundle import ArtifactBundleError, load_bundle
+
+        bundle = load_bundle(
+            attempt_dir,
+            expected_task_id=task_id,
+            expected_attempt_id=attempt_id,
+        )
+    except (ArtifactBundleError, OSError, ValueError) as exc:
+        return CompletionValidationResult(
+            False,
+            (f"v2 handoff publication is invalid: {exc}",),
+        )
+    if bundle.task_inputs_binding.attempt.get("state") not in {"created", "running"}:
+        return CompletionValidationResult(
+            False,
+            ("handoff publication does not reference an active ATTEMPT.json",),
+            bundle.ready,
+        )
+    return CompletionValidationResult(True, (), bundle.ready)
 
 
 def write_completion(
@@ -37,7 +154,7 @@ def write_completion(
     strategy_sha256: str | None = None,
     source_commit: str | None = None,
 ) -> Path:
-    """Commit completion last, after all handoff artifacts are durable."""
+    """Write the legacy-v1 completion signal after root handoff artifacts."""
 
     handoff_path = task_dir / "HANDOFF.json"
     payload = {

@@ -113,6 +113,37 @@ class WorkflowCompletionGateTests(unittest.TestCase):
                     ]
                 )
 
+    def test_completed_review_evidence_digest_cannot_drift_before_finalize(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary) / "task" / "attempts" / "A001"
+            artifact = attempt / "runtime" / "reviews" / "review.md"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("No findings.\n", encoding="utf-8")
+            import hashlib
+
+            digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            (attempt / "runtime" / "WORKFLOWS.ndjson").write_text(
+                json.dumps(
+                    {
+                        "event": "workflow_completed",
+                        "workflow_id": "WF-review",
+                        "instance_id": "I001",
+                        "reviews": [
+                            {
+                                "reviewer_id": "reviewer-1",
+                                "artifact": str(artifact),
+                                "sha256": digest,
+                            }
+                        ],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            artifact.write_text("Changed after completion.\n", encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "changed after workflow completion"):
+                rdo._reviewer_evidence_refs(attempt)
+
 
 if __name__ == "__main__":
     unittest.main()

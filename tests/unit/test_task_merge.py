@@ -166,6 +166,25 @@ class TaskMergeTests(unittest.TestCase):
         self.assertEqual(json.loads((self.task / "STATUS.json").read_text())["state"], "merged")
         self.assertEqual(len(self.merged_events()), 1)
 
+    def test_approval_accepts_task_commit_already_contained_in_target(self):
+        source = git(self.task_worktree, "rev-parse", "HEAD")
+        git(self.root, "merge", "--ff-only", source)
+        (self.root / "target-only.txt").write_text("later target work\n")
+        git(self.root, "add", "target-only.txt")
+        git(self.root, "commit", "-m", "later target work")
+        status_path = self.task / "STATUS.json"
+        status = json.loads(status_path.read_text())
+        status.update(state="review", previous_state="running", owner="worker")
+        status_path.write_text(json.dumps(status))
+
+        self.assertEqual(self.approve(), 0)
+
+        decision = json.loads(
+            (self.task / "reviews" / "DECISION-v002.json").read_text()
+        )
+        self.assertEqual(source, decision["approved_commit"])
+        self.assertEqual(git(self.root, "rev-parse", "HEAD"), decision["target_commit_at_review"])
+
     def test_rejects_task_commit_created_after_approval(self):
         (self.task_worktree / "file.txt").write_text("changed after review\n")
         git(self.task_worktree, "add", "file.txt")

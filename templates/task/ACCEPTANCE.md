@@ -1,29 +1,42 @@
 # Acceptance
 
-## Required Commands
+```json rdo-acceptance-contract
+{
+  "schema_version": 2,
+  "required_commands": [
+    {
+      "id": "RDO_TEMPLATE_INCOMPLETE",
+      "argv": [
+        "RDO_TEMPLATE_INCOMPLETE"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 120
+    }
+  ],
+  "required_outputs": [
+    "RDO_TEMPLATE_INCOMPLETE"
+  ],
+  "pre_merge_commands": [],
+  "post_merge_commands": []
+}
+```
 
-Commands that must be run before handoff. Include exact commands, working directory assumptions, and any required env vars.
+## Behavioral Checks
 
-## Expected Outputs
-
-Files, logs, metrics, or artifacts that must exist after the task completes.
-
-## Smoke Tests
-
-Fast checks that prove the main behavior works. Prefer deterministic, cheap commands.
-
-## Metrics Or Thresholds
-
-Research or experiment thresholds required for review, including baselines, seeds, datasets, and metric names.
+- RDO_TEMPLATE_INCOMPLETE: state behavior that a reviewer must verify.
 
 ## Merge Preconditions
 
-Conditions Codex must verify before approving or merging, such as allowed paths, dry-run merge, integration smoke tests, or review signoff.
+- RDO_TEMPLATE_INCOMPLETE: state conditions required before merge.
 
-## Failure Handoff Conditions
+## Blocked Conditions
 
-Conditions under which the worker should stop and hand off as `blocked` instead of continuing.
+- RDO_TEMPLATE_INCOMPLETE: state when the worker must request `blocked`.
 
-## Post-Merge Smoke Test
+## Pre-Merge Checks
 
-Checks to run after merge if this task reaches `merged`.
+- RDO_TEMPLATE_INCOMPLETE: state non-command checks for the coordinator, or `None.`
+
+## Post-Merge Checks
+
+- RDO_TEMPLATE_INCOMPLETE: state non-command checks after merge, or `None.`

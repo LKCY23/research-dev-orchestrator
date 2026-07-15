@@ -14,6 +14,7 @@ from typing import Any
 from agent_backends import load_backend, validate_backend, validate_project_governance
 from config import load_config
 from protocol import load_json
+from read_policy import compile_read_policy
 from strategy import canonical_digest, validate_execution_policy, validate_strategy
 
 
@@ -156,6 +157,13 @@ def compile_backend_profile(
         for workflow in (strategy.get("workflows", []) if strategy else [])
     )
     codex_stream_required = False
+    read_policy = compile_read_policy(
+        repo_root=repo_root,
+        task_dir=task_dir,
+        status=status if isinstance(status, dict) else {},
+        execution_policy=policy,
+    )
+    generated_files.append("READ_POLICY.json")
 
     if backend_id == "claude-code":
         disabled = governance.get("disabled_plugins", [])
@@ -220,6 +228,13 @@ def compile_backend_profile(
             f"agents.max_threads={parallel_limit}",
             f"agents.max_depth={depth_limit}",
         ]
+        codex_read_hook = Path(__file__).resolve().parent / "codex_read_policy_hook.py"
+        codex_read_command = shlex.join([os.fspath(Path(sys.executable)), os.fspath(codex_read_hook)])
+        backend_settings["config_overrides"].append(
+            "hooks.PreToolUse=[{ matcher = \"^Bash$\", hooks = [{ type = \"command\", command = "
+            + json.dumps(codex_read_command)
+            + ", timeout = 5 }] }]"
+        )
         backend_settings["stream_monitor_required"] = codex_stream_required
         controls.extend([
             {
@@ -314,7 +329,10 @@ def compile_backend_profile(
             "max_agent_depth": min(depth_limit, 1),
             "pure_mode": bool(governance.get("pure_mode", False)),
             "attempt_supervisor_required": True,
+            "context_plugin_enabled": not bool(governance.get("pure_mode", False)),
         })
+        if backend_settings["context_plugin_enabled"]:
+            generated_files.append("opencode-config/plugins/rdo-context.js")
         controls.extend([
             {"name": "native_subagents_enabled", "value": native_enabled,
              "enforcement": "rdo_permission_supervisor", "hard": True},
@@ -339,14 +357,38 @@ def compile_backend_profile(
         "hard": backend_id in {"claude-code", "opencode"}
         or (backend_id == "codex" and codex_stream_required),
     })
+    if backend_id == "claude-code":
+        context_adapter = {"id": "claude-pretooluse", "version": 1,
+                           "enforcement_level": "tool_blocking", "enforced_tools": ["Read", "Grep", "Glob"]}
+    elif backend_id == "kimi-code":
+        context_adapter = {"id": "kimi-pretooluse", "version": 1,
+                           "enforcement_level": "fail_open_tool_blocking", "enforced_tools": ["Read", "Grep", "Glob"]}
+    elif backend_id == "opencode" and backend_settings.get("context_plugin_enabled"):
+        context_adapter = {"id": "opencode-tool-execute-before", "version": 1,
+                           "enforcement_level": "tool_blocking", "enforced_tools": ["read", "grep", "glob"]}
+    elif backend_id == "codex":
+        context_adapter = {"id": "codex-pretooluse", "version": 1,
+                           "enforcement_level": "best_effort", "enforced_tools": ["Bash"],
+                           "known_gaps": ["unified_exec interception is incomplete", "indirect script reads are unclassified"]}
+    else:
+        context_adapter = {"id": "prompt-and-cli", "version": 1,
+                           "enforcement_level": "advisory", "enforced_tools": []}
+
     profile = {
         "schema_version": 1,
         "backend_id": backend_id,
         "phase": phase,
         "task_profile": task_profile,
         "strategy_id": strategy.get("strategy_id") if strategy else None,
+        "strategy_revision": strategy.get("revision") if strategy else None,
         "strategy_sha256": strategy_sha256,
         "capabilities": backend.get("capabilities", {}),
+        "context_access": {
+            "policy": read_policy,
+            "capability_contract_version": 1,
+            "adapter": context_adapter,
+            "broker": {"id": "context-broker-cli", "version": 1},
+        },
         "usage_observability": backend.get("usage_observability", {}),
         "resource_budget": strategy.get("resource_budget", {}) if strategy else {},
         "governance": governance,
@@ -377,11 +419,17 @@ def materialize_backend_profile(profile: dict[str, Any], runtime_dir: Path) -> d
     if expected != canonical_digest(unsigned):
         raise BackendGovernanceError("compiled backend profile digest is invalid")
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    read_policy = profile.get("context_access", {}).get("policy")
+    if not isinstance(read_policy, dict):
+        raise BackendGovernanceError("compiled backend profile is missing context access policy")
+    read_policy_path = runtime_dir / "READ_POLICY.json"
+    _atomic_json(read_policy_path, read_policy)
     settings_path: Path | None = None
     if profile["backend_id"] == "claude-code":
         settings_path = runtime_dir / "claude-settings.json"
         settings = dict(profile.get("backend_settings", {}))
         hook_script = Path(__file__).resolve().parent / "claude_governance_hook.py"
+        read_hook_script = Path(__file__).resolve().parent / "read_policy_hook.py"
         hook_command = lambda event: shlex.join([
             os.fspath(Path(sys.executable)),
             os.fspath(hook_script),
@@ -391,10 +439,27 @@ def materialize_backend_profile(profile: dict[str, Any], runtime_dir: Path) -> d
             event,
         ])
         settings["hooks"] = {
-            "PreToolUse": [{
-                "matcher": "Agent|Task",
-                "hooks": [{"type": "command", "command": hook_command("pre-tool-use"), "timeout": 5}],
-            }],
+            "PreToolUse": [
+                {
+                    "matcher": "Agent|Task",
+                    "hooks": [{"type": "command", "command": hook_command("pre-tool-use"), "timeout": 5}],
+                },
+                {
+                    "matcher": "Read|Grep|Glob",
+                    "hooks": [{
+                        "type": "command",
+                        "command": shlex.join([
+                            os.fspath(Path(sys.executable)),
+                            os.fspath(read_hook_script),
+                            "--runtime-dir",
+                            os.fspath(runtime_dir),
+                            "--backend",
+                            "claude-code",
+                        ]),
+                        "timeout": 5,
+                    }],
+                },
+            ],
             "PostToolUse": [{
                 "matcher": "Agent|Task",
                 "hooks": [{"type": "command", "command": hook_command("post-tool-use"), "timeout": 5}],
@@ -413,6 +478,34 @@ def materialize_backend_profile(profile: dict[str, Any], runtime_dir: Path) -> d
             }],
         }
         _atomic_json(settings_path, settings)
+    elif profile["backend_id"] == "opencode":
+        if profile.get("backend_settings", {}).get("context_plugin_enabled"):
+            config_dir = runtime_dir / "opencode-config"
+            plugin_path = config_dir / "plugins" / "rdo-context.js"
+            plugin_path.parent.mkdir(parents=True, exist_ok=True)
+            adapter_script = Path(__file__).resolve().parent / "read_policy_hook.py"
+            plugin = f'''import {{ spawnSync }} from "node:child_process"
+
+const python = {json.dumps(os.fspath(Path(sys.executable)))}
+const adapter = {json.dumps(os.fspath(adapter_script))}
+const runtime = {json.dumps(os.fspath(runtime_dir))}
+
+export const RdoContextPolicy = async () => ({{
+  "tool.execute.before": async (input, output) => {{
+    if (!["read", "grep", "glob"].includes(input.tool)) return
+    const payload = JSON.stringify({{ tool_name: input.tool, tool_input: output.args ?? {{}} }})
+    const result = spawnSync(python, [adapter, "--runtime-dir", runtime, "--backend", "opencode", "--format", "decision"], {{
+      input: payload,
+      encoding: "utf8",
+    }})
+    if (result.status !== 0) throw new Error(result.stderr || "RDO context policy adapter failed")
+    const decision = JSON.parse(result.stdout)
+    if (decision.decision === "deny") throw new Error(decision.reason)
+  }},
+}})
+'''
+            _atomic_text(plugin_path, plugin)
+            settings_path = plugin_path
     elif profile["backend_id"] == "kimi-code":
         settings_path = runtime_dir / "kimi-governance.toml"
         settings = profile.get("backend_settings", {})
@@ -428,6 +521,12 @@ def materialize_backend_profile(profile: dict[str, Any], runtime_dir: Path) -> d
                 event,
             ])
 
+        read_hook_script = Path(__file__).resolve().parent / "read_policy_hook.py"
+        read_hook_command = shlex.join([
+            os.fspath(Path(sys.executable)), os.fspath(read_hook_script),
+            "--runtime-dir", os.fspath(runtime_dir), "--backend", "kimi-code",
+        ])
+
         native_enabled = bool(settings.get("native_subagents_enabled", False))
         swarm_enabled = bool(settings.get("agent_swarm_enabled", False))
         fragment = [
@@ -441,6 +540,12 @@ def materialize_backend_profile(profile: dict[str, Any], runtime_dir: Path) -> d
             f'decision = {json.dumps("allow" if swarm_enabled else "deny")}',
             'pattern = "AgentSwarm"',
             'reason = "RDO approved execution strategy"',
+            "",
+            "[[hooks]]",
+            'event = "PreToolUse"',
+            'matcher = "Read|Grep|Glob"',
+            f"command = {json.dumps(read_hook_command)}",
+            "timeout = 5",
             "",
         ]
         for kimi_event, internal_event in (
@@ -466,6 +571,8 @@ def materialize_backend_profile(profile: dict[str, Any], runtime_dir: Path) -> d
         "profile_sha256": expected,
         "settings_path": str(settings_path) if settings_path else "",
         "settings_sha256": _file_sha256(settings_path) if settings_path else "",
+        "read_policy_path": str(read_policy_path),
+        "read_policy_sha256": _file_sha256(read_policy_path),
         "environment": profile.get("environment", {}),
     }
 

@@ -7,6 +7,7 @@ repo="$(setup_smoke_repo)"
 cd "${repo}"
 python3 "${RDO_ROOT}/scripts/init_run.py" --run-id direct-run --project-slug smoke --objective smoke --target-branch main >/dev/null
 python3 "${RDO_ROOT}/scripts/create_task.py" --run-id direct-run --task-id T001-direct --goal direct --profile direct --allowed-paths file.txt >/dev/null
+complete_task_contract direct-run T001-direct direct
 worker="${repo}/direct-worker.sh"
 make_verified_worker "${worker}"
 RDO_WORKER_COMMAND="${worker}" "${RDO_ROOT}/scripts/dispatch_agent.sh" direct-run T001-direct >/dev/null
@@ -21,6 +22,7 @@ status = json.loads((task / "STATUS.json").read_text())
 assert status["profile"] == "direct"
 assert status["state"] == "verified", status
 attempt = json.loads((task / "attempts" / status["current_attempt_id"] / "ATTEMPT.json").read_text())
+attempt_dir = task / "attempts" / status["current_attempt_id"]
 assert attempt["phase"] == "execution"
 assert attempt["strategy_id"] is None
 assert attempt["worker_id"] == status["assigned_worker"]["worker_id"]
@@ -28,13 +30,13 @@ assert attempt["execution_mode"] == "start"
 task_head = subprocess.check_output(
     ["git", "rev-parse", "HEAD"], cwd=attempt["runtime"]["cwd"], text=True
 ).strip()
-handoff = json.loads((task / "HANDOFF.json").read_text())
-completion = json.loads(
-    (task / "attempts" / status["current_attempt_id"] / "COMPLETION.json").read_text()
-)
+handoff = json.loads((attempt_dir / "HANDOFF.json").read_text())
+ready = json.loads((attempt_dir / "runtime" / "HANDOFF_READY.json").read_text())
 assert attempt["verified_commit"] == task_head
 assert handoff["source_commit"] == task_head
-assert completion["source_commit"] == task_head
+assert ready["source_commit"] == task_head
+assert ready["requested_state"] == "verified"
+assert not (task / "HANDOFF.json").exists()
 policy = json.loads((task / "EXECUTION_POLICY.json").read_text())
 assert policy["strategy_required"] is False
 PY
@@ -43,18 +45,21 @@ late_repo="$(setup_smoke_repo)"
 cd "${late_repo}"
 python3 "${RDO_ROOT}/scripts/init_run.py" --run-id direct-late-run --project-slug smoke --objective smoke --target-branch main >/dev/null
 python3 "${RDO_ROOT}/scripts/create_task.py" --run-id direct-late-run --task-id T002-direct-late --goal direct --profile direct --allowed-paths file.txt >/dev/null
+complete_task_contract direct-late-run T002-direct-late direct
 late_worker="${late_repo}/direct-late-worker.sh"
 cat > "${late_worker}" <<SH
 #!/usr/bin/env bash
 set -euo pipefail
 prompt="\$(mktemp)"
 cat > "\${prompt}"
-TASK_DIR="\$(awk -F': ' '/^- TASK_DIR:/ {print \$2}' "\${prompt}")"
+ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" check \
+  --attempt-dir "\${ATTEMPT_DIR}" \
+  --check-id smoke >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
-  --task-dir "\${TASK_DIR}" \
+  --attempt-dir "\${ATTEMPT_DIR}" \
   --state verified \
   --summary "self-reviewed commit A" \
-  --command smoke \
   --self-review-passed >/dev/null
 chmod +x file.txt
 git add file.txt
@@ -75,11 +80,14 @@ status = json.loads((task / "STATUS.json").read_text())
 attempt = json.loads(
     (task / "attempts" / status["current_attempt_id"] / "ATTEMPT.json").read_text()
 )
-handoff = json.loads((task / "HANDOFF.json").read_text())
+attempt_dir = task / "attempts" / status["current_attempt_id"]
+handoff = json.loads((attempt_dir / "HANDOFF.json").read_text())
 assert status["state"] == "blocked", status
-assert "HEAD changed after rdo finalize" in status["blocking_reason"]
+assert "HEAD changed after handoff finalization" in status["blocking_reason"]
 assert attempt["state"] == "invalid_handoff"
 assert attempt["handoff_valid"] is False
 assert "verified_commit" not in attempt
 assert handoff["summary"] == "self-reviewed commit A"
+assert (attempt_dir / "runtime" / "HANDOFF_READY.json").is_file()
+assert not (task / "HANDOFF.json").exists()
 PY

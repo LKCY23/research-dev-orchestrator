@@ -7,6 +7,27 @@ repo="$(setup_smoke_repo)"
 cd "${repo}"
 init_run_and_task smoke-run T001-grace grace
 
+# This test constructs an attempt by hand to exercise the historical tmux
+# exit-code grace behavior.  Keep it on the explicit legacy decoder instead of
+# accidentally asking the v2 resolver to accept an incomplete synthetic bundle.
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+run = Path(".agent-collab/runs/smoke-run/RUN.json")
+run_payload = json.loads(run.read_text(encoding="utf-8"))
+run_payload.update(
+    package_version="0.5.0",
+    protocol_version="research-dev-orchestrator/v0.5",
+)
+run.write_text(json.dumps(run_payload, indent=2) + "\n", encoding="utf-8")
+
+status = Path(".agent-collab/runs/smoke-run/tasks/T001-grace/STATUS.json")
+status_payload = json.loads(status.read_text(encoding="utf-8"))
+status_payload["artifact_protocol_version"] = 1
+status.write_text(json.dumps(status_payload, indent=2) + "\n", encoding="utf-8")
+PY
+
 sleep 120 &
 alive_pid="$!"
 trap 'code=$?; kill "${alive_pid}" 2>/dev/null || true; wait "${alive_pid}" 2>/dev/null || true; cleanup_smoke_repos; exit "${code}"' EXIT
@@ -72,6 +93,8 @@ PY
 collect_json smoke-run "${repo}/grace.json"
 assert_json_expr "${repo}/grace.json" "payload['valid'] is True"
 assert_json_expr "${repo}/grace.json" "'handoff validation may be in progress' in '\\n'.join(payload['protocol_warnings'])"
+assert_json_expr "${repo}/grace.json" "payload['tasks'][0]['artifact_resolution']['protocol'] == 'legacy-v1'"
+assert_json_expr "${repo}/grace.json" "'research-dev-orchestrator/v0.5' in '\\n'.join(payload['protocol_warnings'])"
 
 python3 - <<'PY'
 import os

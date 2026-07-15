@@ -1,0 +1,390 @@
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from artifact_bundle import artifact_binding, file_sha256, publish_bundle
+from collect_status import (
+    collect,
+    load_events,
+    validate_approved_task,
+    validate_attempt,
+    validate_merged_task,
+)
+from protocol import PACKAGE_VERSION, PROTOCOL_VERSION, utc_now
+from task_contract import TASK_INPUT_FILENAMES, build_task_inputs_payload
+
+
+class CollectStatusV2Tests(unittest.TestCase):
+    def write_json(self, path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def make_run(self, root: Path, artifact_version: int) -> Path:
+        run = root / ".agent-collab" / "runs" / "run"
+        task = run / "tasks" / "T001"
+        task.mkdir(parents=True)
+        self.write_json(
+            run / "RUN.json",
+            {
+                "run_id": "run",
+                "package_version": PACKAGE_VERSION,
+                "protocol_version": PROTOCOL_VERSION,
+                "target_branch": "main",
+            },
+        )
+        (run / "EVENTS.ndjson").write_text("", encoding="utf-8")
+        (run / "JOURNAL.md").write_text("# Journal\n", encoding="utf-8")
+        self.write_json(
+            task / "STATUS.json",
+            {
+                "task_id": "T001",
+                "artifact_protocol_version": artifact_version,
+                "profile": "direct",
+                "state": "pending",
+                "previous_state": None,
+                "owner": "",
+                "branch": "agent/T001",
+                "worktree": ".agent-worktrees/T001",
+                "updated_at": "2026-07-15T00:00:00Z",
+                "needs_coordinator": False,
+                "summary": "",
+                "blocking_reason": "",
+                "blocker_type": "",
+                "current_attempt_id": None,
+                "assigned_worker": None,
+                "evidence": {"commands_run": [], "logs": [], "passed": None},
+                "state_history": [],
+            },
+        )
+        return run
+
+    def test_load_events_returns_each_record_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary)
+            (run / "EVENTS.ndjson").write_text(
+                json.dumps(
+                    {
+                        "at": "2026-07-15T00:00:00Z",
+                        "actor": "coordinator",
+                        "event": "run_created",
+                        "run_id": "run",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            events, violations, warnings = load_events(run, "run")
+            self.assertEqual(1, len(events))
+            self.assertEqual([], violations)
+            self.assertEqual([], warnings)
+
+    def test_collect_audit_warns_during_dispatch_interwrite_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary) / "tasks" / "T001"
+            attempt = task / "attempts" / "A001"
+            (attempt / "runtime").mkdir(parents=True)
+            status = {
+                "task_id": "T001",
+                "artifact_protocol_version": 2,
+                "profile": "delegated",
+                "state": "running",
+                "current_attempt_id": "A001",
+            }
+            self.write_json(task / "STATUS.json", status)
+            self.write_json(
+                attempt / "ATTEMPT.json",
+                {
+                    "attempt_id": "A001",
+                    "task_id": "T001",
+                    "agent": "claude-code",
+                    "agent_name": "worker",
+                    "session_id": "",
+                    "state": "completed",
+                    "handoff_valid": True,
+                    "handoff_state": "review",
+                    "started_at": utc_now(),
+                    "ended_at": utc_now(),
+                    "exit_code": 0,
+                    "phase": "execution",
+                    "runtime": {
+                        "backend": "plain",
+                        "cli": "claude",
+                        "command": "claude",
+                        "cwd": str(Path(temporary)),
+                    },
+                },
+            )
+            (task / "LOCK").write_text("attempt_id: A001\n", encoding="utf-8")
+            dispatch_lock = task / ".dispatch-lock"
+            dispatch_lock.mkdir()
+            (dispatch_lock / "attempt_id").write_text("A001\n", encoding="utf-8")
+            (dispatch_lock / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+            resolved = SimpleNamespace(
+                bundle=SimpleNamespace(handoff={"requested_state": "review"})
+            )
+            with patch("collect_status.resolve_task_artifacts", return_value=resolved):
+                violations, warnings, _attempt = validate_attempt(task, status, 10, 60)
+            self.assertEqual([], violations)
+            self.assertTrue(any("inter-write" in item for item in warnings))
+
+            metadata = json.loads((attempt / "ATTEMPT.json").read_text())
+            metadata["handoff_state"] = "strategy_review"
+            self.write_json(attempt / "ATTEMPT.json", metadata)
+            resolved.bundle.handoff["requested_state"] = "strategy_review"
+            with patch("collect_status.resolve_task_artifacts", return_value=resolved):
+                violations, _warnings, _attempt = validate_attempt(task, status, 10, 60)
+            self.assertTrue(any("not a recoverable" in item for item in violations))
+
+            metadata["handoff_state"] = "review"
+            metadata["ended_at"] = "2099-01-01T00:00:00Z"
+            self.write_json(attempt / "ATTEMPT.json", metadata)
+            resolved.bundle.handoff["requested_state"] = "review"
+            with patch("collect_status.resolve_task_artifacts", return_value=resolved):
+                violations, _warnings, _attempt = validate_attempt(task, status, 10, 60)
+            self.assertTrue(any("ended_at is in the future" in item for item in violations))
+
+            status["state"] = "planning"
+            metadata["phase"] = "planning"
+            metadata["handoff_state"] = "strategy_review"
+            metadata["ended_at"] = utc_now()
+            self.write_json(attempt / "ATTEMPT.json", metadata)
+            resolved.bundle.handoff["requested_state"] = "strategy_review"
+            with patch("collect_status.resolve_task_artifacts", return_value=resolved):
+                violations, _warnings, _attempt = validate_attempt(task, status, 10, 60)
+            self.assertTrue(
+                any("STATUS planning requires profile='full'" in item for item in violations)
+            )
+
+    def make_published_task(
+        self,
+        root: Path,
+        *,
+        profile: str = "delegated",
+        state: str = "approved",
+    ) -> tuple[Path, dict, str, dict]:
+        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.name", "Collect Test"], check=True)
+        (root / "tracked.txt").write_text("result\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", "result"], check=True)
+        commit = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+        ).strip()
+
+        run = self.make_run(root, 2)
+        task = run / "tasks" / "T001"
+        attempt = task / "attempts" / "A001"
+        runtime = attempt / "runtime"
+        runtime.mkdir(parents=True)
+        inputs = build_task_inputs_payload(
+            task_id="T001",
+            attempt_id="A001",
+            source_bytes={name: f"{name}\n".encode() for name in TASK_INPUT_FILENAMES},
+            task_base_commit=commit,
+            resolved_dependencies=[],
+        )
+        self.write_json(attempt / "TASK_INPUTS.json", inputs)
+        inputs_digest = hashlib.sha256((attempt / "TASK_INPUTS.json").read_bytes()).hexdigest()
+        self.write_json(
+            attempt / "ATTEMPT.json",
+            {
+                "schema_version": 2,
+                "artifact_protocol_version": 2,
+                "task_id": "T001",
+                "attempt_id": "A001",
+                "task_inputs_ref": "TASK_INPUTS.json",
+                "task_inputs_sha256": inputs_digest,
+                "state": "completed",
+                "handoff_valid": True,
+                "handoff_state": "verified" if profile == "direct" else "review",
+            },
+        )
+        self.write_json(runtime / "worktree-before.json", {"head": commit})
+        self.write_json(runtime / "worktree-after.json", {"head": commit})
+        requested_state = "verified" if profile == "direct" else "review"
+        bundle = publish_bundle(
+            attempt,
+            requested_state=requested_state,
+            summary="Frozen collect-status fixture.",
+            direct_self_review={
+                "performed": profile == "direct",
+                "passed": profile == "direct",
+                "summary": "Self-review passed." if profile == "direct" else "",
+                "findings": [],
+            },
+            source_commit=commit,
+            changed_paths=["tracked.txt"],
+            worktree={
+                "before": "runtime/worktree-before.json",
+                "after": "runtime/worktree-after.json",
+            },
+            expected_task_id="T001",
+            expected_attempt_id="A001",
+        )
+        status = json.loads((task / "STATUS.json").read_text(encoding="utf-8"))
+        status.update(
+            profile=profile,
+            state=state,
+            previous_state="review" if state == "approved" else ("approved" if profile != "direct" else "verified"),
+            owner="coordinator",
+            branch="main",
+            worktree=str(root),
+            current_attempt_id="A001",
+        )
+        self.write_json(task / "STATUS.json", status)
+
+        binding = artifact_binding(bundle)
+        if profile != "direct":
+            decision = {
+                "schema_version": 2,
+                "artifact_protocol_version": 2,
+                "task_id": "T001",
+                "revision": 1,
+                "decision": "approved",
+                "approved_commit": commit,
+                "source_branch": "main",
+                "target_branch": "main",
+                "artifact_binding": binding,
+            }
+            decision_path = task / "reviews" / "DECISION-v001.json"
+            self.write_json(decision_path, decision)
+            self.write_json(
+                task / "reviews" / "CURRENT_TASK_REVIEW.json",
+                {
+                    "revision": 1,
+                    "decision_path": "reviews/DECISION-v001.json",
+                    "decision_sha256": file_sha256(decision_path),
+                },
+            )
+        return task, status, commit, binding
+
+    def test_v2_pending_task_is_explicitly_unpublished_not_legacy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_run(root, 2)
+            with patch("collect_status.repo_root", return_value=root):
+                report = collect("run", 24)
+            self.assertTrue(report["valid"], report["protocol_violations"])
+            artifacts = report["tasks"][0]["artifact_resolution"]
+            self.assertTrue(artifacts["valid"])
+            self.assertEqual("v2", artifacts["protocol"])
+            self.assertEqual("unpublished", artifacts["publication_state"])
+
+    def test_unknown_artifact_protocol_makes_report_invalid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_run(root, 3)
+            with patch("collect_status.repo_root", return_value=root):
+                report = collect("run", 24)
+            self.assertFalse(report["valid"])
+            artifacts = report["tasks"][0]["artifact_resolution"]
+            self.assertFalse(artifacts["valid"])
+            self.assertIn("unsupported STATUS.artifact_protocol_version", artifacts["error"])
+            self.assertTrue(
+                any("artifact resolution failed" in item for item in report["protocol_violations"])
+            )
+
+    def test_v2_approved_revalidates_pointer_digest_and_bundle_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task, status, _, _ = self.make_published_task(Path(temporary))
+            self.assertEqual([], validate_approved_task(task, status))
+
+            pointer_path = task / "reviews" / "CURRENT_TASK_REVIEW.json"
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            pointer["decision_sha256"] = "0" * 64
+            self.write_json(pointer_path, pointer)
+            violations = validate_approved_task(task, status)
+            self.assertTrue(any("decision_sha256 does not match" in item for item in violations))
+
+    def test_v2_approved_rejects_rehashed_tampered_artifact_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task, status, _, _ = self.make_published_task(Path(temporary))
+            decision_path = task / "reviews" / "DECISION-v001.json"
+            decision = json.loads(decision_path.read_text(encoding="utf-8"))
+            decision["artifact_binding"]["evidence_sha256"] = "0" * 64
+            self.write_json(decision_path, decision)
+            pointer_path = task / "reviews" / "CURRENT_TASK_REVIEW.json"
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            pointer["decision_sha256"] = file_sha256(decision_path)
+            self.write_json(pointer_path, pointer)
+
+            violations = validate_approved_task(task, status)
+            self.assertTrue(any("artifact binding is invalid" in item for item in violations))
+
+    def test_v2_merged_revalidates_event_binding_for_delegated_and_direct(self):
+        for profile in ("delegated", "direct"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                task, status, commit, binding = self.make_published_task(
+                    root,
+                    profile=profile,
+                    state="merged",
+                )
+                event = {
+                    "event": "task_merged",
+                    "task_id": "T001",
+                    "commit": commit,
+                    "source_branch": "main",
+                    "target_branch": "main",
+                    "attempt_id": "A001",
+                    "artifact_binding": binding,
+                }
+                violations, warnings = validate_merged_task(
+                    root,
+                    task,
+                    status,
+                    {"target_branch": "main"},
+                    [event],
+                )
+                self.assertEqual([], violations)
+                self.assertEqual([], warnings)
+
+                event["artifact_binding"] = dict(binding)
+                event["artifact_binding"]["ready_sha256"] = "0" * 64
+                violations, _ = validate_merged_task(
+                    root,
+                    task,
+                    status,
+                    {"target_branch": "main"},
+                    [event],
+                )
+                self.assertTrue(
+                    any("task_merged artifact binding is invalid" in item for item in violations)
+                )
+
+    def test_v2_merged_rejects_event_attempt_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, status, commit, binding = self.make_published_task(
+                root,
+                profile="direct",
+                state="merged",
+            )
+            event = {
+                "event": "task_merged",
+                "task_id": "T001",
+                "commit": commit,
+                "source_branch": "main",
+                "target_branch": "main",
+                "attempt_id": "A999",
+                "artifact_binding": binding,
+            }
+            violations, _ = validate_merged_task(
+                root,
+                task,
+                status,
+                {"target_branch": "main"},
+                [event],
+            )
+            self.assertTrue(any("attempt_id does not match" in item for item in violations))
+
+
+if __name__ == "__main__":
+    unittest.main()

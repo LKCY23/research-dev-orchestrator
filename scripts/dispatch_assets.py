@@ -98,6 +98,9 @@ def render_worker_prompt(
 ) -> str:
     status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
     profile = status.get("profile", "full")
+    artifact_v2 = status.get("artifact_protocol_version") == 2
+    read_policy_path = attempt_dir / "runtime" / "READ_POLICY.json"
+    context_broker = Path(__file__).resolve().parent / "context_broker.py"
     coordinator_feedback = ""
     strategy_feedback = ""
     review_pointer = task_dir / "reviews" / "CURRENT_TASK_REVIEW.json"
@@ -175,6 +178,13 @@ def render_worker_prompt(
             f"- Write the strategy JSON outside the worktree, then run: python3 {Path(__file__).resolve().parent / 'rdo.py'} strategy {strategy_action} --task-dir {task_dir} --file <strategy-file>.",
             "- The complete minimal schema is embedded below. Adapt it to the task; do not inspect RDO source code or tests to rediscover the protocol.",
             "- Exit immediately after strategy submission; the coordinator reviews it in a separate step.",
+            *(
+                [
+                    f"- If planning is blocked, publish the conditional request with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --attempt-dir {attempt_dir} --state blocked --summary <summary> --blocker-type <type> --blocking-reason <reason>."
+                ]
+                if artifact_v2
+                else []
+            ),
             "",
             "### Minimal Valid Strategy Skeleton",
             "",
@@ -193,26 +203,62 @@ def render_worker_prompt(
                 f"- Read {attempt_dir / 'runtime' / 'RESUME_CONTEXT.json'} first. Do not rerun carried_forward_workflows; execute only remaining_workflows.",
                 f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} workflow start|heartbeat|complete for workflow instances.",
                 f"- For an independent review workflow, each declared native reviewer writes a non-empty artifact under {attempt_dir / 'runtime' / 'reviews'}; complete it with one --review-evidence REVIEWER_ID=ARTIFACT_PATH per reviewer. Reviewer IDs must match observed backend agent instances.",
-                f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> [--acceptance] -- <command> for bounded commands.",
+                f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> -- <command> for non-acceptance workflow commands.",
+                f"- Execute every required acceptance command exactly through: python3 {Path(__file__).resolve().parent / 'rdo.py'} check --attempt-dir {attempt_dir} --check-id <id> [--workflow-id <id> --instance-id <id>].",
                 "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
-                f"- After every required workflow completes, finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state review --summary <summary>.",
+                f"- After every required workflow and acceptance check completes, finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize {'--attempt-dir ' + str(attempt_dir) if artifact_v2 else '--task-dir ' + str(task_dir)} --state review --summary <summary>.",
                 "- A new workflow kind, larger budget, wider permission, or exhaustive search requires a strategy revision and checkpoint.",
             ])
         elif profile == "direct":
             phase_rules.extend([
-                "- Implement the task, run the acceptance commands, inspect the complete diff, and fix every self-review finding.",
+                "- Implement the task, inspect the complete diff, and fix every self-review finding.",
+                f"- Execute every required acceptance command exactly through: python3 {Path(__file__).resolve().parent / 'rdo.py'} check --attempt-dir {attempt_dir} --check-id <id>.",
                 "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 "- You own the final review. The coordinator will enforce only mechanical merge gates.",
-                f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state verified --self-review-passed --summary <summary> [--command <command>].",
+                f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize {'--attempt-dir ' + str(attempt_dir) if artifact_v2 else '--task-dir ' + str(task_dir)} --state verified --self-review-passed --summary <summary>.",
                 "- If independent judgment is needed, hand off blocked and request escalation to delegated instead of self-approving.",
             ])
         else:
             phase_rules.extend([
-                "- Implement the task, run acceptance commands, and self-review the diff before handoff.",
+                "- Implement the task and self-review the diff before handoff.",
+                f"- Execute every required acceptance command exactly through: python3 {Path(__file__).resolve().parent / 'rdo.py'} check --attempt-dir {attempt_dir} --check-id <id>.",
                 "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 "- The coordinator owns the independent code review and merge decision.",
-                f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --task-dir {task_dir} --state review --summary <summary> [--command <command>].",
+                f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize {'--attempt-dir ' + str(attempt_dir) if artifact_v2 else '--task-dir ' + str(task_dir)} --state review --summary <summary>.",
             ])
+        if artifact_v2:
+            phase_rules.append(
+                f"- If blocked, publish only the conditional request with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize --attempt-dir {attempt_dir} --state blocked --summary <summary> --blocker-type <type> --blocking-reason <reason>."
+            )
+    if artifact_v2:
+        protocol_paths = [
+            f"- TASK_DIR: {task_dir}",
+            f"- STATUS_PATH: {status_path}",
+            f"- ATTEMPT_DIR: {attempt_dir}",
+            f"- TASK_INPUTS_PATH: {attempt_dir / 'TASK_INPUTS.json'}",
+            f"- EVIDENCE_PATH: {attempt_dir / 'EVIDENCE.json'}",
+            f"- HANDOFF_JSON_PATH: {attempt_dir / 'HANDOFF.json'}",
+            f"- HANDOFF_READY_PATH: {attempt_dir / 'runtime' / 'HANDOFF_READY.json'}",
+            f"- LOGS_DIR: {attempt_dir / 'runtime'}",
+        ]
+        artifact_reminder = (
+            "- Do not hand-edit EVIDENCE.json, HANDOFF.json, HANDOFF_READY.json, "
+            "TASK_INPUTS.json, or COMMANDS.ndjson; rdo check/finalize publish them."
+        )
+    else:
+        protocol_paths = [
+            f"- TASK_DIR: {task_dir}",
+            f"- STATUS_PATH: {status_path}",
+            f"- EVIDENCE_PATH: {task_dir / 'EVIDENCE.md'}",
+            f"- HANDOFF_PATH: {task_dir / 'HANDOFF.md'}",
+            f"- HANDOFF_JSON_PATH: {task_dir / 'HANDOFF.json'}",
+            f"- ATTEMPT_DIR: {attempt_dir}",
+            f"- LOGS_DIR: {task_dir / 'logs'}",
+        ]
+        artifact_reminder = (
+            "- Do not hand-edit EVIDENCE.md, HANDOFF.md, HANDOFF.json, or "
+            "COMPLETION.json; rdo strategy/finalize writes them atomically."
+        )
     return "\n".join(
         [
             "# Worker Task Prompt",
@@ -227,15 +273,9 @@ def render_worker_prompt(
             "",
             f"- WORKTREE_PATH: {worktree_path}",
             "",
-            "The orchestration protocol files are outside the worktree. Write to these absolute paths:",
+            "The orchestration protocol files are outside the worktree. Use these absolute paths:",
             "",
-            f"- TASK_DIR: {task_dir}",
-            f"- STATUS_PATH: {status_path}",
-            f"- EVIDENCE_PATH: {task_dir / 'EVIDENCE.md'}",
-            f"- HANDOFF_PATH: {task_dir / 'HANDOFF.md'}",
-            f"- HANDOFF_JSON_PATH: {task_dir / 'HANDOFF.json'}",
-            f"- ATTEMPT_DIR: {attempt_dir}",
-            f"- LOGS_DIR: {task_dir / 'logs'}",
+            *protocol_paths,
             "",
             "Do not create alternate STATUS/EVIDENCE/HANDOFF files inside the worktree.",
             "",
@@ -244,9 +284,20 @@ def render_worker_prompt(
             "- Do not edit STATUS.json. Dispatch owns task state transitions.",
             "- Use the provided rdo command for strategy submission or final handoff; do not hand-edit task state.",
             "- If blocked, blocker_type must be one of: needs_coordinator, needs_user, environment, budget, irrecoverable.",
-            "- Do not hand-edit EVIDENCE.md, HANDOFF.md, HANDOFF.json, or COMPLETION.json; rdo strategy/finalize writes them atomically.",
+            artifact_reminder,
             "- Call the final strategy submission or finalize command once, after its prerequisites pass.",
             "- Keep code changes inside allowed_paths.",
+            "",
+            "## Context Access",
+            "",
+            "- Treat CONTEXT.md as the frozen decision capsule. Start there; do not rediscover decisions from broad repository reading.",
+            "- Search narrowly with the backend's native search/Glob/Grep or rg before opening files.",
+            "- Do not read another task's worktree. Large Markdown outside the write scope must be read with offset/limit.",
+            f"- Machine policy: {read_policy_path}",
+            f"- List indexed headings: python3 {context_broker} --policy {read_policy_path} index [--source <path>]",
+            f"- Search indexed sources: python3 {context_broker} --policy {read_policy_path} search --query <pattern> [--source <path>]",
+            f"- Retrieve one section: python3 {context_broker} --policy {read_policy_path} get --source <path> --section <heading> --question <specific-question>",
+            "- Context Broker retrieval is deterministic and bounded. Do not launch a model or subagent merely to extract a document section.",
             "",
             *phase_rules,
             "",

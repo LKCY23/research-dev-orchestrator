@@ -105,9 +105,9 @@ rdo = [sys.executable, "${RDO_ROOT}/scripts/rdo.py"]
 duplicate = subprocess.run(rdo + ["workflow", "start", "--attempt-dir", str(attempt), "--workflow-id", "WF-implementation", "--instance-id", "duplicate"], capture_output=True, text=True)
 assert duplicate.returncode != 0 and "already satisfied" in duplicate.stderr, duplicate
 subprocess.run(rdo + ["workflow", "start", "--attempt-dir", str(attempt), "--workflow-id", "WF-acceptance", "--instance-id", "accept-I001"], check=True)
-subprocess.run(rdo + ["exec", "--attempt-dir", str(attempt), "--workflow-id", "WF-acceptance", "--instance-id", "accept-I001", "--timeout", "5", "--acceptance", "--", "/usr/bin/true"], check=True)
+subprocess.run(rdo + ["check", "--attempt-dir", str(attempt), "--check-id", "smoke", "--workflow-id", "WF-acceptance", "--instance-id", "accept-I001"], check=True)
 subprocess.run(rdo + ["workflow", "complete", "--attempt-dir", str(attempt), "--workflow-id", "WF-acceptance", "--instance-id", "accept-I001"], check=True)
-subprocess.run(rdo + ["finalize", "--task-dir", str(task), "--state", "review", "--summary", "semantic resume complete"], check=True)
+subprocess.run(rdo + ["finalize", "--attempt-dir", str(attempt), "--state", "review", "--summary", "semantic resume complete"], check=True)
 PY
 chmod +x "${worker}"
 
@@ -124,4 +124,8 @@ metadata = json.loads((attempt / "ATTEMPT.json").read_text())
 assert metadata["execution_mode"] == "replace", metadata
 records = [json.loads(line) for line in (attempt / "runtime" / "WORKFLOWS.ndjson").read_text().splitlines()]
 assert [item["event"] for item in records] == ["workflow_carried_forward", "workflow_started", "workflow_completed"], records
+ready = json.loads((attempt / "runtime" / "HANDOFF_READY.json").read_text())
+evidence = json.loads((attempt / "EVIDENCE.json").read_text())
+assert ready["requested_state"] == "review"
+assert [item["check_id"] for item in evidence["command_records"]] == ["smoke"]
 PY

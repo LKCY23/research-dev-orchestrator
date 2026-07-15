@@ -1,0 +1,21 @@
+{
+  "schema_version": 2,
+  "strategy_required": true,
+  "attempt_wall_seconds": 2700,
+  "max_workflows": 6,
+  "max_workflow_instances": 12,
+  "max_parallel_workflows": 2,
+  "max_subagents": 4,
+  "max_parallel_subagents": 2,
+  "default_command_seconds": 120,
+  "max_enumerated_cases": 10000,
+  "allow_unbounded_search": false,
+  "allowed_paths": [
+    "RDO_TEMPLATE_INCOMPLETE"
+  ],
+  "read_paths": [
+    "RDO_TEMPLATE_INCOMPLETE"
+  ],
+  "forbidden_paths": [],
+  "context_sources": []
+}

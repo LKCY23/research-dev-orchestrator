@@ -1,17 +1,31 @@
-# Task {{TASK_ID}}
+# Task
 
-```yaml
-task_id: {{TASK_ID}}
-profile: {{PROFILE}}
-goal: {{GOAL}}
-allowed_paths:
-{{ALLOWED_PATHS}}
-forbidden_paths:
-{{FORBIDDEN_PATHS}}
-dependencies:
-{{DEPENDENCIES}}
-branch: {{BRANCH}}
-worktree: {{WORKTREE}}
-non_goals:
-  - Do not expand scope beyond this task packet.
+## Objective
+
+RDO_TEMPLATE_INCOMPLETE: state the single outcome this task must achieve.
+
+## Deliverables
+
+- RDO_TEMPLATE_INCOMPLETE: list each required deliverable.
+
+## Invariants
+
+- RDO_TEMPLATE_INCOMPLETE: list conditions that must remain true.
+
+## Non-goals
+
+- RDO_TEMPLATE_INCOMPLETE: list work that is explicitly outside this task.
+
+## Dependencies
+
+```json rdo-task-dependencies
+{
+  "schema_version": 2,
+  "dependencies": [
+    {
+      "task_id": "RDO_TEMPLATE_INCOMPLETE",
+      "required_state": "merged"
+    }
+  ]
+}
 ```

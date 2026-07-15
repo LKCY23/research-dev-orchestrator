@@ -17,7 +17,7 @@ class StrategyValidationError(ValueError):
 
 
 DEFAULT_EXECUTION_POLICY: dict[str, Any] = {
-    "schema_version": 1,
+    "schema_version": 2,
     "strategy_required": True,
     "attempt_wall_seconds": 2700,
     "max_workflows": 6,
@@ -29,7 +29,9 @@ DEFAULT_EXECUTION_POLICY: dict[str, Any] = {
     "max_enumerated_cases": 10000,
     "allow_unbounded_search": False,
     "allowed_paths": ["."],
+    "read_paths": ["."],
     "forbidden_paths": [],
+    "context_sources": [],
 }
 
 WORKFLOW_TIMEOUT_ACTIONS = {"block", "request_revision", "continue_without_result"}
@@ -58,8 +60,9 @@ def _positive_int(payload: dict[str, Any], field: str, *, allow_zero: bool = Fal
 def validate_execution_policy(policy: Any) -> dict[str, Any]:
     if not isinstance(policy, dict):
         raise StrategyValidationError("execution policy must be a JSON object")
-    if policy.get("schema_version") != 1:
-        raise StrategyValidationError("execution policy schema_version must be 1")
+    schema_version = policy.get("schema_version")
+    if schema_version not in {1, 2}:
+        raise StrategyValidationError("execution policy schema_version must be 1 or 2")
     if not isinstance(policy.get("strategy_required"), bool):
         raise StrategyValidationError("strategy_required must be boolean")
     for field in (
@@ -83,6 +86,16 @@ def validate_execution_policy(policy: Any) -> dict[str, Any]:
         values = policy.get(field)
         if not isinstance(values, list) or not all(is_non_empty_string(item) for item in values):
             raise StrategyValidationError(f"{field} must be a string list")
+    read_paths = policy.get("read_paths", ["."])
+    if not isinstance(read_paths, list) or not read_paths or not all(is_non_empty_string(item) for item in read_paths):
+        raise StrategyValidationError("read_paths must be a non-empty string list")
+    context_sources = policy.get("context_sources", [])
+    if schema_version == 2 and "context_sources" not in policy:
+        raise StrategyValidationError("schema 2 execution policy requires context_sources")
+    if not isinstance(context_sources, list) or not all(
+        is_non_empty_string(item) for item in context_sources
+    ):
+        raise StrategyValidationError("context_sources must be a string list")
     return policy
 
 
@@ -496,4 +509,52 @@ def load_approved_strategy(task_dir: Path) -> tuple[dict[str, Any], dict[str, An
     if current.get("strategy_sha256") != digest:
         raise StrategyValidationError("CURRENT strategy digest mismatch")
     validate_strategy(strategy, load_execution_policy(task_dir), task_id=load_json(task_dir / "STATUS.json")["task_id"])
+    return strategy, review
+
+
+def load_bound_approved_strategy(
+    task_dir: Path,
+    *,
+    strategy_id: Any,
+    strategy_sha256: Any,
+    revision: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load the exact coordinator-approved strategy frozen for one attempt.
+
+    Unlike ``load_approved_strategy``, this deliberately ignores a mutable
+    ``CURRENT.json`` pointer.  The caller supplies the launch-time identity and
+    digest, so a later pointer change or an in-place strategy rewrite cannot
+    widen an active attempt's authority.
+    """
+
+    if not is_non_empty_string(strategy_id):
+        raise StrategyValidationError("bound strategy_id must be a non-empty string")
+    if not isinstance(strategy_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", strategy_sha256
+    ):
+        raise StrategyValidationError("bound strategy_sha256 must be a SHA-256 digest")
+    if not is_int_not_bool(revision) or revision < 1:
+        raise StrategyValidationError("bound strategy revision must be a positive integer")
+
+    strategy = load_json(strategy_path(task_dir, revision))
+    review = load_json(review_path(task_dir, revision))
+    digest = canonical_digest(strategy)
+    if (
+        strategy.get("strategy_id") != strategy_id
+        or strategy.get("revision") != revision
+        or digest != strategy_sha256
+    ):
+        raise StrategyValidationError("strategy bytes do not match the attempt-frozen binding")
+    if (
+        review.get("decision") != "approved"
+        or review.get("strategy_id") != strategy_id
+        or review.get("strategy_sha256") != strategy_sha256
+    ):
+        raise StrategyValidationError("strategy review does not match the attempt-frozen approval")
+    status = load_json(task_dir / "STATUS.json")
+    validate_strategy(
+        strategy,
+        load_execution_policy(task_dir),
+        task_id=status["task_id"],
+    )
     return strategy, review

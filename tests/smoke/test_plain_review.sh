@@ -20,7 +20,12 @@ from pathlib import Path
 
 task = Path(".agent-collab/runs/smoke-run/tasks/T001-plain")
 status = json.load(open(task / "STATUS.json", encoding="utf-8"))
+attempt = task / "attempts" / status["current_attempt_id"]
 assert status["state_history"][-1]["from"] == "running"
 assert status["state_history"][-1]["to"] == "review"
 assert status["state_history"][-1]["actor"] == "dispatch"
+assert json.load(open(attempt / "runtime" / "HANDOFF_READY.json", encoding="utf-8"))["requested_state"] == "review"
+assert (attempt / "HANDOFF.json").is_file()
+assert (attempt / "EVIDENCE.json").is_file()
+assert not (task / "HANDOFF.json").exists()
 PY

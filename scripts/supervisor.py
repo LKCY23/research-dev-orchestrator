@@ -8,9 +8,13 @@ import json
 import signal
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, IO, Sequence
+from typing import Callable, IO, Mapping, Sequence
+
+
+SUPERVISION_TOKEN_ENV = "RDO_SUPERVISION_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -54,13 +58,69 @@ def descendants(root_pid: int, table: dict[int, tuple[int, int]] | None = None) 
     return found
 
 
+def supervision_environment(
+    base: Mapping[str, str] | None = None,
+) -> tuple[dict[str, str], str]:
+    """Return a child environment carrying an inherited supervision token."""
+
+    environment = dict(os.environ if base is None else base)
+    token = uuid.uuid4().hex
+    environment[SUPERVISION_TOKEN_ENV] = token
+    return environment, token
+
+
+def tagged_processes(token: str, table: dict[int, tuple[int, int]]) -> set[int]:
+    """Find descendants that detached/reparented but retained our launch token."""
+
+    needle = f"{SUPERVISION_TOKEN_ENV}={token}"
+    tagged: set[int] = set()
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid not in table:
+                continue
+            try:
+                environment = (entry / "environ").read_bytes().split(b"\0")
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                continue
+            if needle.encode("utf-8") in environment:
+                tagged.add(pid)
+        return tagged
+
+    try:
+        output = subprocess.check_output(
+            ["ps", "eww", "-axo", "pid=,ppid=,pgid=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return tagged
+    for line in output.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) != 4 or needle not in parts[3]:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid in table:
+            tagged.add(pid)
+    return tagged
+
+
 def current_termination_targets(
     root_pid: int,
     table: dict[int, tuple[int, int]],
+    supervision_token: str | None = None,
 ) -> tuple[set[int], set[int]]:
     """Return only process identities that belong to the current descendant tree."""
 
     pids = descendants(root_pid, table)
+    if supervision_token:
+        pids.update(tagged_processes(supervision_token, table))
     pgids = {table[pid][1] for pid in pids if pid in table}
     pgids.add(root_pid)
     return pids, pgids
@@ -135,6 +195,7 @@ def run_supervised(
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
     started = time.monotonic()
+    child_environment, supervision_token = supervision_environment()
     process = subprocess.Popen(
         list(argv),
         cwd=str(cwd) if cwd else None,
@@ -142,6 +203,7 @@ def run_supervised(
         stdout=stdout,
         stderr=stderr,
         start_new_session=True,
+        env=child_environment,
     )
     observed_pids: set[int] = {process.pid}
     observed_pgids: set[int] = {process.pid}
@@ -155,7 +217,11 @@ def run_supervised(
     while process.poll() is None:
         try:
             table = _process_table()
-            current, current_pgids = current_termination_targets(process.pid, table)
+            current, current_pgids = current_termination_targets(
+                process.pid,
+                table,
+                supervision_token,
+            )
             observed_pids.update(current)
             observed_pgids.update(current_pgids)
             termination_pids = current
@@ -199,7 +265,11 @@ def run_supervised(
         time.sleep(0.1)
     try:
         table = _process_table()
-        current, current_pgids = current_termination_targets(process.pid, table)
+        current, current_pgids = current_termination_targets(
+            process.pid,
+            table,
+            supervision_token,
+        )
         observed_pids.update(current)
         observed_pgids.update(current_pgids)
         termination_pids = current

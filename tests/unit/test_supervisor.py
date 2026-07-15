@@ -1,5 +1,9 @@
+import sys
+import subprocess
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
 from supervisor import current_termination_targets, pid_alive, run_supervised
 
@@ -32,6 +36,30 @@ class SupervisorTests(unittest.TestCase):
         self.assertNotEqual(0, result.child_exit_code)
         self.assertFalse(any(pid_alive(pid) for pid in result.observed_pids))
         self.assertEqual((), result.surviving_pids)
+
+    def test_natural_parent_exit_cleans_reparented_setsid_child(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sentinel = Path(temporary) / "late.txt"
+            child = (
+                "import pathlib,time; time.sleep(0.6); "
+                f"pathlib.Path({str(sentinel)!r}).write_text('late')"
+            )
+            parent = (
+                "import subprocess,sys; "
+                f"subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True)"
+            )
+            result = run_supervised(
+                [sys.executable, "-c", parent],
+                timeout_seconds=2,
+                grace_seconds=0.05,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.assertEqual(0, result.exit_code)
+            self.assertGreaterEqual(len(result.observed_pids), 2)
+            time.sleep(0.75)
+            self.assertFalse(sentinel.exists())
+            self.assertEqual((), result.surviving_pids)
 
     def test_termination_uses_current_descendants_not_historical_pids(self):
         historical_pid = 41003

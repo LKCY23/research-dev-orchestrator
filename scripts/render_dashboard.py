@@ -63,6 +63,48 @@ def render_task_card(run_dir: Path, task: dict[str, Any]) -> str:
             "</div>"
         )
 
+    artifact_resolution = task.get("artifact_resolution")
+    protocol_label = "legacy-v0.5"
+    artifact_links = ""
+    artifact_error = ""
+    if isinstance(artifact_resolution, dict):
+        protocol_label = str(
+            artifact_resolution.get("protocol")
+            or artifact_resolution.get("artifact_protocol_version")
+            or "unknown"
+        )
+        if artifact_resolution.get("valid") is False:
+            artifact_error = (
+                '<div class="blocker"><strong>artifact invalid</strong>'
+                f"<p>{esc(artifact_resolution.get('error') or '')}</p></div>"
+            )
+        refs = artifact_resolution.get("artifact_refs")
+        if artifact_resolution.get("valid") is True and isinstance(refs, dict):
+            labels = (
+                ("attempt", "ATTEMPT"),
+                ("task_inputs", "TASK_INPUTS"),
+                ("evidence", "EVIDENCE.json"),
+                ("handoff", "HANDOFF.json"),
+                ("handoff_ready", "HANDOFF_READY"),
+                ("commands", "COMMANDS"),
+                ("evidence_markdown", "EVIDENCE"),
+                ("handoff_markdown", "HANDOFF"),
+                ("handoff_json", "HANDOFF.json"),
+            )
+            artifact_links = "\n".join(
+                rel_link(run_dir, refs[key], label)
+                for key, label in labels
+                if isinstance(refs.get(key), str)
+            )
+    if not artifact_links and protocol_label.startswith("legacy"):
+        artifact_links = "\n".join(
+            (
+                rel_link(run_dir, task_dir / "EVIDENCE.md", "EVIDENCE"),
+                rel_link(run_dir, task_dir / "HANDOFF.md", "HANDOFF"),
+                rel_link(run_dir, task_dir / "HANDOFF.json", "HANDOFF.json"),
+            )
+        )
+
     return f"""
       <article class="task-card">
         <div class="task-head">
@@ -73,15 +115,15 @@ def render_task_card(run_dir: Path, task: dict[str, Any]) -> str:
         <div class="meta">
           <span>attempt: {esc(task.get("current_attempt_id") or "-")}</span>
           <span>owner: {esc(task.get("owner") or "-")}</span>
+          <span>artifacts: {esc(protocol_label)}</span>
           {handoff_meta}
         </div>
         {blocker}
+        {artifact_error}
         <div class="links">
           {rel_link(run_dir, task_dir / "STATUS.json", "STATUS")}
           {rel_link(run_dir, task_dir / "ACCEPTANCE.md", "ACCEPTANCE")}
-          {rel_link(run_dir, task_dir / "EVIDENCE.md", "EVIDENCE")}
-          {rel_link(run_dir, task_dir / "HANDOFF.md", "HANDOFF")}
-          {rel_link(run_dir, task_dir / "HANDOFF.json", "HANDOFF.json")}
+          {artifact_links}
         </div>
       </article>
     """

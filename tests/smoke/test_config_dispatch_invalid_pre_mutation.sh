@@ -45,6 +45,7 @@ python3 "${RDO_ROOT}/scripts/create_task.py" \
   --task-id T001-invalid-bool \
   --goal invalid-bool \
   --allowed-paths file.txt >/dev/null
+complete_task_contract smoke-run-bool T001-invalid-bool invalid-bool
 
 set +e
 RDO_TMUX_KEEP_SESSION=maybe \

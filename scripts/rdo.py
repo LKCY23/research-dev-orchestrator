@@ -4,21 +4,92 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shlex
 import subprocess
 import sys
 import hashlib
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from artifact_bundle import (
+    ArtifactBundleError,
+    READY_REF,
+    artifact_binding,
+    build_required_output_bindings,
+    command_record_sha256,
+    file_sha256,
+    load_bundle,
+    load_command_records,
+    publish_bundle,
+    publish_json_once,
+    validate_artifact_binding,
+    validate_required_output_bindings,
+    validate_task_inputs_binding,
+)
+from artifact_resolver import ArtifactResolutionError, require_current_bundle
 from completion import write_completion
-from protocol import SKILL_ROOT, append_event, load_json, parse_iso, repo_root, utc_now, write_json
-from strategy import StrategyValidationError, canonical_digest, load_approved_strategy, review_strategy, submit_strategy
+from protocol import (
+    ARTIFACT_PROTOCOL_VERSION,
+    EventJournalError,
+    SKILL_ROOT,
+    append_event,
+    artifact_protocol_version,
+    load_json,
+    parse_iso,
+    read_event_journal,
+    repo_root,
+    utc_now,
+    write_json,
+)
+from strategy import (
+    StrategyValidationError,
+    canonical_digest,
+    load_approved_strategy,
+    load_bound_approved_strategy,
+    review_strategy,
+    submit_strategy,
+)
 from supervisor import run_supervised, terminate_processes
+from task_contract import (
+    TASK_INPUT_FILENAMES,
+    TaskContractError,
+    parse_acceptance_markdown,
+    parse_execution_policy,
+    validate_task_inputs_payload,
+)
 from worktree_fingerprint import fingerprint
+
+
+@contextmanager
+def attempt_artifact_lock(attempt_value: str | Path, *, exclusive: bool):
+    """Coordinate live v2 command writers with immutable finalization.
+
+    Checks and workflow commands hold a shared lock for their whole supervised
+    process lifetime. Finalization takes the exclusive lock, so READY cannot be
+    published while a command can still append raw facts afterward.
+    """
+
+    attempt = Path(attempt_value).resolve()
+    if attempt.parent.name != "attempts" or attempt.name in {"", ".", ".."}:
+        raise SystemExit("attempt directory must be task-local under attempts/")
+    runtime = attempt / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    lock_path = runtime / "ARTIFACT_LOCK"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield attempt
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def task_dir(value: str) -> Path:
@@ -26,6 +97,286 @@ def task_dir(value: str) -> Path:
     if not (path / "STATUS.json").exists():
         raise SystemExit(f"invalid task directory: {path}")
     return path
+
+
+def task_protocol(path: Path, status: dict[str, Any] | None = None) -> int:
+    """Resolve one task's explicit artifact protocol, failing closed on unknown versions."""
+
+    version = artifact_protocol_version(path, status)
+    if version not in {1, ARTIFACT_PROTOCOL_VERSION}:
+        raise SystemExit("task uses an unknown artifact protocol version")
+    return version
+
+
+def _read_text_file(path: Path, *, label: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(f"cannot read {label}: {exc}") from exc
+
+
+def _require_attempt_ownership(
+    attempt_value: str | Path,
+    *,
+    allow_ready: bool,
+) -> tuple[Path, Path, dict[str, Any], dict[str, Any], Any]:
+    """Bind a worker mutation to the exact active v2 attempt and dispatch locks."""
+
+    attempt = Path(attempt_value).resolve()
+    if attempt.parent.name != "attempts":
+        raise SystemExit("attempt directory must be task-local under attempts/")
+    task = attempt.parent.parent.resolve()
+    if attempt.parent.resolve() != (task / "attempts").resolve() or attempt.name in {"", ".", ".."}:
+        raise SystemExit("attempt directory is not owned by the task")
+    status = load_json(task / "STATUS.json")
+    if not isinstance(status, dict):
+        raise SystemExit("STATUS.json must contain an object")
+    if task_protocol(task, status) != ARTIFACT_PROTOCOL_VERSION:
+        raise SystemExit("this command requires Artifact Protocol v2")
+    if status.get("current_attempt_id") != attempt.name:
+        raise SystemExit("command requires the task's current attempt")
+    if status.get("state") not in {"planning", "running"}:
+        raise SystemExit("command requires an active planning or execution task")
+    metadata = load_json(attempt / "ATTEMPT.json")
+    if not isinstance(metadata, dict):
+        raise SystemExit("ATTEMPT.json must contain an object")
+    if metadata.get("attempt_id") != attempt.name or metadata.get("task_id") != status.get("task_id"):
+        raise SystemExit("ATTEMPT.json identity does not match the active task/attempt")
+    if metadata.get("state") not in {"created", "running"}:
+        raise SystemExit("attempt is not active")
+
+    dispatch_lock = task / ".dispatch-lock" / "attempt_id"
+    if not dispatch_lock.is_file() or _read_text_file(dispatch_lock, label="dispatch lock").strip() != attempt.name:
+        raise SystemExit("active attempt does not own the dispatch lock")
+    protocol_lock = task / "LOCK"
+    if not protocol_lock.is_file():
+        raise SystemExit("active attempt does not own the task LOCK")
+    lock_lines = _read_text_file(protocol_lock, label="task LOCK").splitlines()
+    if f"attempt_id: {attempt.name}" not in lock_lines:
+        raise SystemExit("task LOCK belongs to a different attempt")
+    if not allow_ready and (attempt / READY_REF).exists():
+        raise SystemExit("handoff is already published; command evidence is frozen")
+    try:
+        binding = validate_task_inputs_binding(
+            attempt,
+            expected_task_id=str(status.get("task_id")),
+            expected_attempt_id=attempt.name,
+        )
+    except ArtifactBundleError as exc:
+        raise SystemExit(f"invalid attempt input binding: {exc}") from exc
+    if status.get("profile") == "full" and metadata.get("phase") == "execution":
+        _bound_strategy_for_attempt(task, attempt, metadata)
+    return attempt, task, status, metadata, binding
+
+
+def _bound_strategy_for_attempt(
+    task: Path,
+    attempt: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve the exact Full strategy bound before this worker was launched."""
+
+    try:
+        profile = load_json(attempt / "runtime" / "BACKEND_PROFILE.json")
+    except Exception as exc:
+        raise SystemExit(f"attempt backend profile cannot bind its strategy: {exc}") from exc
+    if not isinstance(profile, dict):
+        raise SystemExit("attempt backend profile must be an object")
+    for field in ("strategy_id", "strategy_revision", "strategy_sha256"):
+        if profile.get(field) != metadata.get(field):
+            raise SystemExit(
+                f"ATTEMPT.{field} does not match the launch-time backend profile"
+            )
+    try:
+        strategy, _review = load_bound_approved_strategy(
+            task,
+            strategy_id=metadata.get("strategy_id"),
+            strategy_sha256=metadata.get("strategy_sha256"),
+            revision=metadata.get("strategy_revision"),
+        )
+    except (OSError, StrategyValidationError, KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(f"attempt-frozen strategy binding is invalid: {exc}") from exc
+    return strategy
+
+
+def _validate_frozen_sources(attempt: Path, task: Path, binding: Any) -> dict[str, Any]:
+    """Verify task-root canonical inputs still match this attempt's immutable snapshot."""
+
+    try:
+        inputs = validate_task_inputs_payload(binding.task_inputs)
+    except TaskContractError as exc:
+        raise SystemExit(f"invalid TASK_INPUTS.json: {exc}") from exc
+    task_root = task.resolve()
+    descriptors = inputs["inputs"]
+    input_names = {
+        "task": "TASK.md",
+        "context": "CONTEXT.md",
+        "acceptance": "ACCEPTANCE.md",
+        "execution_policy": "EXECUTION_POLICY.json",
+    }
+    for name, filename in input_names.items():
+        descriptor = descriptors[name]
+        source = (task_root / descriptor["ref"]).resolve()
+        raw_expected = task_root / filename
+        expected = raw_expected.resolve()
+        if source != expected or expected.parent != task_root:
+            raise SystemExit(f"TASK_INPUTS.json {filename} ref does not resolve to the canonical task input")
+        if raw_expected.is_symlink() or not expected.is_file():
+            raise SystemExit(f"canonical task input is missing or unsafe: {filename}")
+        if file_sha256(expected) != descriptor["sha256"]:
+            raise SystemExit(
+                f"task input contract drifted after dispatch: {filename}; create a revision task"
+            )
+    try:
+        acceptance = parse_acceptance_markdown(
+            (task_root / "ACCEPTANCE.md").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, TaskContractError) as exc:
+        raise SystemExit(f"frozen ACCEPTANCE.md is invalid: {exc}") from exc
+    return acceptance["contract"]
+
+
+def _worktree_for_attempt(metadata: dict[str, Any]) -> Path:
+    runtime = metadata.get("runtime")
+    cwd = runtime.get("cwd") if isinstance(runtime, dict) else None
+    if not isinstance(cwd, str) or not cwd:
+        raise SystemExit("ATTEMPT.json runtime.cwd is missing")
+    worktree = Path(cwd).resolve()
+    if not worktree.is_dir():
+        raise SystemExit(f"attempt worktree does not exist: {worktree}")
+    return worktree
+
+
+def _command_cwd(worktree: Path, relative: str) -> Path:
+    candidate = (worktree / relative).resolve()
+    try:
+        candidate.relative_to(worktree.resolve())
+    except ValueError as exc:
+        raise SystemExit(f"acceptance command cwd escapes the task worktree: {relative!r}") from exc
+    if not candidate.is_dir():
+        raise SystemExit(f"acceptance command cwd does not exist: {relative!r}")
+    return candidate
+
+
+def _append_command_record(path: Path, record: dict[str, Any]) -> None:
+    """Append one complete NDJSON record with a single O_APPEND write."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        written = os.write(descriptor, encoded)
+        if written != len(encoded):
+            raise OSError(f"short append: wrote {written} of {len(encoded)} bytes")
+        os.fsync(descriptor)
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _check_command_locked(args: argparse.Namespace) -> int:
+    """Execute one exact required acceptance command under shared supervision."""
+
+    attempt, task, status, metadata, binding = _require_attempt_ownership(
+        args.attempt_dir,
+        allow_ready=False,
+    )
+    if metadata.get("phase") != "execution" or status.get("state") != "running":
+        raise SystemExit("rdo check requires the current running execution attempt")
+    if bool(getattr(args, "workflow_id", "")) != bool(getattr(args, "instance_id", "")):
+        raise SystemExit("--workflow-id and --instance-id must be supplied together")
+    if getattr(args, "workflow_id", ""):
+        active: set[tuple[str, str]] = set()
+        for item in workflow_events(attempt):
+            key = (str(item.get("workflow_id")), str(item.get("instance_id")))
+            if item.get("event") == "workflow_started":
+                active.add(key)
+            elif item.get("event") in {
+                "workflow_completed",
+                "workflow_timed_out",
+                "workflow_cancelled",
+            }:
+                active.discard(key)
+        if (args.workflow_id, args.instance_id) not in active:
+            raise SystemExit("rdo check workflow binding is not an active workflow instance")
+    contract = _validate_frozen_sources(attempt, task, binding)
+    definitions = {
+        item["id"]: item for item in contract.get("required_commands", [])
+    }
+    definition = definitions.get(args.check_id)
+    if definition is None:
+        raise SystemExit(f"unknown required acceptance check id: {args.check_id!r}")
+
+    worktree = _worktree_for_attempt(metadata)
+    cwd = _command_cwd(worktree, definition["cwd"])
+    record_id = f"C-{uuid.uuid4().hex}"
+    command_dir = attempt / "runtime" / "commands"
+    command_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = command_dir / f"{record_id}.stdout.log"
+    stderr_path = command_dir / f"{record_id}.stderr.log"
+    started_at = utc_now()
+    try:
+        with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+            result = run_supervised(
+                definition["argv"],
+                timeout_seconds=float(definition["timeout_seconds"]),
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+            )
+        exit_code = result.exit_code
+        timed_out = result.timed_out
+        elapsed_seconds = result.elapsed_seconds
+        survivors = list(result.surviving_pids)
+    except OSError as exc:
+        stderr_path.write_text(f"command could not start: {exc}\n", encoding="utf-8")
+        stdout_path.touch(exist_ok=True)
+        exit_code = 127
+        timed_out = False
+        elapsed_seconds = 0.0
+        survivors = []
+
+    record: dict[str, Any] = {
+        "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
+        "schema_version": ARTIFACT_PROTOCOL_VERSION,
+        "record_id": record_id,
+        "task_id": binding.task_id,
+        "attempt_id": binding.attempt_id,
+        "task_inputs_sha256": binding.task_inputs_sha256,
+        "acceptance_contract_sha256": binding.task_inputs["inputs"]["acceptance"]["sha256"],
+        "category": "required_commands",
+        "check_id": definition["id"],
+        "argv": list(definition["argv"]),
+        "cwd": definition["cwd"],
+        "timeout_seconds": definition["timeout_seconds"],
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "elapsed_seconds": elapsed_seconds,
+        "surviving_processes": survivors,
+        "stdout_ref": stdout_path.relative_to(attempt).as_posix(),
+        "stdout_sha256": file_sha256(stdout_path),
+        "stderr_ref": stderr_path.relative_to(attempt).as_posix(),
+        "stderr_sha256": file_sha256(stderr_path),
+    }
+    if getattr(args, "workflow_id", ""):
+        record["workflow_id"] = args.workflow_id
+    if getattr(args, "instance_id", ""):
+        record["instance_id"] = args.instance_id
+    record["record_sha256"] = command_record_sha256(record)
+    _append_command_record(attempt / "runtime" / "COMMANDS.ndjson", record)
+    print(json.dumps(record, indent=2))
+    return int(exit_code)
+
+
+def check_command(args: argparse.Namespace) -> int:
+    with attempt_artifact_lock(args.attempt_dir, exclusive=False):
+        return _check_command_locked(args)
 
 
 def run_dir(path: Path) -> Path:
@@ -169,6 +520,9 @@ def current_task_review(path: Path) -> dict[str, Any]:
     if not pointer_path.exists():
         raise SystemExit("approved task is missing CURRENT_TASK_REVIEW.json")
     pointer = load_json(pointer_path)
+    revision = pointer.get("revision") if isinstance(pointer, dict) else None
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+        raise SystemExit("CURRENT_TASK_REVIEW.json revision must be a positive integer")
     relative = pointer.get("decision_path") if isinstance(pointer, dict) else None
     if not isinstance(relative, str) or not relative:
         raise SystemExit("CURRENT_TASK_REVIEW.json has no decision_path")
@@ -178,14 +532,33 @@ def current_task_review(path: Path) -> dict[str, Any]:
     except ValueError as exc:
         raise SystemExit("task review decision must be inside the reviews directory") from exc
     decision = load_json(decision_path)
+    declared_digest = pointer.get("decision_sha256") if isinstance(pointer, dict) else None
+    status = load_json(path / "STATUS.json")
+    if decision.get("revision") != revision:
+        raise SystemExit("CURRENT_TASK_REVIEW.json revision does not match the decision")
+    if relative != f"reviews/DECISION-v{revision:03d}.json":
+        raise SystemExit("CURRENT_TASK_REVIEW.json decision_path does not match its revision")
+    if task_protocol(path, status) == ARTIFACT_PROTOCOL_VERSION and (
+        not isinstance(declared_digest, str)
+        or len(declared_digest) != 64
+        or any(character not in "0123456789abcdef" for character in declared_digest)
+    ):
+        raise SystemExit("CURRENT_TASK_REVIEW.json requires a lowercase decision_sha256")
+    if task_protocol(path, status) == ARTIFACT_PROTOCOL_VERSION and (
+        decision.get("schema_version") != ARTIFACT_PROTOCOL_VERSION
+        or decision.get("artifact_protocol_version") != ARTIFACT_PROTOCOL_VERSION
+    ):
+        raise SystemExit("current task review decision is not Artifact Protocol v2")
+    if declared_digest is not None and declared_digest != file_sha256(decision_path):
+        raise SystemExit("CURRENT_TASK_REVIEW.json decision digest does not match the decision")
     if decision.get("decision") != "approved":
         raise SystemExit("current task review decision is not approved")
-    if decision.get("task_id") != load_json(path / "STATUS.json").get("task_id"):
+    if decision.get("task_id") != status.get("task_id"):
         raise SystemExit("task review decision task_id does not match STATUS.json")
     return decision
 
 
-def approval_git_binding(path: Path, status: dict[str, Any]) -> dict[str, str]:
+def approval_git_binding(path: Path, status: dict[str, Any]) -> dict[str, Any]:
     root = repo_root(path)
     task_worktree = resolve_worktree(root, status.get("worktree"), label="task worktree")
     require_same_repository(root, task_worktree)
@@ -197,12 +570,52 @@ def approval_git_binding(path: Path, status: dict[str, Any]) -> dict[str, str]:
         raise SystemExit("RUN.json target_branch is missing")
     approved_commit = git_output(task_worktree, "rev-parse", "HEAD")
     target_commit = git_output(root, "rev-parse", target_branch)
-    if subprocess.run(
+    target_is_ancestor = subprocess.run(
         ["git", "merge-base", "--is-ancestor", target_commit, approved_commit],
         cwd=root,
         check=False,
-    ).returncode != 0:
-        raise SystemExit("task branch is not fast-forward mergeable from the reviewed target commit")
+    ).returncode == 0
+    source_is_ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", approved_commit, target_commit],
+        cwd=root,
+        check=False,
+    ).returncode == 0
+    if not target_is_ancestor and not source_is_ancestor:
+        raise SystemExit(
+            "task commit is neither fast-forward mergeable nor already contained in the target branch"
+        )
+    if task_protocol(path, status) == ARTIFACT_PROTOCOL_VERSION:
+        attempt_id = status.get("current_attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise SystemExit("v2 task review requires a current attempt")
+        try:
+            bundle = load_bundle(
+                path / "attempts" / attempt_id,
+                expected_task_id=str(status.get("task_id")),
+                expected_attempt_id=attempt_id,
+                expected_requested_state="review",
+                expected_source_commit=approved_commit,
+            )
+        except ArtifactBundleError as exc:
+            raise SystemExit(f"v2 review bundle is invalid: {exc}") from exc
+        contract = _validate_frozen_sources(
+            path / "attempts" / attempt_id,
+            path,
+            bundle.task_inputs_binding,
+        )
+        _validate_bundle_required_outputs(
+            task_worktree,
+            approved_commit,
+            contract,
+            bundle.evidence,
+        )
+        return {
+            "approved_commit": approved_commit,
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "target_commit_at_review": target_commit,
+            "artifact_binding": artifact_binding(bundle),
+        }
     return {
         "approved_commit": approved_commit,
         "source_branch": source_branch,
@@ -230,8 +643,103 @@ def strategy_submit(args: argparse.Namespace) -> int:
         not isinstance(payload.get("revision"), int) or payload["revision"] <= 1
     ):
         raise SystemExit("strategy revise requires revision > 1")
-    output, digest = submit_strategy(path, payload)
+    protocol_version = task_protocol(path, status)
+    existing_output = path / "strategy" / f"STRATEGY-v{int(payload.get('revision', 0)):03d}.json"
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION and existing_output.is_file():
+        existing_payload = load_json(existing_output)
+        if existing_payload != payload:
+            raise SystemExit(f"immutable strategy revision already exists with different content: {existing_output}")
+        output, digest = existing_output, canonical_digest(existing_payload)
+    else:
+        output, digest = submit_strategy(path, payload)
     summary = f"Submitted strategy {payload['strategy_id']} for coordinator review"
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        attempt_path, _task, _status, metadata, binding = _require_attempt_ownership(
+            path / "attempts" / str(attempt_id),
+            allow_ready=True,
+        )
+        if metadata.get("phase") != expected_phase:
+            raise SystemExit("strategy submission attempt phase does not match task state")
+        worktree = _worktree_for_attempt(metadata)
+        require_clean_task_worktree(worktree, str(status.get("branch") or ""))
+        source_commit = git_output(worktree, "rev-parse", "HEAD")
+        task_base_commit = str(binding.task_inputs["task_base_commit"])
+        if expected_phase == "planning" and source_commit != task_base_commit:
+            raise SystemExit(
+                "planning strategy submission requires HEAD to equal the frozen task base commit"
+            )
+        submission_ref = "runtime/STRATEGY_SUBMISSION.json"
+        publish_json_once(
+            attempt_path / submission_ref,
+            {
+                "schema_version": ARTIFACT_PROTOCOL_VERSION,
+                "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
+                "task_id": status["task_id"],
+                "attempt_id": str(attempt_id),
+                "strategy_revision": payload["revision"],
+                "strategy_id": payload["strategy_id"],
+                "strategy_ref": f"../../strategy/{output.name}",
+                "strategy_sha256": digest,
+            },
+        )
+        before_ref = "runtime/worktree-before.json"
+        if not (attempt_path / before_ref).is_file():
+            raise SystemExit("planning attempt is missing runtime/worktree-before.json")
+        after_ref = "runtime/worktree-after.json"
+        publish_json_once(attempt_path / after_ref, fingerprint(worktree))
+        planning_changes = _snapshot_changed_paths(
+            attempt_path / before_ref,
+            attempt_path / after_ref,
+        )
+        if expected_phase == "planning" and planning_changes:
+            raise SystemExit(f"planning attempt modified the task worktree: {planning_changes}")
+        if expected_phase == "execution":
+            strategy_changed_paths = _git_changed_paths(
+                worktree,
+                task_base_commit,
+                source_commit,
+            )
+            _validate_changed_path_policy(
+                path,
+                "full",
+                strategy_changed_paths,
+                attempt=attempt_path,
+                metadata=metadata,
+            )
+        else:
+            strategy_changed_paths = []
+        try:
+            bundle = publish_bundle(
+                attempt_path,
+                requested_state="strategy_review",
+                summary=summary,
+                direct_self_review={
+                    "performed": False,
+                    "passed": False,
+                    "summary": "",
+                    "findings": [],
+                },
+                source_commit=source_commit,
+                command_record_ids=(),
+                changed_paths=strategy_changed_paths,
+                worktree={"before": before_ref, "after": after_ref},
+                artifact_refs=(submission_ref,),
+                expected_task_id=str(status["task_id"]),
+                expected_attempt_id=str(attempt_id),
+            )
+        except ArtifactBundleError as exc:
+            raise SystemExit(f"cannot publish strategy handoff: {exc}") from exc
+        event(path, "strategy_submitted", "worker", strategy_id=payload["strategy_id"], revision=payload["revision"], strategy_sha256=digest)
+        print(
+            json.dumps(
+                {
+                    "path": str(output),
+                    "strategy_sha256": digest,
+                    "artifact_binding": artifact_binding(bundle),
+                }
+            )
+        )
+        return 0
     atomic_text(path / "EVIDENCE.md", f"# Evidence\n\nValidated `{output.name}` with SHA-256 `{digest}`.\n")
     atomic_text(path / "HANDOFF.md", f"# Strategy Handoff\n\n{summary}.\n")
     write_json(
@@ -264,13 +772,45 @@ def strategy_submit(args: argparse.Namespace) -> int:
 
 def strategy_review(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
+    if (path / ".dispatch-lock").exists():
+        raise SystemExit("strategy review is forbidden while a dispatch lock exists")
     if load_json(path / "STATUS.json").get("state") != "strategy_review":
         raise SystemExit("strategy review requires strategy_review state")
-    handoff = load_json(path / "HANDOFF.json")
     submitted = load_json(path / "strategy" / f"STRATEGY-v{args.revision:03d}.json")
     digest = canonical_digest(submitted)
-    if handoff.get("strategy_revision") != args.revision or handoff.get("strategy_sha256") != digest:
-        raise SystemExit("strategy review revision does not match the validated worker handoff")
+    status = load_json(path / "STATUS.json")
+    if task_protocol(path, status) == ARTIFACT_PROTOCOL_VERSION:
+        attempt_id = status.get("current_attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise SystemExit("v2 strategy review requires a current attempt")
+        try:
+            bundle = require_current_bundle(
+                path,
+                status,
+                expected_requested_state="strategy_review",
+            )
+        except ArtifactResolutionError as exc:
+            raise SystemExit(f"strategy review bundle is invalid: {exc}") from exc
+        submission_path = path / "attempts" / attempt_id / "runtime" / "STRATEGY_SUBMISSION.json"
+        submission = load_json(submission_path)
+        if (
+            submission.get("strategy_revision") != args.revision
+            or submission.get("strategy_sha256") != digest
+            or submission.get("strategy_id") != submitted.get("strategy_id")
+        ):
+            raise SystemExit("strategy review revision does not match the frozen v2 handoff")
+        artifacts = bundle.evidence.get("artifacts", [])
+        if not any(
+            isinstance(item, dict)
+            and item.get("ref") == "runtime/STRATEGY_SUBMISSION.json"
+            and item.get("sha256") == file_sha256(submission_path)
+            for item in artifacts
+        ):
+            raise SystemExit("strategy review bundle does not bind STRATEGY_SUBMISSION.json")
+    else:
+        handoff = load_json(path / "HANDOFF.json")
+        if handoff.get("strategy_revision") != args.revision or handoff.get("strategy_sha256") != digest:
+            raise SystemExit("strategy review revision does not match the validated worker handoff")
     decision = "approved" if args.strategy_action == "approve" else "changes_requested"
     review = review_strategy(path, args.revision, decision=decision, reviewer=args.reviewer, notes=args.note)
     event(path, "strategy_reviewed", "coordinator", decision=decision, revision=args.revision, strategy_sha256=review["strategy_sha256"])
@@ -283,8 +823,25 @@ def strategy_review(args: argparse.Namespace) -> int:
 def task_review(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
     status = load_json(path / "STATUS.json")
+    if (path / ".dispatch-lock").exists():
+        raise SystemExit("task review is forbidden while a dispatch lock exists")
     if status.get("state") != "review":
         raise SystemExit("task review requires review state")
+
+    protocol_version = task_protocol(path, status)
+    reviewed_bundle = None
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        attempt_id = status.get("current_attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise SystemExit("v2 task review requires a current attempt")
+        try:
+            reviewed_bundle = require_current_bundle(
+                path,
+                status,
+                expected_requested_state="review",
+            )
+        except ArtifactResolutionError as exc:
+            raise SystemExit(f"v2 task review bundle is invalid: {exc}") from exc
 
     target_by_decision = {
         "approved": "approved",
@@ -317,7 +874,7 @@ def task_review(args: argparse.Namespace) -> int:
     if decision_path.exists():
         raise SystemExit(f"refusing to overwrite task review decision: {decision_path}")
     payload = {
-        "schema_version": 1,
+        "schema_version": ARTIFACT_PROTOCOL_VERSION if protocol_version == ARTIFACT_PROTOCOL_VERSION else 1,
         "task_id": load_json(path / "STATUS.json")["task_id"],
         "revision": revision,
         "decision": args.decision,
@@ -327,14 +884,26 @@ def task_review(args: argparse.Namespace) -> int:
         "findings_sha256": hashlib.sha256(findings.encode("utf-8")).hexdigest(),
         "notes": args.note,
     }
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        assert reviewed_bundle is not None
+        payload["artifact_protocol_version"] = ARTIFACT_PROTOCOL_VERSION
+        payload["artifact_binding"] = artifact_binding(reviewed_bundle)
     if args.decision == "approved":
         payload.update(approval_git_binding(path, status))
-    write_json(decision_path, payload)
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        publish_json_once(decision_path, payload)
+    else:
+        write_json(decision_path, payload)
     write_json(
         reviews / "CURRENT_TASK_REVIEW.json",
         {
             "revision": revision,
             "decision_path": decision_path.relative_to(path).as_posix(),
+            **(
+                {"decision_sha256": file_sha256(decision_path)}
+                if protocol_version == ARTIFACT_PROTOCOL_VERSION
+                else {}
+            ),
         },
     )
     transition(path, target, "coordinator")
@@ -369,6 +938,60 @@ def merge_source_commit(path: Path, status: dict[str, Any], root: Path) -> tuple
         raise SystemExit("RUN.json target_branch is missing")
 
     profile = status.get("profile", "full")
+    if task_protocol(path, status) == ARTIFACT_PROTOCOL_VERSION:
+        attempt_id = status.get("current_attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise SystemExit("v2 merge requires a current attempt")
+        attempt = path / "attempts" / attempt_id
+        expected_state = "verified" if profile == "direct" else "review"
+        try:
+            bundle = load_bundle(
+                attempt,
+                expected_task_id=str(status.get("task_id")),
+                expected_attempt_id=attempt_id,
+                expected_requested_state=expected_state,
+                expected_source_commit=source_head,
+            )
+        except ArtifactBundleError as exc:
+            raise SystemExit(f"v2 merge bundle is invalid: {exc}") from exc
+        metadata = load_json(attempt / "ATTEMPT.json")
+        if (
+            metadata.get("state") != "completed"
+            or metadata.get("handoff_valid") is not True
+            or metadata.get("handoff_state") != expected_state
+        ):
+            raise SystemExit("v2 task does not have a valid completed handoff attempt")
+        if profile == "direct":
+            if status.get("state") not in {"verified", "merged"}:
+                raise SystemExit("Direct task merge requires verified state")
+        else:
+            if status.get("state") not in {"approved", "merged"}:
+                raise SystemExit("Delegated/Full task merge requires coordinator approval")
+            decision = current_task_review(path)
+            expected_binding = decision.get("artifact_binding")
+            if not isinstance(expected_binding, dict):
+                raise SystemExit("approved v2 review is missing artifact_binding")
+            try:
+                validate_artifact_binding(
+                    attempt,
+                    expected_binding,
+                    expected_task_id=str(status.get("task_id")),
+                    expected_attempt_id=attempt_id,
+                    expected_source_commit=source_head,
+                )
+            except ArtifactBundleError as exc:
+                raise SystemExit(f"approved artifact binding is invalid: {exc}") from exc
+            if (
+                decision.get("approved_commit") != source_head
+                or decision.get("source_branch") != source_branch
+                or decision.get("target_branch") != target_branch
+            ):
+                raise SystemExit("approved v2 Git binding no longer matches task/run metadata")
+        current_binding = artifact_binding(bundle)
+        if current_binding.get("source_commit") != source_head:
+            raise SystemExit("task branch HEAD changed after frozen v2 handoff")
+        return source_head, source_branch, target_branch
+
     if status.get("state") in {"approved", "merged"} and profile != "direct":
         decision = current_task_review(path)
         required = {
@@ -413,15 +1036,16 @@ def merge_source_commit(path: Path, status: dict[str, Any], root: Path) -> tuple
 
 
 def existing_task_merged_event(path: Path, commit: str | None = None) -> dict[str, Any] | None:
-    events_path = run_dir(path) / "EVENTS.ndjson"
-    if not events_path.exists():
-        return None
     task_id = load_json(path / "STATUS.json").get("task_id")
     matches: list[dict[str, Any]] = []
-    for line in events_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
+    try:
+        records, _warning = read_event_journal(
+            run_dir(path),
+            tolerate_interrupted_tail=True,
+        )
+    except EventJournalError as exc:
+        raise SystemExit(f"cannot read task_merged events: {exc}") from exc
+    for record in records:
         if (
             record.get("event") == "task_merged"
             and record.get("task_id") == task_id
@@ -495,13 +1119,87 @@ def run_merge_verification(
     }
 
 
+def run_canonical_merge_checks(
+    path: Path,
+    worktree: Path,
+    definitions: list[dict[str, Any]],
+    *,
+    phase: str,
+    attempt_id: str,
+) -> dict[str, Any] | None:
+    """Run v2 coordinator checks exactly as declared in ACCEPTANCE.md."""
+
+    if not definitions:
+        return None
+    results: list[dict[str, Any]] = []
+    logs_dir = path / "logs" / "merge" / attempt_id
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    for definition in definitions:
+        check_id = str(definition["id"])
+        log_path = logs_dir / f"{phase}-{check_id}.log"
+        cwd = _command_cwd(worktree, str(definition["cwd"]))
+        try:
+            with log_path.open("ab") as log:
+                result = run_supervised(
+                    list(definition["argv"]),
+                    timeout_seconds=float(definition["timeout_seconds"]),
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    grace_seconds=0.5,
+                )
+            exit_code = result.exit_code
+            timed_out = result.timed_out
+            elapsed_seconds = result.elapsed_seconds
+            surviving_processes = list(result.surviving_pids)
+        except OSError as exc:
+            with log_path.open("ab") as log:
+                log.write(f"command could not start: {exc}\n".encode("utf-8"))
+            exit_code = 127
+            timed_out = False
+            elapsed_seconds = 0.0
+            surviving_processes = []
+        record = {
+            "check_id": check_id,
+            "argv": list(definition["argv"]),
+            "cwd": str(definition["cwd"]),
+            "timeout_seconds": definition["timeout_seconds"],
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "elapsed_seconds": elapsed_seconds,
+            "surviving_processes": surviving_processes,
+            "log": log_path.relative_to(path).as_posix(),
+            "log_sha256": file_sha256(log_path),
+        }
+        results.append(record)
+        if exit_code != 0 or timed_out or surviving_processes:
+            break
+    return {
+        "phase": phase,
+        "passed": len(results) == len(definitions)
+        and all(
+            item["exit_code"] == 0
+            and item["timed_out"] is False
+            and not item["surviving_processes"]
+            for item in results
+        ),
+        "results": results,
+    }
+
+
 def task_merge(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
     status = load_json(path / "STATUS.json")
+    protocol_version = task_protocol(path, status)
     if status.get("state") not in {"approved", "verified", "merged"}:
         raise SystemExit("task merge requires approved, verified, or already merged state")
     if (path / ".dispatch-lock").exists():
         raise SystemExit("task merge is forbidden while a dispatch lock exists")
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION and args.verify_command:
+        raise SystemExit(
+            "v2 task merge forbids free --verify-command values; use canonical pre/post-merge commands"
+        )
 
     root = repo_root(path)
     run = load_json(run_dir(path) / "RUN.json")
@@ -514,30 +1212,138 @@ def task_merge(args: argparse.Namespace) -> int:
     require_same_repository(root, target_worktree)
     require_clean_target_worktree(target_worktree, configured_target)
 
-    if status.get("state") == "merged":
-        recorded = existing_task_merged_event(path)
-        if recorded is not None:
-            source_commit = recorded.get("commit")
-            if not isinstance(source_commit, str) or not source_commit:
-                raise SystemExit("task_merged event is missing commit")
-            if recorded.get("target_branch") != configured_target:
-                raise SystemExit("task_merged target branch does not match RUN.json")
-            if args.expected_commit:
-                expected = git_output(root, "rev-parse", args.expected_commit)
-                if expected != source_commit:
-                    raise SystemExit(
-                        f"expected commit {expected} does not match merged commit {source_commit}"
-                    )
-            target_head = git_output(target_worktree, "rev-parse", "HEAD")
-            if subprocess.run(
-                ["git", "merge-base", "--is-ancestor", source_commit, target_head],
-                cwd=target_worktree,
-                check=False,
-            ).returncode != 0:
-                raise SystemExit("STATUS is merged but target branch does not contain the merged commit")
-            print(json.dumps(recorded, indent=2))
-            verification = recorded.get("verification")
-            return 0 if not isinstance(verification, dict) or verification.get("passed") is not False else 1
+    recorded = existing_task_merged_event(path)
+    if recorded is not None:
+        source_commit = recorded.get("commit")
+        if not isinstance(source_commit, str) or not source_commit:
+            raise SystemExit("task_merged event is missing commit")
+        if recorded.get("target_branch") != configured_target:
+            raise SystemExit("task_merged target branch does not match RUN.json")
+        if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+            attempt_id = recorded.get("attempt_id")
+            expected_binding = recorded.get("artifact_binding")
+            if not isinstance(attempt_id, str) or not isinstance(expected_binding, dict):
+                raise SystemExit("v2 task_merged event is missing its attempt/artifact binding")
+            try:
+                recorded_bundle = validate_artifact_binding(
+                    path / "attempts" / attempt_id,
+                    expected_binding,
+                    expected_task_id=str(status.get("task_id")),
+                    expected_attempt_id=attempt_id,
+                    expected_source_commit=source_commit,
+                )
+            except ArtifactBundleError as exc:
+                raise SystemExit(f"v2 task_merged artifact binding is invalid: {exc}") from exc
+            if status.get("profile") != "direct":
+                decision = current_task_review(path)
+                if (
+                    decision.get("artifact_binding") != expected_binding
+                    or decision.get("approved_commit") != source_commit
+                ):
+                    raise SystemExit("task_merged event no longer matches coordinator approval")
+            contract = _validate_frozen_sources(
+                path / "attempts" / attempt_id,
+                path,
+                recorded_bundle.task_inputs_binding,
+            )
+            _validate_bundle_required_outputs(
+                target_worktree,
+                source_commit,
+                contract,
+                recorded_bundle.evidence,
+                require_live_match=False,
+            )
+        if args.expected_commit:
+            expected = git_output(root, "rev-parse", args.expected_commit)
+            if expected != source_commit:
+                raise SystemExit(
+                    f"expected commit {expected} does not match merged commit {source_commit}"
+                )
+        target_head = git_output(target_worktree, "rev-parse", "HEAD")
+        if subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source_commit, target_head],
+            cwd=target_worktree,
+            check=False,
+        ).returncode != 0:
+            raise SystemExit("task_merged event commit is not contained by the target branch")
+        if status.get("state") != "merged":
+            transition(path, "merged", "coordinator")
+        print(json.dumps(recorded, indent=2))
+        verification = recorded.get("verification")
+        return 0 if not isinstance(verification, dict) or verification.get("passed") is not False else 1
+
+    if status.get("state") == "merged" and protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        attempt_id = status.get("current_attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise SystemExit("merged v2 task is missing its current attempt")
+        expected_state = "verified" if status.get("profile") == "direct" else "review"
+        try:
+            recovered_bundle = require_current_bundle(
+                path,
+                status,
+                expected_requested_state=expected_state,
+            )
+        except ArtifactResolutionError as exc:
+            raise SystemExit(f"cannot recover missing task_merged event: {exc}") from exc
+        source_commit = recovered_bundle.handoff.get("source_commit")
+        if not isinstance(source_commit, str) or not source_commit:
+            raise SystemExit("recovered v2 handoff is missing source_commit")
+        source_branch = str(status.get("branch") or "")
+        if status.get("profile") != "direct":
+            decision = current_task_review(path)
+            expected_binding = artifact_binding(recovered_bundle)
+            if (
+                decision.get("artifact_binding") != expected_binding
+                or decision.get("approved_commit") != source_commit
+                or decision.get("source_branch") != source_branch
+                or decision.get("target_branch") != configured_target
+            ):
+                raise SystemExit("merged recovery does not match coordinator approval")
+        contract = _validate_frozen_sources(
+            path / "attempts" / attempt_id,
+            path,
+            recovered_bundle.task_inputs_binding,
+        )
+        _validate_bundle_required_outputs(
+            target_worktree,
+            source_commit,
+            contract,
+            recovered_bundle.evidence,
+            require_live_match=False,
+        )
+        if args.expected_commit:
+            expected = git_output(root, "rev-parse", args.expected_commit)
+            if expected != source_commit:
+                raise SystemExit(
+                    f"expected commit {expected} does not match merged commit {source_commit}"
+                )
+        target_head = git_output(target_worktree, "rev-parse", "HEAD")
+        if subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source_commit, target_head],
+            cwd=target_worktree,
+            check=False,
+        ).returncode != 0:
+            raise SystemExit("merged STATUS commit is not contained by the target branch")
+        verification = {
+            "passed": False,
+            "recovered": True,
+            "reason": "STATUS was merged but task_merged verification evidence was missing",
+            "target_head_after_verification": target_head,
+            "target_branch_unchanged": True,
+            "source_commit_contained": True,
+        }
+        payload = {
+            "commit": source_commit,
+            "source_branch": source_branch,
+            "target_branch": configured_target,
+            "coordinator_id": args.coordinator,
+            "attempt_id": attempt_id,
+            "artifact_binding": artifact_binding(recovered_bundle),
+            "verification": verification,
+        }
+        event(path, "task_merged", "coordinator", **payload)
+        print(json.dumps({"task_id": status.get("task_id"), "state": "merged", **payload}, indent=2))
+        return 1
 
     source_commit, source_branch, target_branch = merge_source_commit(path, status, root)
     if args.expected_commit:
@@ -546,6 +1352,46 @@ def task_merge(args: argparse.Namespace) -> int:
             raise SystemExit(
                 f"expected commit {expected} does not match approved source commit {source_commit}"
             )
+    v2_bundle = None
+    v2_contract = None
+    pre_merge_verification = None
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        attempt_id = str(status.get("current_attempt_id"))
+        try:
+            v2_bundle = load_bundle(
+                path / "attempts" / attempt_id,
+                expected_task_id=str(status.get("task_id")),
+                expected_attempt_id=attempt_id,
+                expected_source_commit=source_commit,
+            )
+        except ArtifactBundleError as exc:
+            raise SystemExit(f"v2 merge bundle is invalid: {exc}") from exc
+        v2_contract = _validate_frozen_sources(
+            path / "attempts" / attempt_id,
+            path,
+            v2_bundle.task_inputs_binding,
+        )
+        task_worktree = resolve_worktree(root, status.get("worktree"), label="task worktree")
+        _validate_bundle_required_outputs(
+            task_worktree,
+            source_commit,
+            v2_contract,
+            v2_bundle.evidence,
+        )
+        pre_merge_verification = run_canonical_merge_checks(
+            path,
+            task_worktree,
+            list(v2_contract.get("pre_merge_commands", [])),
+            phase="pre-merge",
+            attempt_id=attempt_id,
+        )
+        if pre_merge_verification is not None and not pre_merge_verification["passed"]:
+            print(json.dumps({"state": status.get("state"), "verification": pre_merge_verification}, indent=2))
+            return 1
+        require_clean_task_worktree(task_worktree, source_branch)
+        if git_output(task_worktree, "rev-parse", "HEAD") != source_commit:
+            raise SystemExit("task branch changed while running pre-merge checks")
+
     target_head = git_output(target_worktree, "rev-parse", "HEAD")
     contains_source = subprocess.run(
         ["git", "merge-base", "--is-ancestor", source_commit, target_head],
@@ -578,15 +1424,75 @@ def task_merge(args: argparse.Namespace) -> int:
         ).returncode != 0:
             raise SystemExit("target branch does not contain the task commit after merge")
 
-    verification = run_merge_verification(
-        path,
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        assert v2_contract is not None
+        post_merge_verification = run_canonical_merge_checks(
+            path,
+            target_worktree,
+            list(v2_contract.get("post_merge_commands", [])),
+            phase="post-merge",
+            attempt_id=str(status.get("current_attempt_id")),
+        )
+        target_clean = True
+        try:
+            require_clean_target_worktree(target_worktree, configured_target)
+        except SystemExit:
+            target_clean = False
+        verification = {
+            "passed": (
+                (pre_merge_verification is None or pre_merge_verification["passed"])
+                and (post_merge_verification is None or post_merge_verification["passed"])
+                and target_clean
+            ),
+            "pre_merge": pre_merge_verification,
+            "post_merge": post_merge_verification,
+            "target_clean": target_clean,
+        }
+    else:
+        verification = run_merge_verification(
+            path,
+            target_worktree,
+            list(args.verify_command),
+            float(args.verification_timeout),
+        )
+    target_head_after_verification = git_output(target_worktree, "rev-parse", "HEAD")
+    target_branch_after_verification = git_output(
         target_worktree,
-        list(args.verify_command),
-        float(args.verification_timeout),
+        "branch",
+        "--show-current",
     )
-    if status.get("state") != "merged":
-        transition(path, "merged", "coordinator")
+    source_still_contained = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", source_commit, target_head_after_verification],
+        cwd=target_worktree,
+        check=False,
+    ).returncode == 0
+    target_head_unchanged = target_head_after_verification == target_head
+    target_branch_unchanged = target_branch_after_verification == configured_target
     if verification is not None:
+        verification["target_head_before_verification"] = target_head
+        verification["target_head_after_verification"] = target_head_after_verification
+        verification["target_head_unchanged"] = target_head_unchanged
+        verification["target_branch_unchanged"] = target_branch_unchanged
+        verification["source_commit_contained"] = source_still_contained
+        verification["passed"] = bool(
+            verification.get("passed")
+            and target_head_unchanged
+            and target_branch_unchanged
+            and source_still_contained
+        )
+    if not target_head_unchanged or not target_branch_unchanged or not source_still_contained:
+        print(
+            json.dumps(
+                {
+                    "state": status.get("state"),
+                    "verification": verification,
+                    "error": "post-merge verification mutated the target branch",
+                },
+                indent=2,
+            )
+        )
+        return 1
+    if verification is not None and protocol_version != ARTIFACT_PROTOCOL_VERSION:
         updated = load_json(path / "STATUS.json")
         evidence = updated.setdefault("evidence", {})
         commands_run = evidence.setdefault("commands_run", [])
@@ -606,9 +1512,15 @@ def task_merge(args: argparse.Namespace) -> int:
         "target_branch": target_branch,
         "coordinator_id": args.coordinator,
     }
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+        assert v2_bundle is not None
+        payload["attempt_id"] = str(status.get("current_attempt_id"))
+        payload["artifact_binding"] = artifact_binding(v2_bundle)
     if verification is not None:
         payload["verification"] = verification
     event(path, "task_merged", "coordinator", **payload)
+    if status.get("state") != "merged":
+        transition(path, "merged", "coordinator")
     result = {
         "task_id": status.get("task_id"),
         "state": "merged",
@@ -626,6 +1538,73 @@ def workflow_events(attempt: Path) -> list[dict[str, Any]]:
 def command_events(attempt: Path) -> list[dict[str, Any]]:
     path = attempt / "runtime" / "COMMANDS.ndjson"
     return [] if not path.exists() else [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _record_log_matches(attempt: Path, payload: dict[str, Any], prefix: str) -> bool:
+    ref = payload.get(f"{prefix}_ref")
+    digest = payload.get(f"{prefix}_sha256")
+    if not isinstance(ref, str) or not isinstance(digest, str):
+        return False
+    candidate = (attempt / ref).resolve()
+    try:
+        candidate.relative_to(attempt.resolve())
+    except ValueError:
+        return False
+    return candidate.is_file() and not candidate.is_symlink() and file_sha256(candidate) == digest
+
+
+def select_required_check_records(
+    attempt: Path,
+    contract: dict[str, Any],
+    binding: Any,
+) -> tuple[list[Any], list[str]]:
+    """Select one exact successful record for every frozen required check."""
+
+    try:
+        records = load_command_records(attempt, required=False)
+    except ArtifactBundleError as exc:
+        return [], [f"structured command log is invalid: {exc}"]
+    acceptance_sha256 = binding.task_inputs["inputs"]["acceptance"]["sha256"]
+    selected: list[Any] = []
+    reasons: list[str] = []
+    for definition in contract.get("required_commands", []):
+        matches = []
+        for record in records:
+            payload = record.payload
+            if (
+                payload.get("artifact_protocol_version") == ARTIFACT_PROTOCOL_VERSION
+                and payload.get("task_id") == binding.task_id
+                and payload.get("attempt_id") == binding.attempt_id
+                and payload.get("task_inputs_sha256") == binding.task_inputs_sha256
+                and payload.get("acceptance_contract_sha256") == acceptance_sha256
+                and payload.get("category") == "required_commands"
+                and payload.get("check_id") == definition["id"]
+                and payload.get("argv") == definition["argv"]
+                and payload.get("cwd") == definition["cwd"]
+                and payload.get("timeout_seconds") == definition["timeout_seconds"]
+            ):
+                matches.append(record)
+        passing = [
+            record
+            for record in matches
+            if record.payload.get("exit_code") == 0
+            and record.payload.get("timed_out") is False
+            and record.payload.get("surviving_processes") == []
+            and _record_log_matches(attempt, record.payload, "stdout")
+            and _record_log_matches(attempt, record.payload, "stderr")
+        ]
+        if not passing:
+            if matches:
+                reasons.append(
+                    f"required check {definition['id']!r} has no successful, fully-clean record"
+                )
+            else:
+                reasons.append(
+                    f"required check {definition['id']!r} has no exact record for the frozen acceptance contract"
+                )
+            continue
+        selected.append(passing[-1])
+    return selected, reasons
 
 
 def completed_workflows(records: list[dict[str, Any]]) -> set[str]:
@@ -660,11 +1639,34 @@ def completion_gate_reasons(
         if missing:
             reasons.append(f"required workflows are incomplete: {missing}")
     if gate["acceptance_commands_pass"]:
-        acceptance = [item for item in command_events(attempt) if item.get("acceptance") is True]
-        if not acceptance:
-            reasons.append("acceptance command records are missing")
-        elif any(item.get("exit_code") != 0 or item.get("timed_out") for item in acceptance):
-            reasons.append("one or more acceptance commands failed or timed out")
+        task = attempt.parent.parent
+        status_path = task / "STATUS.json"
+        status = load_json(status_path) if status_path.exists() else None
+        if (
+            isinstance(status, dict)
+            and task_protocol(task, status) == ARTIFACT_PROTOCOL_VERSION
+        ):
+            try:
+                binding = validate_task_inputs_binding(
+                    attempt,
+                    expected_task_id=str(status.get("task_id")),
+                    expected_attempt_id=attempt.name,
+                )
+                contract = _validate_frozen_sources(attempt, task, binding)
+                _selected, check_reasons = select_required_check_records(
+                    attempt,
+                    contract,
+                    binding,
+                )
+                reasons.extend(check_reasons)
+            except (ArtifactBundleError, SystemExit) as exc:
+                reasons.append(f"acceptance evidence is invalid: {exc}")
+        else:
+            acceptance = [item for item in command_events(attempt) if item.get("acceptance") is True]
+            if not acceptance:
+                reasons.append("acceptance command records are missing")
+            elif any(item.get("exit_code") != 0 or item.get("timed_out") for item in acceptance):
+                reasons.append("one or more acceptance commands failed or timed out")
     if not gate["optional_workflows_may_timeout"] and any(
         record.get("event") == "workflow_timed_out" for record in records
     ):
@@ -732,16 +1734,13 @@ def active_execution_attempt(value: str) -> tuple[Path, Path, dict[str, Any]]:
     metadata = load_json(attempt / "ATTEMPT.json")
     if metadata.get("phase") != "execution" or metadata.get("state") not in {"created", "running"}:
         raise SystemExit("attempt is not an active execution attempt")
-    strategy, review = load_approved_strategy(task)
-    if (
-        metadata.get("strategy_id") != strategy.get("strategy_id")
-        or metadata.get("strategy_sha256") != review.get("strategy_sha256")
-    ):
-        raise SystemExit("attempt strategy does not match current approval")
+    if (attempt / READY_REF).exists():
+        raise SystemExit("handoff is already published; attempt evidence is frozen")
+    strategy = _bound_strategy_for_attempt(task, attempt, metadata)
     return attempt, task, strategy
 
 
-def workflow_action(args: argparse.Namespace) -> int:
+def _workflow_action_locked(args: argparse.Namespace) -> int:
     attempt, task, strategy = active_execution_attempt(args.attempt_dir)
     definitions = {item["workflow_id"]: item for item in strategy["workflows"]}
     if args.workflow_id not in definitions:
@@ -838,8 +1837,341 @@ def workflow_action(args: argparse.Namespace) -> int:
     return 0
 
 
+def workflow_action(args: argparse.Namespace) -> int:
+    with attempt_artifact_lock(args.attempt_dir, exclusive=True):
+        return _workflow_action_locked(args)
+
+
+def _git_changed_paths(worktree: Path, base_commit: str, source_commit: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "diff", "--no-renames", "--name-only", "-z", base_commit, source_commit, "--"],
+        cwd=worktree,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(f"cannot derive changed paths from frozen task base: {detail}")
+    return sorted(
+        item.decode("utf-8", errors="surrogateescape")
+        for item in result.stdout.split(b"\0")
+        if item
+    )
+
+
+def _snapshot_changed_paths(before_path: Path, after_path: Path) -> list[str]:
+    before_payload = load_json(before_path)
+    after_payload = load_json(after_path)
+    before = {
+        item["path"]: (item.get("kind"), item.get("mode"), item.get("sha256"))
+        for item in before_payload.get("entries", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    after = {
+        item["path"]: (item.get("kind"), item.get("mode"), item.get("sha256"))
+        for item in after_payload.get("entries", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+
+
+def _required_outputs_exist(worktree: Path, contract: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    root = worktree.resolve()
+    for relative in contract.get("required_outputs", []):
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            missing.append(f"{relative} (escapes worktree)")
+            continue
+        if not candidate.exists():
+            missing.append(relative)
+    return missing
+
+
+def _path_contains(parent: str, child: str) -> bool:
+    normalized_parent = parent.replace("\\", "/").rstrip("/") or "."
+    normalized_child = child.replace("\\", "/").rstrip("/") or "."
+    return (
+        normalized_parent == "."
+        or normalized_child == normalized_parent
+        or normalized_child.startswith(normalized_parent + "/")
+    )
+
+
+def _validate_changed_path_policy(
+    task: Path,
+    profile: str,
+    changed_paths: list[str],
+    *,
+    attempt: Path | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        policy = parse_execution_policy(
+            (task / "EXECUTION_POLICY.json").read_bytes(),
+            profile=profile,
+        )
+    except (OSError, TaskContractError) as exc:
+        raise SystemExit(f"frozen execution policy is invalid: {exc}") from exc
+    allowed = list(policy["allowed_paths"])
+    if profile == "full":
+        if attempt is None or metadata is None:
+            raise SystemExit("Full path validation requires the attempt-frozen strategy binding")
+        strategy = _bound_strategy_for_attempt(task, attempt, metadata)
+        allowed = sorted(
+            {
+                path
+                for workflow in strategy["workflows"]
+                if workflow["executor"]["write_access"]
+                for path in workflow["executor"]["allowed_paths"]
+            }
+        )
+    forbidden = list(policy["forbidden_paths"])
+    violations = [
+        path
+        for path in changed_paths
+        if not any(_path_contains(root, path) for root in allowed)
+        or any(_path_contains(root, path) for root in forbidden)
+    ]
+    if violations:
+        raise SystemExit(
+            "committed task diff violates the frozen write policy: "
+            f"{sorted(violations)}"
+        )
+
+
+def _validate_bundle_required_outputs(
+    worktree: Path,
+    source_commit: str,
+    contract: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    require_live_match: bool = True,
+) -> None:
+    try:
+        validate_required_output_bindings(
+            worktree,
+            source_commit,
+            evidence.get("required_outputs"),
+            expected_paths=list(contract.get("required_outputs", [])),
+            require_live_match=require_live_match,
+        )
+    except ArtifactBundleError as exc:
+        raise SystemExit(f"required output binding is invalid: {exc}") from exc
+
+
+def _reviewer_evidence_refs(attempt: Path) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for workflow in workflow_events(attempt):
+        reviews = workflow.get("reviews")
+        if not isinstance(reviews, list):
+            continue
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            reviewer_id = review.get("reviewer_id")
+            artifact = review.get("artifact")
+            if not isinstance(reviewer_id, str) or not isinstance(artifact, str):
+                continue
+            resolved = Path(artifact).resolve()
+            try:
+                ref = resolved.relative_to(attempt.resolve()).as_posix()
+            except ValueError as exc:
+                raise SystemExit("reviewer evidence must be attempt-local") from exc
+            declared_digest = review.get("sha256")
+            if not isinstance(declared_digest, str) or file_sha256(resolved) != declared_digest:
+                raise SystemExit("reviewer evidence changed after workflow completion")
+            key = (reviewer_id, ref)
+            if key not in seen:
+                result.append({"reviewer_id": reviewer_id, "ref": ref})
+                seen.add(key)
+    return result
+
+
+def _finalize_v2_locked(args: argparse.Namespace) -> int:
+    attempt, task, status, metadata, binding = _require_attempt_ownership(
+        args.attempt_dir,
+        allow_ready=True,
+    )
+    if args.state not in {"verified", "review", "blocked"}:
+        raise SystemExit("finalize state must be verified, review, or blocked")
+    profile = status.get("profile", "full")
+    expected_terminal = {"direct": "verified", "delegated": "review", "full": "review"}.get(profile)
+    if expected_terminal is None:
+        raise SystemExit(f"unknown execution profile: {profile!r}")
+    if args.state != "blocked" and args.state != expected_terminal:
+        raise SystemExit(f"profile {profile!r} requires {expected_terminal!r} finalization")
+    if args.state == "blocked" and (not args.blocker_type or not args.blocking_reason):
+        raise SystemExit("blocked finalization requires blocker type and reason")
+    expected_task_state = "planning" if metadata.get("phase") == "planning" else "running"
+    if status.get("state") != expected_task_state:
+        raise SystemExit(
+            f"attempt phase {metadata.get('phase')!r} does not own task state {status.get('state')!r}"
+        )
+    if metadata.get("phase") != "execution" and args.state != "blocked":
+        raise SystemExit("planning attempts may only publish a blocked finalization")
+
+    summary = args.summary
+    if getattr(args, "summary_file", ""):
+        summary = Path(args.summary_file).read_text(encoding="utf-8").strip()
+    if not isinstance(summary, str) or not summary.strip():
+        raise SystemExit("finalize requires a non-empty summary or --summary-file")
+    if getattr(args, "command", []):
+        raise SystemExit("v2 finalize forbids free-text --command evidence; use rdo check")
+
+    worktree = _worktree_for_attempt(metadata)
+    contract = _validate_frozen_sources(attempt, task, binding)
+    selected: list[Any] = []
+    required_output_bindings: list[dict[str, str]] = []
+    source_commit: str | None
+    if args.state == "blocked":
+        try:
+            source_commit = git_output(worktree, "rev-parse", "HEAD")
+        except SystemExit:
+            source_commit = None
+    else:
+        if status.get("state") != "running":
+            raise SystemExit(f"{args.state} finalization requires running state")
+        require_clean_task_worktree(worktree, str(status.get("branch") or ""))
+        source_commit = git_output(worktree, "rev-parse", "HEAD")
+        selected, reasons = select_required_check_records(attempt, contract, binding)
+        if reasons:
+            raise SystemExit("acceptance gate failed: " + "; ".join(reasons))
+        missing_outputs = _required_outputs_exist(worktree, contract)
+        if missing_outputs:
+            raise SystemExit(f"required outputs are missing: {missing_outputs}")
+        try:
+            required_output_bindings = build_required_output_bindings(
+                worktree,
+                source_commit,
+                list(contract.get("required_outputs", [])),
+            )
+        except ArtifactBundleError as exc:
+            raise SystemExit(f"required outputs are not bound to source_commit: {exc}") from exc
+        if profile == "full":
+            strategy = _bound_strategy_for_attempt(task, attempt, metadata)
+            workflow_reasons = completion_gate_reasons(attempt, strategy)
+            if workflow_reasons:
+                raise SystemExit("handoff completion gate failed: " + "; ".join(workflow_reasons))
+
+    before_ref = "runtime/worktree-before.json"
+    before_path = attempt / before_ref
+    if not before_path.is_file():
+        raise SystemExit("attempt is missing runtime/worktree-before.json")
+    after_ref = "runtime/worktree-after.json"
+    try:
+        publish_json_once(attempt / after_ref, fingerprint(worktree))
+    except ArtifactBundleError as exc:
+        raise SystemExit(f"cannot freeze worktree-after snapshot: {exc}") from exc
+
+    if args.state != "blocked" and source_commit is not None:
+        changed_paths = _git_changed_paths(
+            worktree,
+            str(binding.task_inputs["task_base_commit"]),
+            source_commit,
+        )
+    else:
+        changed_paths = _snapshot_changed_paths(before_path, attempt / after_ref)
+    if metadata.get("phase") == "planning":
+        require_clean_task_worktree(worktree, str(status.get("branch") or ""))
+        task_base_commit = str(binding.task_inputs["task_base_commit"])
+        live_head = git_output(worktree, "rev-parse", "HEAD")
+        if source_commit != task_base_commit or live_head != task_base_commit:
+            raise SystemExit(
+                "planning attempt requires source_commit and HEAD to equal the frozen task base commit"
+            )
+        if changed_paths:
+            raise SystemExit(f"planning attempt modified the task worktree: {changed_paths}")
+    else:
+        _validate_changed_path_policy(
+            task,
+            profile,
+            changed_paths,
+            attempt=attempt,
+            metadata=metadata,
+        )
+    explicit_files = sorted(set(getattr(args, "file", [])))
+    if explicit_files and explicit_files != changed_paths:
+        raise SystemExit(
+            "explicit --file values do not match the committed task diff: "
+            f"explicit={explicit_files}, derived={changed_paths}"
+        )
+
+    log_refs: list[str] = []
+    for record in selected:
+        for field in ("stdout_ref", "stderr_ref"):
+            ref = record.payload.get(field)
+            if isinstance(ref, str) and ref not in log_refs:
+                log_refs.append(ref)
+    direct_self_review = {
+        "performed": profile == "direct" and bool(args.self_review_passed),
+        "passed": profile == "direct" and bool(args.self_review_passed),
+        "summary": (
+            (getattr(args, "self_review_summary", "") or f"Self-review completed: {summary}")
+            if profile == "direct" and args.self_review_passed
+            else ""
+        ),
+        "findings": list(args.self_review_finding),
+    }
+    if args.state == "verified" and not args.self_review_passed:
+        raise SystemExit("Direct verified finalization requires --self-review-passed")
+    blocker = (
+        {"blocker_type": args.blocker_type, "reason": args.blocking_reason}
+        if args.state == "blocked"
+        else None
+    )
+    try:
+        bundle = publish_bundle(
+            attempt,
+            requested_state=args.state,
+            summary=summary,
+            direct_self_review=direct_self_review,
+            known_limitations=list(args.limitation),
+            conditional_blocker=blocker,
+            source_commit=source_commit,
+            command_record_ids=[record.record_id for record in selected],
+            changed_paths=changed_paths,
+            worktree={"before": before_ref, "after": after_ref},
+            log_refs=log_refs,
+            artifact_refs=(),
+            reviewer_evidence=_reviewer_evidence_refs(attempt),
+            required_outputs=required_output_bindings,
+            expected_task_id=str(status.get("task_id")),
+            expected_attempt_id=attempt.name,
+        )
+    except ArtifactBundleError as exc:
+        raise SystemExit(f"cannot publish v2 handoff: {exc}") from exc
+    print(
+        json.dumps(
+            {
+                "handoff": bundle.handoff,
+                "artifact_binding": artifact_binding(bundle),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _finalize_v2(args: argparse.Namespace) -> int:
+    with attempt_artifact_lock(args.attempt_dir, exclusive=True):
+        return _finalize_v2_locked(args)
+
+
 def handoff(args: argparse.Namespace) -> int:
+    if getattr(args, "auto_derive", False) and getattr(args, "attempt_dir", ""):
+        candidate = Path(args.attempt_dir).resolve().parent.parent
+        candidate_status = load_json(candidate / "STATUS.json")
+        if task_protocol(candidate, candidate_status) == ARTIFACT_PROTOCOL_VERSION:
+            return _finalize_v2(args)
+    if not getattr(args, "task_dir", ""):
+        raise SystemExit("legacy handoff/finalize requires --task-dir")
     path = task_dir(args.task_dir)
+    if task_protocol(path) == ARTIFACT_PROTOCOL_VERSION:
+        raise SystemExit("Artifact Protocol v2 requires rdo finalize --attempt-dir <attempt>")
     if args.state not in {"verified", "review", "blocked"}:
         raise SystemExit("handoff state must be verified, review, or blocked")
     if args.state == "blocked" and (not args.blocker_type or not args.blocking_reason):
@@ -882,7 +2214,7 @@ def handoff(args: argparse.Namespace) -> int:
         if isinstance(cwd, str) and cwd:
             cwd_path = Path(cwd).resolve()
             require_clean_task_worktree(cwd_path, str(status.get("branch") or ""))
-            if profile == "direct" and args.state == "verified":
+            if args.state in {"verified", "review"}:
                 source_commit = git_output(cwd_path, "rev-parse", "HEAD")
             derived_files = derive_task_changed_files(path, attempt_path, cwd_path)
             if files and sorted(set(files)) != derived_files:
@@ -937,7 +2269,20 @@ def handoff(args: argparse.Namespace) -> int:
     return 0
 
 
-def execute_command(args: argparse.Namespace) -> int:
+def _execute_command_locked(args: argparse.Namespace) -> int:
+    raw_attempt = Path(args.attempt_dir).resolve()
+    raw_task = raw_attempt.parent.parent
+    raw_status_path = raw_task / "STATUS.json"
+    v2 = False
+    if raw_status_path.exists():
+        raw_status = load_json(raw_status_path)
+        if task_protocol(raw_task, raw_status) == ARTIFACT_PROTOCOL_VERSION:
+            v2 = True
+            if args.acceptance:
+                raise SystemExit(
+                    "Artifact Protocol v2 forbids free rdo exec acceptance evidence; "
+                    "use rdo check --check-id"
+                )
     attempt, _task, strategy = active_execution_attempt(args.attempt_dir)
     definitions = {item["workflow_id"]: item for item in strategy["workflows"]}
     definition = definitions.get(args.workflow_id)
@@ -982,9 +2327,21 @@ def execute_command(args: argparse.Namespace) -> int:
     }
     runtime = attempt / "runtime"
     runtime.mkdir(parents=True, exist_ok=True)
-    with (runtime / "COMMANDS.ndjson").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    command_log = "WORKFLOW_COMMANDS.ndjson" if v2 else "COMMANDS.ndjson"
+    _append_command_record(runtime / command_log, record)
     return result.exit_code
+
+
+def execute_command(args: argparse.Namespace) -> int:
+    attempt = Path(args.attempt_dir).resolve()
+    task = attempt.parent.parent
+    status_path = task / "STATUS.json"
+    if status_path.exists():
+        status = load_json(status_path)
+        if task_protocol(task, status) == ARTIFACT_PROTOCOL_VERSION:
+            with attempt_artifact_lock(attempt, exclusive=False):
+                return _execute_command_locked(args)
+    return _execute_command_locked(args)
 
 
 def status_action(args: argparse.Namespace) -> int:
@@ -1074,8 +2431,9 @@ def build_parser() -> argparse.ArgumentParser:
     workflows = areas.add_parser("workflow").add_subparsers(dest="workflow_action", required=True)
     for name in ("start", "heartbeat", "complete"):
         command = workflows.add_parser(name); command.add_argument("--attempt-dir", required=True); command.add_argument("--workflow-id", required=True); command.add_argument("--instance-id", required=True); command.add_argument("--review-evidence", action="append", default=[]); command.set_defaults(func=workflow_action)
-    command = areas.add_parser("handoff"); command.add_argument("--task-dir", required=True); command.add_argument("--state", required=True); command.add_argument("--summary", required=True); command.add_argument("--command", action="append", default=[]); command.add_argument("--file", action="append", default=[]); command.add_argument("--limitation", action="append", default=[]); command.add_argument("--self-review-passed", action="store_true"); command.add_argument("--self-review-finding", action="append", default=[]); command.add_argument("--self-review-fix", action="append", default=[]); command.add_argument("--blocker-type", default=""); command.add_argument("--blocking-reason", default=""); command.set_defaults(func=handoff)
-    command = areas.add_parser("finalize"); command.add_argument("--task-dir", required=True); command.add_argument("--state", required=True); command.add_argument("--summary", default=""); command.add_argument("--summary-file", default=""); command.add_argument("--command", action="append", default=[]); command.add_argument("--file", action="append", default=[]); command.add_argument("--limitation", action="append", default=[]); command.add_argument("--self-review-passed", action="store_true"); command.add_argument("--self-review-finding", action="append", default=[]); command.add_argument("--self-review-fix", action="append", default=[]); command.add_argument("--blocker-type", default=""); command.add_argument("--blocking-reason", default=""); command.set_defaults(func=handoff, auto_derive=True)
+    command = areas.add_parser("handoff"); command.add_argument("--task-dir", required=True); command.add_argument("--state", required=True); command.add_argument("--summary", required=True); command.add_argument("--command", action="append", default=[]); command.add_argument("--file", action="append", default=[]); command.add_argument("--limitation", action="append", default=[]); command.add_argument("--self-review-passed", action="store_true"); command.add_argument("--self-review-summary", default=""); command.add_argument("--self-review-finding", action="append", default=[]); command.add_argument("--self-review-fix", action="append", default=[]); command.add_argument("--blocker-type", default=""); command.add_argument("--blocking-reason", default=""); command.set_defaults(func=handoff)
+    command = areas.add_parser("finalize"); command.add_argument("--task-dir", default=""); command.add_argument("--attempt-dir", default=""); command.add_argument("--state", required=True); command.add_argument("--summary", default=""); command.add_argument("--summary-file", default=""); command.add_argument("--command", action="append", default=[]); command.add_argument("--file", action="append", default=[]); command.add_argument("--limitation", action="append", default=[]); command.add_argument("--self-review-passed", action="store_true"); command.add_argument("--self-review-summary", default=""); command.add_argument("--self-review-finding", action="append", default=[]); command.add_argument("--self-review-fix", action="append", default=[]); command.add_argument("--blocker-type", default=""); command.add_argument("--blocking-reason", default=""); command.set_defaults(func=handoff, auto_derive=True)
+    command = areas.add_parser("check"); command.add_argument("--attempt-dir", required=True); command.add_argument("--check-id", required=True); command.add_argument("--workflow-id", default=""); command.add_argument("--instance-id", default=""); command.set_defaults(func=check_command)
     command = areas.add_parser("exec"); command.add_argument("--attempt-dir", required=True); command.add_argument("--workflow-id", required=True); command.add_argument("--instance-id", required=True); command.add_argument("--timeout", type=float, required=True); command.add_argument("--cwd", default=""); command.add_argument("--acceptance", action="store_true"); command.add_argument("command", nargs=argparse.REMAINDER); command.set_defaults(func=execute_command)
     command = areas.add_parser("status"); command.add_argument("--task-dir", required=True); command.set_defaults(func=status_action)
     workers = areas.add_parser("worker").add_subparsers(dest="worker_action", required=True)

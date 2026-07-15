@@ -265,6 +265,9 @@ class BackendGovernanceTests(unittest.TestCase):
         self.assertIn("features.enable_fanout=false", command)
         self.assertIn("skills.include_instructions=false", command)
         self.assertIn("--ignore-user-config", command)
+        self.assertIn("--dangerously-bypass-hook-trust", command)
+        self.assertIn("hooks.PreToolUse", command)
+        self.assertEqual(profile["context_access"]["adapter"]["enforcement_level"], "best_effort")
 
         human_command = build_command(
             backend_id="codex",
@@ -278,6 +281,7 @@ class BackendGovernanceTests(unittest.TestCase):
         self.assertNotIn("codex_stream_monitor.py", human_command)
         self.assertIn("agents.max_threads=1", human_command)
         self.assertIn("skills.include_instructions=false", human_command)
+        self.assertIn("--dangerously-bypass-hook-trust", human_command)
         self.assertNotIn("--ignore-user-config", human_command)
 
     def test_codex_spawn_monitor_can_be_explicitly_enabled(self):
@@ -368,6 +372,12 @@ class BackendGovernanceTests(unittest.TestCase):
         fragment = (runtime / "kimi-governance.toml").read_text(encoding="utf-8")
         self.assertIn('pattern = "Agent"', fragment)
         self.assertIn('event = "PreToolUse"', fragment)
+        self.assertIn('matcher = "Read|Grep|Glob"', fragment)
+        self.assertIn("read_policy_hook.py", fragment)
+        self.assertEqual(
+            profile["context_access"]["adapter"]["enforcement_level"],
+            "fail_open_tool_blocking",
+        )
         command = build_command(
             backend_id="kimi-code",
             io_mode="machine",
@@ -452,6 +462,22 @@ class BackendGovernanceTests(unittest.TestCase):
         )
         runtime = self.root / "opencode-attempt" / "runtime"
         result = materialize_backend_profile(profile, runtime)
+        plugin = runtime / "opencode-config" / "plugins" / "rdo-context.js"
+        self.assertTrue(plugin.exists())
+        self.assertIn('"tool.execute.before"', plugin.read_text(encoding="utf-8"))
+        plugin_module = runtime / "rdo-context.mjs"
+        plugin_module.write_text(plugin.read_text(encoding="utf-8"), encoding="utf-8")
+        node_check = subprocess.run(
+            ["node", "--check", str(plugin_module)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(node_check.returncode, 0, node_check.stderr)
+        self.assertEqual(
+            profile["context_access"]["adapter"]["enforcement_level"],
+            "tool_blocking",
+        )
         for io_mode in ("machine", "human"):
             command = build_command(
                 backend_id="opencode",
@@ -476,6 +502,11 @@ class BackendGovernanceTests(unittest.TestCase):
         profile = self.compile_backend("opencode")
         self.assertEqual(profile["governance"]["allowed_subagent_types"], ["explore"])
         self.assertTrue(profile["backend_settings"]["pure_mode"])
+        self.assertFalse(profile["backend_settings"]["context_plugin_enabled"])
+        self.assertEqual(
+            profile["context_access"]["adapter"]["enforcement_level"],
+            "advisory",
+        )
 
     def test_agent_team_request_fails_when_project_disables_teams(self):
         config = self.root / ".agent-collab" / "rdo.toml"
@@ -593,6 +624,35 @@ class BackendGovernanceTests(unittest.TestCase):
         validation = validate_worker_handoff(status, attempt_id, self.task, "0")
         self.assertFalse(validation.valid)
         self.assertIn("backend settings changed during the attempt", validation.reasons)
+
+    def test_handoff_rejects_modified_read_policy(self):
+        attempt_id = "A001-read-policy"
+        attempt = self.task / "attempts" / attempt_id
+        runtime = attempt / "runtime"
+        result = materialize_backend_profile(self.compile(), runtime)
+        write_json(attempt / "ATTEMPT.json", {
+            "backend_profile_sha256": result["profile_sha256"],
+            "read_policy_sha256": result["read_policy_sha256"],
+        })
+        now = utc_now()
+        status = {
+            "state": "running",
+            "current_attempt_id": attempt_id,
+            "state_history": [{"from": "strategy_review", "to": "running", "actor": "dispatch", "at": now}],
+        }
+        (self.task / "HANDOFF.md").write_text("# Handoff\n\nComplete.\n", encoding="utf-8")
+        (self.task / "EVIDENCE.md").write_text("# Evidence\n\nPassed.\n", encoding="utf-8")
+        write_json(self.task / "HANDOFF.json", {
+            "_template": False,
+            "requested_state": "review",
+            "commands_run": [],
+            "files_changed": [],
+            "known_limitations": [],
+        })
+        write_json(runtime / "READ_POLICY.json", {"schema_version": 1, "worktree": "/tampered"})
+        validation = validate_worker_handoff(status, attempt_id, self.task, "0")
+        self.assertFalse(validation.valid)
+        self.assertIn("read policy changed during the attempt", validation.reasons)
 
 
 if __name__ == "__main__":

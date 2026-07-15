@@ -12,24 +12,10 @@ set -euo pipefail
 prompt="$(mktemp)"
 cat > "${prompt}"
 STATUS_PATH="$(awk -F': ' '/^- STATUS_PATH:/ {print $2}' "${prompt}")"
-EVIDENCE_PATH="$(awk -F': ' '/^- EVIDENCE_PATH:/ {print $2}' "${prompt}")"
-HANDOFF_PATH="$(awk -F': ' '/^- HANDOFF_PATH:/ {print $2}' "${prompt}")"
-HANDOFF_JSON_PATH="$(awk -F': ' '/^- HANDOFF_JSON_PATH:/ {print $2}' "${prompt}")"
-printf '# Evidence\n\n## Commands Run\n- smoke\n\n## Tests Passed\n- yes\n' > "${EVIDENCE_PATH}"
-printf '# Handoff\n\n## What Changed\n- attempted illegal status mutation\n' > "${HANDOFF_PATH}"
-cat > "${HANDOFF_JSON_PATH}" <<'JSON'
-{
-  "_template": false,
-  "requested_state": "review",
-  "summary": "attempted illegal status mutation",
-  "commands_run": ["smoke"],
-  "files_changed": ["file.txt"],
-  "known_limitations": [],
-  "needs_coordinator": false,
-  "blocker_type": "",
-  "blocking_reason": ""
-}
-JSON
+ATTEMPT_DIR="$(awk -F': ' '/^- ATTEMPT_DIR:/ {print $2}' "${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" check \
+  --attempt-dir "${ATTEMPT_DIR}" \
+  --check-id smoke >/dev/null
 python3 - "${STATUS_PATH}" <<'PY'
 import json
 import sys

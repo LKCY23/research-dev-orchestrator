@@ -133,7 +133,10 @@ class UsageSupervisor:
         return (
             self._line_count("WORKFLOWS.ndjson"),
             self._line_count("COMMANDS.ndjson"),
-            int((self.runtime.parent / "COMPLETION.json").exists()),
+            int(
+                (self.runtime / "HANDOFF_READY.json").exists()
+                or (self.runtime.parent / "COMPLETION.json").exists()
+            ),
         )
 
     def _append(self, name: str, payload: dict[str, Any]) -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from collections import Counter
@@ -11,14 +12,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from artifact_resolver import (
+    ArtifactResolutionError,
+    protocol_route,
+    resolve_task_artifacts,
+    validate_artifact_binding_for_task,
+)
 from config import load_config
 from protocol import (  # noqa: E402
+    EventJournalError,
+    LEGACY_PROTOCOL_VERSIONS,
     PACKAGE_VERSION,
     PROTOCOL_VERSION,
     has_substantive_content,
     load_json,
     parse_iso,
     pid_is_alive,
+    read_event_journal,
     repo_root,
     utc_now,
 )
@@ -35,24 +45,21 @@ def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[
     events_path = run_dir / "EVENTS.ndjson"
     if not events_path.exists():
         return [], ["run: missing required EVENTS.ndjson"], []
-    events: list[dict[str, Any]] = []
     violations: list[str] = []
     warnings: list[str] = []
-    for line_no, line in enumerate(events_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as exc:
-            violations.append(f"EVENTS.ndjson line {line_no}: malformed JSON: {exc}")
-            continue
-        if not isinstance(event, dict):
-            violations.append(f"EVENTS.ndjson line {line_no}: event must be a JSON object")
-            continue
+    try:
+        events, tail_warning = read_event_journal(
+            run_dir,
+            tolerate_interrupted_tail=True,
+        )
+    except EventJournalError as exc:
+        return [], [str(exc)], []
+    if tail_warning:
+        warnings.append(tail_warning)
+    for line_no, event in enumerate(events, start=1):
         event_violations, event_warnings = validate_event(event, run_id, line_no)
         violations.extend(event_violations)
         warnings.extend(event_warnings)
-        events.append(event)
     return events, violations, warnings
 
 
@@ -95,6 +102,22 @@ def load_handoff_index(task_dir: Path) -> tuple[dict[str, Any] | None, list[str]
     }, warnings
 
 
+def status_uses_v2(status: dict[str, Any]) -> bool:
+    """Return true only for the explicit v2 status discriminator."""
+
+    return status.get("artifact_protocol_version") == 2
+
+
+def status_uses_legacy(status: dict[str, Any]) -> bool:
+    """Return true only for a recognized legacy discriminator."""
+
+    try:
+        route, _ = protocol_route(status)
+    except ArtifactResolutionError:
+        return False
+    return route.startswith("legacy-")
+
+
 def skill_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -113,6 +136,11 @@ def validate_attempt(
     warnings: list[str] = []
     state = status.get("state")
     profile = status.get("profile", "full")
+    if state == "planning" and profile != "full":
+        violations.append(
+            f"{task_dir.name}: STATUS planning requires profile='full'"
+        )
+    artifact_legacy = status_uses_legacy(status)
     policy_path = task_dir / "EXECUTION_POLICY.json"
     if policy_path.exists():
         try:
@@ -161,7 +189,13 @@ def validate_attempt(
     if state in {"planning", "running"}:
         expected_phase = "planning" if state == "planning" else "execution"
         dispatch_pid_alive: bool | None = None
-        if attempt_state not in {"created", "running"}:
+        dispatch_attempt_matches = False
+        recoverable_completed = bool(
+            status_uses_v2(status)
+            and attempt_state == "completed"
+            and attempt.get("handoff_valid") is True
+        )
+        if attempt_state not in {"created", "running"} and not recoverable_completed:
             violations.append(
                 f"{task_dir.name}: STATUS {state} requires ATTEMPT.state created or running, got {attempt_state!r}"
             )
@@ -177,6 +211,8 @@ def validate_attempt(
                 violations.append(f"{task_dir.name}: .dispatch-lock missing attempt_id")
             elif dispatch_attempt.read_text(encoding="utf-8", errors="replace").strip() != str(attempt_id):
                 violations.append(f"{task_dir.name}: .dispatch-lock attempt_id does not match STATUS current_attempt_id")
+            else:
+                dispatch_attempt_matches = True
             pid_path = dispatch_lock / "pid"
             if not pid_path.exists():
                 violations.append(f"{task_dir.name}: .dispatch-lock missing pid while STATUS is {state}")
@@ -205,6 +241,72 @@ def validate_attempt(
                         violations.append(
                             f"{task_dir.name}: tmux exit_code file exists while STATUS and ATTEMPT still report running"
                         )
+        if recoverable_completed:
+            recovery_reasons: list[str] = []
+            expected_handoffs = (
+                {"strategy_review", "blocked"}
+                if state == "planning"
+                else (
+                    {"verified", "blocked"}
+                    if profile == "direct"
+                    else (
+                        {"review", "blocked", "strategy_review"}
+                        if profile == "full"
+                        else {"review", "blocked"}
+                    )
+                )
+            )
+            if attempt.get("handoff_state") not in expected_handoffs:
+                recovery_reasons.append("handoff_state does not match the active task/profile")
+            ended = parse_iso(attempt.get("ended_at"))
+            if ended is None:
+                recovery_reasons.append("completed attempt has no valid ended_at")
+                recovery_age = None
+            else:
+                recovery_age = (
+                    datetime.now(timezone.utc) - ended
+                ).total_seconds()
+                if recovery_age < 0:
+                    recovery_reasons.append(
+                        "completed attempt ended_at is in the future"
+                    )
+                elif recovery_age > tmux_exit_code_grace_seconds:
+                    recovery_reasons.append(
+                        f"dispatcher inter-write window is {recovery_age:.1f}s old"
+                    )
+            if not dispatch_attempt_matches:
+                recovery_reasons.append("dispatch lock does not match the completed attempt")
+            if dispatch_pid_alive is not True:
+                recovery_reasons.append("dispatch pid is not alive")
+            try:
+                resolved = resolve_task_artifacts(
+                    task_dir,
+                    status,
+                    require_publication=True,
+                )
+            except ArtifactResolutionError as exc:
+                recovery_reasons.append(f"handoff publication is invalid: {exc}")
+            else:
+                bundle = resolved.bundle
+                if (
+                    bundle is None
+                    or bundle.handoff.get("requested_state")
+                    != attempt.get("handoff_state")
+                ):
+                    recovery_reasons.append(
+                        "handoff publication does not match ATTEMPT.handoff_state"
+                    )
+            if recovery_reasons:
+                violations.append(
+                    f"{task_dir.name}: active STATUS with completed ATTEMPT is not a "
+                    "recoverable dispatcher inter-write window: "
+                    + "; ".join(recovery_reasons)
+                )
+            else:
+                warnings.append(
+                    f"{task_dir.name}: dispatcher inter-write handoff validation is between ATTEMPT and "
+                    f"STATUS writes ({recovery_age:.1f}s old); replay may complete the transition"
+                )
     elif dispatch_lock.exists():
         violations.append(f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}")
     if state == "strategy_review":
@@ -214,13 +316,14 @@ def validate_attempt(
             )
         if attempt.get("exit_code") != 0:
             violations.append(f"{task_dir.name}: STATUS strategy_review requires worker exit_code=0")
-        request, request_reasons = load_handoff_request(task_dir)
-        for reason in request_reasons:
-            violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
-        if isinstance(request, dict) and request.get("requested_state") != "strategy_review":
-            violations.append(
-                f"{task_dir.name}: STATUS strategy_review requires HANDOFF.json requested_state=strategy_review"
-            )
+        if artifact_legacy:
+            request, request_reasons = load_handoff_request(task_dir)
+            for reason in request_reasons:
+                violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
+            if isinstance(request, dict) and request.get("requested_state") != "strategy_review":
+                violations.append(
+                    f"{task_dir.name}: STATUS strategy_review requires HANDOFF.json requested_state=strategy_review"
+                )
     elif state == "verified":
         if profile != "direct":
             violations.append(f"{task_dir.name}: STATUS verified requires profile='direct'")
@@ -228,15 +331,16 @@ def validate_attempt(
             violations.append(f"{task_dir.name}: STATUS verified requires completed attempt with handoff_state=verified")
         if attempt.get("exit_code") != 0:
             violations.append(f"{task_dir.name}: STATUS verified requires worker exit_code=0")
-        if not has_substantive_content(task_dir / "HANDOFF.md"):
-            violations.append(f"{task_dir.name}: STATUS verified requires substantive HANDOFF.md")
-        if not has_substantive_content(task_dir / "EVIDENCE.md"):
-            violations.append(f"{task_dir.name}: STATUS verified requires substantive EVIDENCE.md")
-        request, request_reasons = load_handoff_request(task_dir)
-        for reason in request_reasons:
-            violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
-        if isinstance(request, dict) and request.get("requested_state") != "verified":
-            violations.append(f"{task_dir.name}: STATUS verified requires HANDOFF.json requested_state=verified")
+        if artifact_legacy:
+            if not has_substantive_content(task_dir / "HANDOFF.md"):
+                violations.append(f"{task_dir.name}: STATUS verified requires substantive HANDOFF.md")
+            if not has_substantive_content(task_dir / "EVIDENCE.md"):
+                violations.append(f"{task_dir.name}: STATUS verified requires substantive EVIDENCE.md")
+            request, request_reasons = load_handoff_request(task_dir)
+            for reason in request_reasons:
+                violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
+            if isinstance(request, dict) and request.get("requested_state") != "verified":
+                violations.append(f"{task_dir.name}: STATUS verified requires HANDOFF.json requested_state=verified")
     elif state == "review":
         if profile not in {"delegated", "full"}:
             violations.append(f"{task_dir.name}: STATUS review requires profile='delegated' or profile='full'")
@@ -244,24 +348,26 @@ def validate_attempt(
             violations.append(f"{task_dir.name}: STATUS review requires completed attempt with handoff_state=review")
         if attempt.get("exit_code") != 0:
             violations.append(f"{task_dir.name}: STATUS review requires worker exit_code=0")
-        if not has_substantive_content(task_dir / "HANDOFF.md"):
-            violations.append(f"{task_dir.name}: STATUS review requires substantive HANDOFF.md")
-        if not has_substantive_content(task_dir / "EVIDENCE.md"):
-            violations.append(f"{task_dir.name}: STATUS review requires substantive EVIDENCE.md")
-        request, request_reasons = load_handoff_request(task_dir)
-        for reason in request_reasons:
-            violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
-        if isinstance(request, dict) and request.get("requested_state") != "review":
-            violations.append(f"{task_dir.name}: STATUS review requires HANDOFF.json requested_state=review")
+        if artifact_legacy:
+            if not has_substantive_content(task_dir / "HANDOFF.md"):
+                violations.append(f"{task_dir.name}: STATUS review requires substantive HANDOFF.md")
+            if not has_substantive_content(task_dir / "EVIDENCE.md"):
+                violations.append(f"{task_dir.name}: STATUS review requires substantive EVIDENCE.md")
+            request, request_reasons = load_handoff_request(task_dir)
+            for reason in request_reasons:
+                violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
+            if isinstance(request, dict) and request.get("requested_state") != "review":
+                violations.append(f"{task_dir.name}: STATUS review requires HANDOFF.json requested_state=review")
     elif state == "blocked":
         if attempt_state == "completed":
             if attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "blocked":
                 violations.append(f"{task_dir.name}: completed blocked task requires handoff_state=blocked")
-            request, request_reasons = load_handoff_request(task_dir)
-            for reason in request_reasons:
-                violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
-            if isinstance(request, dict) and request.get("requested_state") != "blocked":
-                violations.append(f"{task_dir.name}: STATUS blocked requires HANDOFF.json requested_state=blocked")
+            if artifact_legacy:
+                request, request_reasons = load_handoff_request(task_dir)
+                for reason in request_reasons:
+                    violations.append(f"{task_dir.name}: handoff request invalid: {reason}")
+                if isinstance(request, dict) and request.get("requested_state") != "blocked":
+                    violations.append(f"{task_dir.name}: STATUS blocked requires HANDOFF.json requested_state=blocked")
         elif attempt_state == "invalid_handoff":
             if status.get("blocker_type") != "needs_coordinator":
                 violations.append(f"{task_dir.name}: invalid_handoff blocked task requires blocker_type=needs_coordinator")
@@ -310,17 +416,18 @@ def validate_status(
     violations.extend(validate_status_schema(status, fsm, task_dir.name))
     violations.extend(validate_state_history(status, fsm, task_dir.name))
 
-    evidence = status.get("evidence")
-    if isinstance(evidence, dict):
-        logs = evidence.get("logs", [])
-        if isinstance(logs, list):
-            for log_ref in logs:
-                log_path = task_dir / str(log_ref)
-                if not log_path.exists():
-                    violations.append(f"{task_dir.name}: evidence log missing: {log_ref}")
+    if status_uses_legacy(status):
+        evidence = status.get("evidence")
+        if isinstance(evidence, dict):
+            logs = evidence.get("logs", [])
+            if isinstance(logs, list):
+                for log_ref in logs:
+                    log_path = task_dir / str(log_ref)
+                    if not log_path.exists():
+                        violations.append(f"{task_dir.name}: evidence log missing: {log_ref}")
 
-    if state in {"approved", "merged"} and not has_substantive_content(task_dir / "EVIDENCE.md"):
-        violations.append(f"{task_dir.name}: {state} task has missing or template-only EVIDENCE.md")
+        if state in {"approved", "merged"} and not has_substantive_content(task_dir / "EVIDENCE.md"):
+            violations.append(f"{task_dir.name}: {state} task has missing or template-only EVIDENCE.md")
 
     attempt_id = status.get("current_attempt_id")
     if attempt_id and not (task_dir / "attempts" / str(attempt_id)).exists():
@@ -366,7 +473,44 @@ def validate_merged_task(
     warnings: list[str] = []
     if not isinstance(commit, str) or not commit:
         violations.append(f"{task_dir.name}: task_merged event has no commit")
-    if status.get("profile", "full") != "direct":
+    if status_uses_v2(status):
+        attempt_id = latest.get("attempt_id")
+        current_attempt_id = status.get("current_attempt_id")
+        binding = latest.get("artifact_binding")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            violations.append(f"{task_dir.name}: v2 task_merged event has no attempt_id")
+        elif attempt_id != current_attempt_id:
+            violations.append(
+                f"{task_dir.name}: v2 task_merged event attempt_id does not match STATUS current_attempt_id"
+            )
+        if not isinstance(binding, dict):
+            violations.append(f"{task_dir.name}: v2 task_merged event has no artifact_binding")
+        elif isinstance(commit, str) and commit:
+            expected_state = "verified" if status.get("profile", "full") == "direct" else "review"
+            try:
+                validate_artifact_binding_for_task(
+                    task_dir,
+                    status,
+                    binding,
+                    expected_requested_state=expected_state,
+                    expected_source_commit=commit,
+                )
+            except ArtifactResolutionError as exc:
+                violations.append(
+                    f"{task_dir.name}: v2 task_merged artifact binding is invalid: {exc}"
+                )
+        if latest.get("source_branch") != status.get("branch"):
+            violations.append(
+                f"{task_dir.name}: v2 task_merged source_branch does not match STATUS branch"
+            )
+        if status.get("profile", "full") != "direct":
+            _, review_violations = _load_v2_approved_review(
+                task_dir,
+                status,
+                expected_commit=commit if isinstance(commit, str) and commit else None,
+            )
+            violations.extend(review_violations)
+    elif status.get("profile", "full") != "direct":
         try:
             pointer = load_json(task_dir / "reviews" / "CURRENT_TASK_REVIEW.json")
             decision_path = task_dir / str(pointer.get("decision_path") or "")
@@ -402,8 +546,94 @@ def validate_merged_task(
     return violations, warnings
 
 
+def _safe_v2_review_path(task_dir: Path, raw_ref: Any) -> Path:
+    """Resolve one immutable review decision without permitting task escape/symlinks."""
+
+    if not isinstance(raw_ref, str) or not raw_ref or "\\" in raw_ref:
+        raise ValueError("decision_path must be a non-empty relative POSIX path")
+    parts = raw_ref.split("/")
+    if parts[0] != "reviews" or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("decision_path must be a normalized file below reviews/")
+    candidate = task_dir.joinpath(*parts)
+    current = task_dir
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("decision_path must not traverse a symlink")
+    if not candidate.is_file():
+        raise ValueError("decision_path does not name a regular file")
+    return candidate
+
+
+def _load_v2_approved_review(
+    task_dir: Path,
+    status: dict[str, Any],
+    *,
+    expected_commit: str | None = None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Validate the pointer, digest, decision, Git commit, and v2 bundle binding."""
+
+    label = f"{task_dir.name}: approved task review"
+    try:
+        pointer = load_json(task_dir / "reviews" / "CURRENT_TASK_REVIEW.json")
+        if not isinstance(pointer, dict):
+            raise ValueError("CURRENT_TASK_REVIEW.json must be a JSON object")
+        decision_path = _safe_v2_review_path(task_dir, pointer.get("decision_path"))
+        declared_digest = pointer.get("decision_sha256")
+        if not isinstance(declared_digest, str) or len(declared_digest) != 64:
+            raise ValueError("CURRENT_TASK_REVIEW.json decision_sha256 must be a SHA-256 digest")
+        decision_bytes = decision_path.read_bytes()
+        actual_digest = hashlib.sha256(decision_bytes).hexdigest()
+        if declared_digest != actual_digest:
+            raise ValueError("CURRENT_TASK_REVIEW.json decision_sha256 does not match the decision")
+        decision = json.loads(decision_bytes)
+        if not isinstance(decision, dict):
+            raise ValueError("review decision must be a JSON object")
+    except Exception as exc:
+        return None, [f"{label} binding is unreadable: {exc}"]
+
+    violations: list[str] = []
+    if pointer.get("revision") != decision.get("revision"):
+        violations.append(f"{label} pointer revision does not match the decision")
+    if decision.get("schema_version") != 2 or decision.get("artifact_protocol_version") != 2:
+        violations.append(f"{label} decision is not Artifact Protocol v2")
+    if decision.get("task_id") != status.get("task_id"):
+        violations.append(f"{label} decision task_id does not match STATUS")
+    if decision.get("decision") != "approved":
+        violations.append(f"{label} decision is not approved")
+
+    approved_commit = decision.get("approved_commit")
+    if not isinstance(approved_commit, str) or not approved_commit:
+        violations.append(f"{label} decision has no approved_commit")
+    elif expected_commit is not None and approved_commit != expected_commit:
+        violations.append(f"{label} approved_commit does not match the merged commit")
+    if decision.get("source_branch") != status.get("branch"):
+        violations.append(f"{label} source_branch does not match STATUS branch")
+
+    binding = decision.get("artifact_binding")
+    if not isinstance(binding, dict):
+        violations.append(f"{label} decision has no artifact_binding")
+    elif isinstance(approved_commit, str) and approved_commit:
+        try:
+            validate_artifact_binding_for_task(
+                task_dir,
+                status,
+                binding,
+                expected_requested_state="review",
+                expected_source_commit=approved_commit,
+            )
+        except ArtifactResolutionError as exc:
+            violations.append(f"{label} artifact binding is invalid: {exc}")
+    return decision, violations
+
+
 def validate_approved_task(task_dir: Path, status: dict[str, Any]) -> list[str]:
     if status.get("state") != "approved" or status.get("profile", "full") == "direct":
+        return []
+    if status_uses_v2(status):
+        _, violations = _load_v2_approved_review(task_dir, status)
+        return violations
+    if not status_uses_legacy(status):
         return []
     try:
         pointer = load_json(task_dir / "reviews" / "CURRENT_TASK_REVIEW.json")
@@ -465,9 +695,14 @@ def collect(
                     f"run: RUN.json package_version {recorded_package!r} differs from installed package version {PACKAGE_VERSION!r}"
                 )
             recorded_protocol = run_json.get("protocol_version")
-            if recorded_protocol != PROTOCOL_VERSION:
+            if recorded_protocol in LEGACY_PROTOCOL_VERSIONS or recorded_protocol is None:
                 warnings.append(
                     f"run: RUN.json protocol_version {recorded_protocol!r} differs from installed {PROTOCOL_VERSION!r}"
+                )
+            elif recorded_protocol != PROTOCOL_VERSION:
+                violations.append(
+                    f"run: RUN.json protocol_version {recorded_protocol!r} is unsupported; "
+                    f"expected {PROTOCOL_VERSION!r} or a recognized legacy version"
                 )
     if not (run_dir / "JOURNAL.md").exists():
         violations.append("run: missing required JOURNAL.md")
@@ -504,9 +739,29 @@ def collect(
                     "lock": None,
                     "dispatch_lock": None,
                     "handoff_index": None,
+                    "artifact_resolution": {
+                        "valid": False,
+                        "error": "STATUS.json must be a JSON object",
+                    },
                 }
             )
             continue
+
+        recorded_protocol = run_json.get("protocol_version")
+        if (
+            recorded_protocol == PROTOCOL_VERSION
+            and status.get("artifact_protocol_version") != 2
+        ):
+            violations.append(
+                f"{task_dir.name}: current run requires STATUS.artifact_protocol_version=2"
+            )
+        elif (
+            recorded_protocol in LEGACY_PROTOCOL_VERSIONS
+            and status.get("artifact_protocol_version") == 2
+        ):
+            violations.append(
+                f"{task_dir.name}: legacy run cannot contain an artifact-protocol-v2 task"
+            )
 
         status_violations, status_warnings = validate_status(
             task_dir,
@@ -554,8 +809,23 @@ def collect(
                         if status.get("state") != "running":
                             warnings.append(f"{task_dir.name}: .dispatch-lock pid is not alive: {pid}")
 
-        handoff_index, handoff_warnings = load_handoff_index(task_dir)
-        warnings.extend(handoff_warnings)
+        handoff_index: dict[str, Any] | None = None
+        artifact_resolution: dict[str, Any]
+        try:
+            resolved_artifacts = resolve_task_artifacts(task_dir, status)
+        except ArtifactResolutionError as exc:
+            violations.append(f"{task_dir.name}: artifact resolution failed: {exc}")
+            artifact_resolution = {
+                "valid": False,
+                "protocol": status.get("artifact_protocol_version"),
+                "error": str(exc),
+            }
+        else:
+            handoff_index = resolved_artifacts.handoff_index
+            artifact_resolution = {"valid": True, **resolved_artifacts.as_dict()}
+            warnings.extend(
+                f"{task_dir.name}: {warning}" for warning in resolved_artifacts.warnings
+            )
 
         tasks.append(
             {
@@ -570,6 +840,7 @@ def collect(
                 "blocking_reason": status.get("blocking_reason"),
                 "summary": status.get("summary"),
                 "handoff_index": handoff_index,
+                "artifact_resolution": artifact_resolution,
                 "lock": lock_info,
                 "dispatch_lock": dispatch_lock_info,
             }

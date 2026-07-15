@@ -49,6 +49,16 @@ normalize_bool() {
   esac
 }
 
+json_files_equal() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as left, open(sys.argv[2], encoding="utf-8") as right:
+    raise SystemExit(0 if json.load(left) == json.load(right) else 1)
+PY
+}
+
 write_tmux_timeout_diagnostics() {
   python3 "${PROTOCOL_CLI}" write-tmux-timeout-diagnostics \
     --run-dir "${RUN_DIR}" \
@@ -170,6 +180,8 @@ import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8")).get("profile", "full"))
 PY
 )"
+TASK_ARTIFACT_PROTOCOL_VERSION="$(python3 "${PROTOCOL_CLI}" task-protocol-version \
+  --task-dir "${TASK_DIR}")" || exit 2
 approved_strategy_valid() {
   PYTHONPATH="${SCRIPT_DIR}" python3 - "${TASK_DIR}" >/dev/null 2>&1 <<'PY'
 import sys
@@ -213,8 +225,23 @@ if [[ "${TASK_PROFILE}" != "full" && "${RDO_ATTEMPT_PHASE}" != "execution" ]]; t
   exit 2
 fi
 
+# V2 readiness is deliberately checked before creating a dispatch lock,
+# attempt directory, FSM transition, branch, or worktree.  The same validation
+# is repeated under the lock when TASK_INPUTS.json is frozen.
+if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "2" ]]; then
+  python3 "${PROTOCOL_CLI}" check-task-readiness \
+    --task-dir "${TASK_DIR}" \
+    --run-dir "${RUN_DIR}" \
+    --task-id "${TASK_ID}" \
+    --profile "${TASK_PROFILE}" >/dev/null
+elif [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" != "1" ]]; then
+  echo "unsupported artifact protocol version: ${TASK_ARTIFACT_PROTOCOL_VERSION}" >&2
+  exit 2
+fi
+
 STRATEGY_ID=""
 STRATEGY_SHA256=""
+STRATEGY_REVISION=""
 STRATEGY_PATH=""
 if [[ "${RDO_ATTEMPT_PHASE}" == "execution" && "${TASK_PROFILE}" == "full" ]]; then
   STRATEGY_INFO="$(PYTHONPATH="${SCRIPT_DIR}" python3 - "${TASK_DIR}" <<'PY'
@@ -443,7 +470,26 @@ else
   WORKTREE_PATH="${REPO_ROOT}/${WORKTREE_REL}"
 fi
 
-mkdir -p "${ATTEMPT_DIR}"
+TASK_INPUTS_SHA256=""
+TASK_INPUTS_REF=""
+TASK_BASE_COMMIT=""
+WORKTREE_BEFORE_SHA256=""
+if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "2" ]]; then
+  TASK_INPUTS_RESULT="$(python3 "${PROTOCOL_CLI}" freeze-task-inputs \
+    --task-dir "${TASK_DIR}" \
+    --run-dir "${RUN_DIR}" \
+    --repo-root "${REPO_ROOT}" \
+    --task-id "${TASK_ID}" \
+    --attempt-id "${ATTEMPT_ID}" \
+    --attempt-dir "${ATTEMPT_DIR}" \
+    --profile "${TASK_PROFILE}" \
+    --execution-mode "${RDO_EXECUTION_MODE}")" || exit 2
+  TASK_INPUTS_SHA256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["sha256"])' "${TASK_INPUTS_RESULT}")"
+  TASK_INPUTS_REF="TASK_INPUTS.json"
+  TASK_BASE_COMMIT="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["task_base_commit"])' "${TASK_INPUTS_RESULT}")"
+else
+  mkdir -p "${ATTEMPT_DIR}"
+fi
 
 BACKEND_MATERIALIZED_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" materialize \
   --profile-json "${BACKEND_PROFILE_JSON}" \
@@ -451,15 +497,18 @@ BACKEND_MATERIALIZED_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" materialize \
 BACKEND_PROFILE_PATH="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["profile_path"])' "${BACKEND_MATERIALIZED_JSON}")"
 BACKEND_PROFILE_SHA256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["profile_sha256"])' "${BACKEND_MATERIALIZED_JSON}")"
 BACKEND_SETTINGS_SHA256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("settings_sha256") or "")' "${BACKEND_MATERIALIZED_JSON}")"
+READ_POLICY_SHA256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("read_policy_sha256") or "")' "${BACKEND_MATERIALIZED_JSON}")"
 printf '%s\n' "${PREFLIGHT_JSON}" > "${ATTEMPT_DIR}/runtime/PREFLIGHT.json"
 
-for artifact in EVIDENCE.md HANDOFF.md HANDOFF.json; do
-  if [[ -f "${TASK_DIR}/${artifact}" ]]; then
-    cp "${TASK_DIR}/${artifact}" "${ATTEMPT_DIR}/preexisting-${artifact}"
-  fi
-  cp "${SKILL_ROOT}/templates/task/${artifact}" "${TASK_DIR}/${artifact}"
-done
-rm -f "${ATTEMPT_DIR}/COMPLETION.json" "${ATTEMPT_DIR}/COMPLETION.json.tmp"
+if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "1" ]]; then
+  for artifact in EVIDENCE.md HANDOFF.md HANDOFF.json; do
+    if [[ -f "${TASK_DIR}/${artifact}" ]]; then
+      cp "${TASK_DIR}/${artifact}" "${ATTEMPT_DIR}/preexisting-${artifact}"
+    fi
+    cp "${SKILL_ROOT}/templates/task/${artifact}" "${TASK_DIR}/${artifact}"
+  done
+  rm -f "${ATTEMPT_DIR}/COMPLETION.json" "${ATTEMPT_DIR}/COMPLETION.json.tmp"
+fi
 
 {
   echo "owner: dispatch"
@@ -477,7 +526,11 @@ if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
     if git -C "${REPO_ROOT}" show-ref --verify --quiet "refs/heads/${BRANCH}"; then
       git -C "${REPO_ROOT}" worktree add "${WORKTREE_PATH}" "${BRANCH}"
     else
-      git -C "${REPO_ROOT}" worktree add -b "${BRANCH}" "${WORKTREE_PATH}" HEAD
+      if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "2" ]]; then
+        git -C "${REPO_ROOT}" worktree add -b "${BRANCH}" "${WORKTREE_PATH}" "${TASK_BASE_COMMIT}"
+      else
+        git -C "${REPO_ROOT}" worktree add -b "${BRANCH}" "${WORKTREE_PATH}" HEAD
+      fi
     fi
   fi
 fi
@@ -546,6 +599,13 @@ fi
 
 ORIGINAL_WORKER_COMMAND="${RDO_WORKER_COMMAND}"
 SUPERVISOR_RESULT="${ATTEMPT_DIR}/supervisor-result.json"
+if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "2" ]]; then
+  HANDOFF_PUBLICATION_PATH="${ATTEMPT_DIR}/runtime/HANDOFF_READY.json"
+  TRANSCRIPT_PATH="${ATTEMPT_DIR}/runtime/transcript.log"
+else
+  HANDOFF_PUBLICATION_PATH="${ATTEMPT_DIR}/COMPLETION.json"
+  TRANSCRIPT_PATH="${ATTEMPT_DIR}/transcript.log"
+fi
 if [[ "${RDO_RUNTIME_BACKEND}" == "plain" ]]; then
   if [[ "${REGISTERED_BACKEND_COMMAND}" == "0" ]]; then
     BACKEND_ARGV_JSON="$(python3 -c 'import json,sys; print(json.dumps(["/bin/bash", "-c", sys.argv[1]], separators=(",", ":")))' "${ORIGINAL_WORKER_COMMAND}")"
@@ -556,15 +616,18 @@ if [[ "${RDO_RUNTIME_BACKEND}" == "plain" ]]; then
     "${ATTEMPT_DIR}/prompt.md" "${PROMPT_TRANSPORT}" "${RDO_STARTUP_TIMEOUT_SECONDS}" \
     "${ATTEMPT_TIMEOUT_SECONDS}" "${ATTEMPT_DIR}/runtime/STARTUP.json" \
     "${SUPERVISOR_RESULT}" "${ATTEMPT_DIR}/runtime/supervisor.json" \
-    "${ATTEMPT_DIR}/transcript.log" "${STRATEGY_ID}" "${STRATEGY_SHA256}" \
+    "${TRANSCRIPT_PATH}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" \
     "${ATTEMPT_DIR}/runtime/SESSION.json" "${RDO_BACKEND_SESSION_ID}" \
-    "${REGISTERED_BACKEND_COMMAND}" "${BACKEND_PROFILE_PATH}" <<'PY'
+    "${REGISTERED_BACKEND_COMMAND}" "${BACKEND_PROFILE_PATH}" \
+    "${TASK_ARTIFACT_PROTOCOL_VERSION}" "${HANDOFF_PUBLICATION_PATH}" \
+    "${TASK_DIR}" "${ATTEMPT_ID}" <<'PY'
 import shlex, sys
 (
     script, backend, argv_json, environment_json, cwd, prompt_path,
     prompt_transport, startup_timeout, timeout, startup_result,
     supervisor_result, supervisor_state, transcript, strategy_id,
     strategy_sha256, session_result, existing_session_id, registered, backend_profile,
+    artifact_protocol_version, publication_path, task_dir, attempt_id,
 ) = sys.argv[1:]
 parts = [
     sys.executable, script, "--backend", backend,
@@ -579,6 +642,10 @@ parts = [
     "--session-result", session_result,
     "--existing-session-id", existing_session_id,
     "--backend-profile", backend_profile,
+    "--artifact-protocol-version", artifact_protocol_version,
+    "--publication-path", publication_path,
+    "--task-dir", task_dir,
+    "--attempt-id", attempt_id,
 ]
 if registered == "0":
     parts.append("--custom-command")
@@ -586,9 +653,9 @@ print(" ".join(shlex.quote(part) for part in parts))
 PY
 )"
 else
-  RDO_WORKER_COMMAND="$(python3 - "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${ORIGINAL_WORKER_COMMAND}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" "${ATTEMPT_DIR}/COMPLETION.json" "${TASK_DIR}" "${ATTEMPT_ID}" "${ATTEMPT_DIR}/runtime/FINALIZATION.json" <<'PY'
+  RDO_WORKER_COMMAND="$(python3 - "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${ORIGINAL_WORKER_COMMAND}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" "${TASK_ARTIFACT_PROTOCOL_VERSION}" "${HANDOFF_PUBLICATION_PATH}" "${TASK_DIR}" "${ATTEMPT_ID}" "${ATTEMPT_DIR}/runtime/FINALIZATION.json" <<'PY'
 import shlex, sys
-script, timeout, result, cwd, command, strategy_id, strategy_sha256, completion_path, task_dir, attempt_id, finalization_path = sys.argv[1:]
+script, timeout, result, cwd, command, strategy_id, strategy_sha256, artifact_protocol_version, publication_path, task_dir, attempt_id, finalization_path = sys.argv[1:]
 print(" ".join([
     shlex.quote(sys.executable), shlex.quote(script),
     "--timeout-seconds", shlex.quote(timeout),
@@ -596,7 +663,8 @@ print(" ".join([
     "--cwd", shlex.quote(cwd),
     "--strategy-id", shlex.quote(strategy_id),
     "--strategy-sha256", shlex.quote(strategy_sha256),
-    "--completion-path", shlex.quote(completion_path),
+    "--artifact-protocol-version", shlex.quote(artifact_protocol_version),
+    "--publication-path", shlex.quote(publication_path),
     "--task-dir", shlex.quote(task_dir),
     "--attempt-id", shlex.quote(attempt_id),
     "--finalization-path", shlex.quote(finalization_path),
@@ -609,6 +677,9 @@ fi
 
 python3 "${PROTOCOL_CLI}" create-attempt \
   --path "${ATTEMPT_DIR}/ATTEMPT.json" \
+  --artifact-protocol-version "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
+  --task-inputs-ref "${TASK_INPUTS_REF}" \
+  --task-inputs-sha256 "${TASK_INPUTS_SHA256}" \
   --attempt-id "${ATTEMPT_ID}" \
   --task-id "${TASK_ID}" \
   --agent-name "${RDO_WORKER_AGENT_NAME}" \
@@ -620,9 +691,11 @@ python3 "${PROTOCOL_CLI}" create-attempt \
   --resume-reason "${STATUS_STATE}" \
   --phase "${RDO_ATTEMPT_PHASE}" \
   --strategy-id "${STRATEGY_ID}" \
+  --strategy-revision "${STRATEGY_REVISION}" \
   --strategy-sha256 "${STRATEGY_SHA256}" \
   --backend-profile-sha256 "${BACKEND_PROFILE_SHA256}" \
   --backend-settings-sha256 "${BACKEND_SETTINGS_SHA256}" \
+  --read-policy-sha256 "${READ_POLICY_SHA256}" \
   --permission-mode "${RDO_PERMISSION_MODE}" \
   --io-mode "${RDO_IO_MODE}" \
   --command "${ORIGINAL_WORKER_COMMAND}" \
@@ -650,6 +723,7 @@ if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
   python3 "${SCRIPT_DIR}/worktree_fingerprint.py" \
     --worktree "${WORKTREE_PATH}" \
     --output "${ATTEMPT_DIR}/runtime/worktree-before.json"
+  WORKTREE_BEFORE_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${ATTEMPT_DIR}/runtime/worktree-before.json")"
   if [[ "${TASK_PROFILE}" == "full" && "${RDO_ATTEMPT_PHASE}" == "execution" ]]; then
     python3 "${RESUME_CONTEXT_CLI}" \
       --task-dir "${TASK_DIR}" \
@@ -662,7 +736,7 @@ fi
 
 if [[ "${DISPATCH_DRY_RUN}" == "1" ]]; then
   echo "dry run: prompt written to ${ATTEMPT_DIR}/prompt.md" | tee "${ATTEMPT_DIR}/result.md"
-  touch "${ATTEMPT_DIR}/transcript.log"
+  touch "${TRANSCRIPT_PATH}"
   EXIT_CODE=0
   EXIT_CODE_RAW="0"
 else
@@ -682,7 +756,7 @@ else
       --worktree-path "${WORKTREE_PATH}" \
       --command "${RDO_WORKER_COMMAND}" \
       --prompt-path "${ATTEMPT_DIR}/prompt.md" \
-      --transcript-path "${ATTEMPT_DIR}/transcript.log" \
+      --transcript-path "${TRANSCRIPT_PATH}" \
       --exit-code-file "${EXIT_CODE_FILE}" \
       --done-signal "${DONE_SIGNAL}" \
       --keep-session "${RDO_TMUX_KEEP_SESSION}" \
@@ -701,7 +775,7 @@ PY
 )"
     tmux new-session -d -s "${TMUX_SESSION}" "${TMUX_COMMAND}"
     if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
-      tmux pipe-pane -o -t "${TMUX_SESSION}" "cat >> '${ATTEMPT_DIR}/transcript.log'" || true
+      tmux pipe-pane -o -t "${TMUX_SESSION}" "cat >> '${TRANSCRIPT_PATH}'" || true
     fi
     WAIT_START="$(date +%s)"
     while [[ ! -f "${EXIT_CODE_FILE}" ]]; do
@@ -752,7 +826,7 @@ python3 "${PROTOCOL_CLI}" record-session \
 SESSION_RECORD_CODE=$?
 set -e
 if [[ "${SESSION_RECORD_CODE}" -ne 0 ]]; then
-  echo "record-session failed with exit ${SESSION_RECORD_CODE}; continuing to handoff validation" >> "${ATTEMPT_DIR}/transcript.log"
+  echo "record-session failed with exit ${SESSION_RECORD_CODE}; continuing to handoff validation" >> "${TRANSCRIPT_PATH}"
 fi
 
 if [[ -f "${ATTEMPT_DIR}/runtime/STARTUP.json" ]]; then
@@ -776,11 +850,25 @@ if [[ -f "${ATTEMPT_DIR}/runtime/STARTUP.json" ]]; then
 fi
 
 if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
-  python3 "${SCRIPT_DIR}/worktree_fingerprint.py" \
-    --worktree "${WORKTREE_PATH}" \
-    --output "${ATTEMPT_DIR}/runtime/worktree-after.json"
-  if [[ "${RDO_ATTEMPT_PHASE}" == "planning" ]] && ! cmp -s "${ATTEMPT_DIR}/runtime/worktree-before.json" "${ATTEMPT_DIR}/runtime/worktree-after.json"; then
-    echo "planning worker modified the task worktree" >> "${ATTEMPT_DIR}/transcript.log"
+  WORKTREE_AFTER_PATH="${ATTEMPT_DIR}/runtime/worktree-after.json"
+  if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "2" && -f "${WORKTREE_AFTER_PATH}" ]]; then
+    WORKTREE_AFTER_CHECK="${ATTEMPT_DIR}/runtime/worktree-after-dispatch-check.json"
+    python3 "${SCRIPT_DIR}/worktree_fingerprint.py" \
+      --worktree "${WORKTREE_PATH}" \
+      --output "${WORKTREE_AFTER_CHECK}"
+    if ! json_files_equal "${WORKTREE_AFTER_PATH}" "${WORKTREE_AFTER_CHECK}"; then
+      echo "task worktree changed after immutable v2 handoff publication" >> "${TRANSCRIPT_PATH}"
+      EXIT_CODE=126
+      EXIT_CODE_RAW="126"
+    fi
+    rm -f "${WORKTREE_AFTER_CHECK}"
+  else
+    python3 "${SCRIPT_DIR}/worktree_fingerprint.py" \
+      --worktree "${WORKTREE_PATH}" \
+      --output "${WORKTREE_AFTER_PATH}"
+  fi
+  if [[ "${RDO_ATTEMPT_PHASE}" == "planning" ]] && ! json_files_equal "${ATTEMPT_DIR}/runtime/worktree-before.json" "${ATTEMPT_DIR}/runtime/worktree-after.json"; then
+    echo "planning worker modified the task worktree" >> "${TRANSCRIPT_PATH}"
     EXIT_CODE=126
     EXIT_CODE_RAW="126"
   elif [[ "${RDO_ATTEMPT_PHASE}" == "execution" ]] && ! python3 "${SCRIPT_DIR}/worktree_policy_check.py" \
@@ -789,7 +877,7 @@ if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
       --strategy "${STRATEGY_PATH}" \
       --policy "${TASK_DIR}/EXECUTION_POLICY.json" \
       > "${ATTEMPT_DIR}/runtime/worktree-policy-result.json"; then
-    echo "execution worker modified paths outside the approved strategy" >> "${ATTEMPT_DIR}/transcript.log"
+    echo "execution worker modified paths outside the approved strategy" >> "${TRANSCRIPT_PATH}"
     EXIT_CODE=126
     EXIT_CODE_RAW="126"
   fi
@@ -811,6 +899,22 @@ python3 "${PROTOCOL_CLI}" validate-handoff \
   --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
   --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
   --worktree "${WORKTREE_PATH}" \
+  --expected-profile "${TASK_PROFILE}" \
+  --expected-task-id "${TASK_ID}" \
+  --expected-artifact-protocol-version "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
+  --expected-phase "${RDO_ATTEMPT_PHASE}" \
+  --expected-branch "${BRANCH}" \
+  --expected-worktree "${WORKTREE_PATH}" \
+  --expected-worker-backend "${RDO_WORKER_BACKEND}" \
+  --expected-strategy-id "${STRATEGY_ID}" \
+  --expected-strategy-revision "${STRATEGY_REVISION}" \
+  --expected-strategy-sha256 "${STRATEGY_SHA256}" \
+  --expected-backend-profile-sha256 "${BACKEND_PROFILE_SHA256}" \
+  --expected-backend-settings-sha256 "${BACKEND_SETTINGS_SHA256}" \
+  --expected-read-policy-sha256 "${READ_POLICY_SHA256}" \
+  --expected-task-inputs-sha256 "${TASK_INPUTS_SHA256}" \
+  --expected-task-base-commit "${TASK_BASE_COMMIT}" \
+  --expected-worktree-before-sha256 "${WORKTREE_BEFORE_SHA256}" \
   --exit-code-raw "${EXIT_CODE_RAW}"
 VALIDATION_CODE=$?
 set -e

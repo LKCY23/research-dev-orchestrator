@@ -355,7 +355,10 @@ def validate_worker_handoff(
                 reasons.append("backend profile digest changed during the attempt")
     if isinstance(attempt, dict) and attempt.get("backend_settings_sha256"):
         generated = profile.get("generated_files", []) if isinstance(profile, dict) else []
-        settings_files = [item for item in generated if isinstance(item, str) and item]
+        settings_files = [
+            item for item in generated
+            if isinstance(item, str) and item and item != "READ_POLICY.json"
+        ]
         settings_path = attempt_path.parent / "runtime" / (
             settings_files[0] if len(settings_files) == 1 else "claude-settings.json"
         )
@@ -366,6 +369,15 @@ def validate_worker_handoff(
         else:
             if settings_digest != attempt.get("backend_settings_sha256"):
                 reasons.append("backend settings changed during the attempt")
+    if isinstance(attempt, dict) and attempt.get("read_policy_sha256"):
+        policy_path = attempt_path.parent / "runtime" / "READ_POLICY.json"
+        try:
+            policy_digest = hashlib.sha256(policy_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            reasons.append(f"read policy is unreadable during handoff: {exc}")
+        else:
+            if policy_digest != attempt.get("read_policy_sha256"):
+                reasons.append("read policy changed during the attempt")
     violations_path = task_dir / "attempts" / attempt_id / "runtime" / "VIOLATIONS.ndjson"
     if violations_path.exists():
         try:
