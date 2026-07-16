@@ -85,6 +85,115 @@ class DispatchAssetsTests(unittest.TestCase):
 
             self.assertNotIn("Minimal Valid Strategy Skeleton", prompt)
 
+    def test_v2_prompt_is_input_complete_without_protocol_file_reads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary)
+            (task / "STATUS.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "T101-example",
+                        "profile": "direct",
+                        "artifact_protocol_version": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task / "EXECUTION_POLICY.json").write_text(
+                json.dumps(DEFAULT_EXECUTION_POLICY), encoding="utf-8"
+            )
+            for name in ("TASK.md", "CONTEXT.md", "ACCEPTANCE.md"):
+                (task / name).write_text(name, encoding="utf-8")
+
+            prompt = render_worker_prompt(
+                worktree_path="/tmp/worktree",
+                task_dir=task,
+                status_path=task / "STATUS.json",
+                attempt_dir=task / "attempts" / "A001",
+                worker_backend="claude-code",
+                phase="execution",
+            )
+
+            self.assertIn("## EXECUTION_POLICY.json", prompt)
+            self.assertIn("frozen and fully embedded below", prompt)
+            self.assertIn("do not re-read task-dir copies or TASK_INPUTS.json", prompt)
+            self.assertIn("do not bypass the policy with Bash, Python, cat", prompt)
+            self.assertNotIn("- STATUS_PATH:", prompt)
+            self.assertNotIn("- TASK_INPUTS_PATH:", prompt)
+            self.assertNotIn("- EVIDENCE_PATH:", prompt)
+            self.assertNotIn("- HANDOFF_READY_PATH:", prompt)
+
+    def test_full_execution_embeds_strategy_resume_summary_and_complete_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary)
+            (task / "STATUS.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "T101-example",
+                        "profile": "full",
+                        "artifact_protocol_version": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task / "EXECUTION_POLICY.json").write_text(
+                json.dumps(DEFAULT_EXECUTION_POLICY), encoding="utf-8"
+            )
+            for name in ("TASK.md", "CONTEXT.md", "ACCEPTANCE.md"):
+                (task / name).write_text(name, encoding="utf-8")
+            strategy = {
+                "strategy_id": "T101-example-S001",
+                "workflows": [
+                    {
+                        "workflow_id": "WF-reused",
+                        "resume": {
+                            "from_attempt": "A000",
+                            "from_workflow": "WF-old",
+                            "mode": "reuse",
+                        },
+                    },
+                    {
+                        "workflow_id": "WF-revalidate",
+                        "resume": {
+                            "from_attempt": "A000",
+                            "from_workflow": "WF-check",
+                            "mode": "revalidate",
+                        },
+                    },
+                    {"workflow_id": "WF-new"},
+                ],
+            }
+            strategy_path = task / "strategy.json"
+            strategy_path.write_text(json.dumps(strategy), encoding="utf-8")
+            attempt = task / "attempts" / "A001"
+
+            prompt = render_worker_prompt(
+                worktree_path="/tmp/worktree",
+                task_dir=task,
+                status_path=task / "STATUS.json",
+                attempt_dir=attempt,
+                worker_backend="claude-code",
+                phase="execution",
+                strategy_path=str(strategy_path),
+            )
+
+            self.assertIn("## Approved Strategy (embedded, exact)", prompt)
+            self.assertIn('carried_forward_workflows = ["WF-reused"]', prompt)
+            self.assertIn(
+                'remaining_workflows = ["WF-revalidate", "WF-new"]', prompt
+            )
+            self.assertIn(
+                f"workflow start --attempt-dir {attempt} --workflow-id WF-revalidate --instance-id WF-revalidate-I001",
+                prompt,
+            )
+            self.assertIn(
+                f"workflow complete --attempt-dir {attempt} --workflow-id WF-new --instance-id WF-new-I001",
+                prompt,
+            )
+            self.assertNotIn("--workflow-id WF-reused --instance-id", prompt)
+            self.assertIn("Do not read", prompt)
+            self.assertIn("RESUME_CONTEXT.json", prompt)
+            self.assertIn("Do not run the same acceptance argv", prompt)
+
     def test_prompt_embeds_digest_bound_changes_requested_feedback(self):
         with tempfile.TemporaryDirectory() as temporary:
             task = Path(temporary)

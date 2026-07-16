@@ -11,7 +11,8 @@ cat > "${worker}" <<'SH'
 set -euo pipefail
 prompt="$(mktemp)"
 cat > "${prompt}"
-STATUS_PATH="$(awk -F': ' '/^- STATUS_PATH:/ {print $2}' "${prompt}")"
+TASK_DIR="$(awk -F': ' '/^- TASK_DIR:/ {print $2}' "${prompt}")"
+STATUS_PATH="${TASK_DIR}/STATUS.json"
 ATTEMPT_DIR="$(awk -F': ' '/^- ATTEMPT_DIR:/ {print $2}' "${prompt}")"
 python3 "${RDO_ROOT}/scripts/rdo.py" check \
   --attempt-dir "${ATTEMPT_DIR}" \

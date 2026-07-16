@@ -85,6 +85,82 @@ def render_strategy_template(task_dir: Path, worker_backend: str) -> str:
     return json.dumps(template, ensure_ascii=True, indent=2)
 
 
+def load_prompt_strategy(strategy_path: str) -> dict[str, object] | None:
+    """Load the exact approved strategy when rendering a Full execution prompt."""
+    if not strategy_path:
+        return None
+    path = Path(strategy_path)
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else None
+
+
+def render_full_execution_protocol(
+    *, attempt_dir: Path, strategy_path: str, strategy: dict[str, object] | None
+) -> tuple[list[str], str]:
+    """Render an input-complete Full execution protocol without external reads."""
+    rdo = Path(__file__).resolve().parent / "rdo.py"
+    if strategy is None:
+        return (
+            [
+                f"- Execute only the approved strategy at: {strategy_path}",
+                f"- Use python3 {rdo} workflow start|heartbeat|complete with --attempt-dir, --workflow-id, and --instance-id.",
+            ],
+            "",
+        )
+
+    workflows = [
+        item for item in strategy.get("workflows", [])
+        if isinstance(item, dict) and isinstance(item.get("workflow_id"), str)
+    ]
+    carried_forward = sorted(
+        str(item["workflow_id"])
+        for item in workflows
+        if isinstance(item.get("resume"), dict)
+        and item["resume"].get("mode") == "reuse"
+    )
+    carried_set = set(carried_forward)
+    remaining = [
+        str(item["workflow_id"])
+        for item in workflows
+        if item["workflow_id"] not in carried_set
+    ]
+    lines = [
+        f"- The exact approved strategy is embedded below. Do not read {strategy_path} separately.",
+        "- Dispatch validates resume checkpoints before worker launch. The worker-facing resume summary is complete:",
+        f"  - carried_forward_workflows = {json.dumps(carried_forward)}",
+        f"  - remaining_workflows = {json.dumps(remaining)}",
+        f"- Do not read {attempt_dir / 'runtime' / 'RESUME_CONTEXT.json'}; it is a dispatcher audit artifact, not an additional input.",
+        "- Execute only remaining_workflows. Do not rerun carried_forward_workflows.",
+        "- The workflow command forms below are complete; do not call workflow --help.",
+    ]
+    for item in workflows:
+        workflow_id = str(item["workflow_id"])
+        if workflow_id in carried_set:
+            continue
+        instance_id = f"{workflow_id}-I001"
+        lines.extend([
+            f"- {workflow_id} instance {instance_id}:",
+            f"  - start: python3 {rdo} workflow start --attempt-dir {attempt_dir} --workflow-id {workflow_id} --instance-id {instance_id}",
+            f"  - complete: python3 {rdo} workflow complete --attempt-dir {attempt_dir} --workflow-id {workflow_id} --instance-id {instance_id}",
+        ])
+    lines.extend([
+        "- workflow heartbeat is optional. Use the same workflow/instance arguments only for genuinely long-running work; omit it for short workflows.",
+        f"- Use python3 {rdo} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> -- <command> only for non-acceptance workflow commands.",
+        f"- Run each required acceptance command exactly once through: python3 {rdo} check --attempt-dir {attempt_dir} --check-id <id> [--workflow-id <id> --instance-id <id>]. Do not run the same acceptance argv earlier through rdo exec.",
+        "- If workflow completion reports a missing acceptance record, run the missing rdo check with the same active instance, then retry complete; do not start a new instance.",
+    ])
+    block = "\n".join([
+        "## Approved Strategy (embedded, exact)",
+        "",
+        "```json",
+        json.dumps(strategy, ensure_ascii=True, indent=2),
+        "```",
+    ])
+    return lines, block
+
+
 def render_worker_prompt(
     *,
     worktree_path: str,
@@ -101,6 +177,8 @@ def render_worker_prompt(
     artifact_v2 = status.get("artifact_protocol_version") == 2
     read_policy_path = attempt_dir / "runtime" / "READ_POLICY.json"
     context_broker = Path(__file__).resolve().parent / "context_broker.py"
+    prompt_strategy = load_prompt_strategy(strategy_path)
+    strategy_block = ""
     coordinator_feedback = ""
     strategy_feedback = ""
     review_pointer = task_dir / "reviews" / "CURRENT_TASK_REVIEW.json"
@@ -173,6 +251,7 @@ def render_worker_prompt(
             "",
             "- Inspect the task and worktree read-only. Do not edit, commit, or run implementation workflows.",
             "- Design all anticipated workflows, subagents, permissions, dependencies, budgets, and completion gates.",
+            "- Assign each required acceptance command to one workflow and run it once through rdo check; do not duplicate the same acceptance argv through rdo exec.",
             "- On revision > 1, explicitly preserve compatible prior work with workflow.resume = {from_attempt, from_workflow, mode}; use mode=reuse only when no rerun is needed and mode=revalidate when outputs remain useful but checks must run again.",
             f"- Set strategy.backend_id to {worker_backend!r}; an approved strategy cannot execute through another backend.",
             f"- Write the strategy JSON outside the worktree, then run: python3 {Path(__file__).resolve().parent / 'rdo.py'} strategy {strategy_action} --task-dir {task_dir} --file <strategy-file>.",
@@ -198,13 +277,14 @@ def render_worker_prompt(
             "",
         ]
         if profile == "full":
+            full_protocol, strategy_block = render_full_execution_protocol(
+                attempt_dir=attempt_dir,
+                strategy_path=strategy_path,
+                strategy=prompt_strategy,
+            )
             phase_rules.extend([
-                f"- Execute only the approved strategy at: {strategy_path}",
-                f"- Read {attempt_dir / 'runtime' / 'RESUME_CONTEXT.json'} first. Do not rerun carried_forward_workflows; execute only remaining_workflows.",
-                f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} workflow start|heartbeat|complete for workflow instances.",
+                *full_protocol,
                 f"- For an independent review workflow, each declared native reviewer writes a non-empty artifact under {attempt_dir / 'runtime' / 'reviews'}; complete it with one --review-evidence REVIEWER_ID=ARTIFACT_PATH per reviewer. Reviewer IDs must match observed backend agent instances.",
-                f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> -- <command> for non-acceptance workflow commands.",
-                f"- Execute every required acceptance command exactly through: python3 {Path(__file__).resolve().parent / 'rdo.py'} check --attempt-dir {attempt_dir} --check-id <id> [--workflow-id <id> --instance-id <id>].",
                 "- Finish every implementation and remediation change before completing the last required workflow; that completion freezes the source tree for finalize-only closeout.",
                 "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 f"- After every required workflow and acceptance check completes, finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize {'--attempt-dir ' + str(attempt_dir) if artifact_v2 else '--task-dir ' + str(task_dir)} --state review --summary <summary>.",
@@ -236,13 +316,7 @@ def render_worker_prompt(
     if artifact_v2:
         protocol_paths = [
             f"- TASK_DIR: {task_dir}",
-            f"- STATUS_PATH: {status_path}",
             f"- ATTEMPT_DIR: {attempt_dir}",
-            f"- TASK_INPUTS_PATH: {attempt_dir / 'TASK_INPUTS.json'}",
-            f"- EVIDENCE_PATH: {attempt_dir / 'EVIDENCE.json'}",
-            f"- HANDOFF_JSON_PATH: {attempt_dir / 'HANDOFF.json'}",
-            f"- HANDOFF_READY_PATH: {attempt_dir / 'runtime' / 'HANDOFF_READY.json'}",
-            f"- LOGS_DIR: {attempt_dir / 'runtime'}",
         ]
         artifact_reminder = (
             "- Do not hand-edit EVIDENCE.json, HANDOFF.json, HANDOFF_READY.json, "
@@ -280,6 +354,7 @@ def render_worker_prompt(
             "",
             *protocol_paths,
             "",
+            "These paths are CLI arguments, not discovery inputs. Do not Read or inspect task/attempt protocol files.",
             "Do not create alternate STATUS/EVIDENCE/HANDOFF files inside the worktree.",
             "",
             "## Protocol Reminders",
@@ -293,9 +368,11 @@ def render_worker_prompt(
             "",
             "## Context Access",
             "",
-            "- Treat CONTEXT.md as the frozen decision capsule. Start there; do not rediscover decisions from broad repository reading.",
+            "- TASK.md, CONTEXT.md, ACCEPTANCE.md, and EXECUTION_POLICY.json are frozen and fully embedded below. Use the embedded copies; do not re-read task-dir copies or TASK_INPUTS.json.",
+            "- Treat the embedded CONTEXT.md as the decision capsule; do not rediscover its decisions from broad repository reading.",
             "- Search narrowly with the backend's native search/Glob/Grep or rg before opening files.",
             "- Do not read another task's worktree. Large Markdown outside the write scope must be read with offset/limit.",
+            "- If a native read is denied, do not bypass the policy with Bash, Python, cat, or another indirect reader. Use the embedded inputs, an allowed worktree path, or the Context Broker.",
             f"- Machine policy: {read_policy_path}",
             f"- List indexed headings: python3 {context_broker} --policy {read_policy_path} index [--source <path>]",
             f"- Search indexed sources: python3 {context_broker} --policy {read_policy_path} search --query <pattern> [--source <path>]",
@@ -303,6 +380,8 @@ def render_worker_prompt(
             "- Context Broker retrieval is deterministic and bounded. Do not launch a model or subagent merely to extract a document section.",
             "",
             *phase_rules,
+            "",
+            strategy_block,
             "",
             strategy_feedback,
             coordinator_feedback,
@@ -314,6 +393,9 @@ def render_worker_prompt(
             "",
             "## ACCEPTANCE.md",
             read_text(task_dir / "ACCEPTANCE.md") if (task_dir / "ACCEPTANCE.md").exists() else "Acceptance criteria are included in TASK.md.",
+            "",
+            "## EXECUTION_POLICY.json",
+            read_text(task_dir / "EXECUTION_POLICY.json") if (task_dir / "EXECUTION_POLICY.json").exists() else "{}",
             "",
         ]
     )

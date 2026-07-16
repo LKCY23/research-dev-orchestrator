@@ -98,9 +98,12 @@ from pathlib import Path
 prompt = sys.stdin.read()
 task = Path(re.search(r"^- TASK_DIR: (.+)$", prompt, re.M).group(1))
 attempt = Path(re.search(r"^- ATTEMPT_DIR: (.+)$", prompt, re.M).group(1))
-context = json.loads((attempt / "runtime" / "RESUME_CONTEXT.json").read_text())
-assert context["carried_forward_workflows"] == ["WF-implementation"], context
-assert context["remaining_workflows"] == ["WF-acceptance"], context
+carried = json.loads(re.search(r"carried_forward_workflows = (.+)$", prompt, re.M).group(1))
+remaining = json.loads(re.search(r"remaining_workflows = (.+)$", prompt, re.M).group(1))
+assert carried == ["WF-implementation"], carried
+assert remaining == ["WF-acceptance"], remaining
+assert "## Approved Strategy (embedded, exact)" in prompt
+assert "Do not read" in prompt and "RESUME_CONTEXT.json" in prompt
 rdo = [sys.executable, "${RDO_ROOT}/scripts/rdo.py"]
 duplicate = subprocess.run(rdo + ["workflow", "start", "--attempt-dir", str(attempt), "--workflow-id", "WF-implementation", "--instance-id", "duplicate"], capture_output=True, text=True)
 assert duplicate.returncode != 0 and "already satisfied" in duplicate.stderr, duplicate
@@ -122,6 +125,9 @@ assert status["state"] == "review", status
 attempt = task / "attempts" / status["current_attempt_id"]
 metadata = json.loads((attempt / "ATTEMPT.json").read_text())
 assert metadata["execution_mode"] == "replace", metadata
+context = json.loads((attempt / "runtime" / "RESUME_CONTEXT.json").read_text())
+assert context["carried_forward_workflows"] == ["WF-implementation"], context
+assert context["remaining_workflows"] == ["WF-acceptance"], context
 records = [json.loads(line) for line in (attempt / "runtime" / "WORKFLOWS.ndjson").read_text().splitlines()]
 assert [item["event"] for item in records] == ["workflow_carried_forward", "workflow_started", "workflow_completed"], records
 ready = json.loads((attempt / "runtime" / "HANDOFF_READY.json").read_text())
