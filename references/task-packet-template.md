@@ -4,6 +4,29 @@ Artifact Protocol v2 gives each task-root input one responsibility. All four
 files are required and dispatch validates them before allocating an attempt,
 acquiring locks, creating a worktree, or mutating task execution state.
 
+## Authoring gate
+
+Select the task profile explicitly only after checking the task-size rules in
+[execution-profiles.md](execution-profiles.md). A dispatchable task should name
+one primary trust boundary, one independently acceptable outcome, and a
+cohesive deliverable group. Split the task when parts can independently pass,
+fail, ship, roll back, or require different permission/platform mechanisms.
+
+Use the canonical sections to make that boundary visible:
+
+- `Objective`: state the one independently acceptable outcome.
+- `Deliverables`: include only outputs needed to establish that outcome.
+- `Invariants`: state the trust property and compatibility conditions that must
+  remain true.
+- `Non-goals`: name adjacent trust boundaries intentionally assigned to other
+  tasks.
+- `ACCEPTANCE.md`: contain one cohesive acceptance group for the task boundary,
+  even when it has several commands.
+
+Task size, risk, and review needs require coordinator judgment. Do not implement
+keyword, file-count, path-count, or duration heuristics that infer a profile or
+silently convert a task to Full.
+
 ## Canonical inputs
 
 - `TASK.md` contains exactly Objective, Deliverables, Invariants, Non-goals,
@@ -15,8 +38,9 @@ acquiring locks, creating a worktree, or mutating task execution state.
 - `ACCEPTANCE.md` contains one `json rdo-acceptance-contract` block with exact
   required commands, required outputs, and pre/post-merge commands. Its prose
   sections carry behavioral and coordinator judgment.
-- `EXECUTION_POLICY.json` owns profile-independent limits and the explicit
-  `allowed_paths`, `read_paths`, `forbidden_paths`, and `context_sources`.
+- `EXECUTION_POLICY.json` owns execution limits, the explicit `allowed_paths`,
+  `read_paths`, `forbidden_paths`, and `context_sources`, plus the deterministic
+  `strategy_required == (profile == full)` binding.
 
 `STATUS.json` owns task state, profile, branch, worktree, and current attempt.
 Those controls do not belong in `TASK.md`.

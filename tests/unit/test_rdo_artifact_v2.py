@@ -750,6 +750,37 @@ No additional background is needed.
         )
         self.assertEqual(["result.txt"], rdo._snapshot_changed_paths(before, after))
 
+    def test_non_full_task_cannot_create_or_review_strategy_artifacts(self) -> None:
+        from tests.unit.test_strategy import strategy_payload
+
+        fixture = self.make_fixture(profile="delegated")
+        candidate = fixture.attempt / "strategy.json"
+        self.write_json(candidate, strategy_payload(self.task_id))
+        with self.assertRaisesRegex(SystemExit, "requires profile='full'"):
+            rdo.strategy_submit(
+                argparse.Namespace(
+                    task_dir=str(fixture.task),
+                    file=str(candidate),
+                    strategy_action="submit",
+                )
+            )
+        self.assertFalse(fixture.task.joinpath("strategy", "STRATEGY-v001.json").exists())
+
+        status = json.loads((fixture.task / "STATUS.json").read_text(encoding="utf-8"))
+        status["state"] = "strategy_review"
+        self.write_json(fixture.task / "STATUS.json", status)
+        shutil.rmtree(fixture.task / ".dispatch-lock")
+        with self.assertRaisesRegex(SystemExit, "requires profile='full'"):
+            rdo.strategy_review(
+                argparse.Namespace(
+                    task_dir=str(fixture.task),
+                    revision=1,
+                    strategy_action="approve",
+                    reviewer="coordinator",
+                    note=[],
+                )
+            )
+
     def test_full_execution_attempt_can_pause_for_strategy_revision(self) -> None:
         from tests.unit.test_strategy import strategy_payload
 

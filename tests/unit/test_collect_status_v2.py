@@ -38,7 +38,20 @@ class CollectStatusV2Tests(unittest.TestCase):
                 "target_branch": "main",
             },
         )
-        (run / "EVENTS.ndjson").write_text("", encoding="utf-8")
+        (run / "EVENTS.ndjson").write_text(
+            json.dumps(
+                {
+                    "at": "2026-07-15T00:00:00Z",
+                    "actor": "coordinator",
+                    "event": "task_created",
+                    "run_id": "run",
+                    "task_id": "T001",
+                    "profile": "direct",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         (run / "JOURNAL.md").write_text("# Journal\n", encoding="utf-8")
         self.write_json(
             task / "STATUS.json",
@@ -276,6 +289,44 @@ class CollectStatusV2Tests(unittest.TestCase):
             self.assertTrue(artifacts["valid"])
             self.assertEqual("v2", artifacts["protocol"])
             self.assertEqual("unpublished", artifacts["publication_state"])
+
+    def test_v2_status_requires_an_explicit_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = self.make_run(root, 2)
+            status_path = run / "tasks" / "T001" / "STATUS.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status.pop("profile")
+            self.write_json(status_path, status)
+            with patch("collect_status.repo_root", return_value=root):
+                report = collect("run", 24)
+            self.assertFalse(report["valid"])
+            self.assertTrue(
+                any(
+                    "artifact-protocol-v2 STATUS requires an explicit profile" in item
+                    for item in report["protocol_violations"]
+                )
+            )
+
+    def test_v2_status_rejects_null_or_post_creation_profile_changes(self):
+        for value, expected in (
+            (None, "invalid execution profile None"),
+            ("full", "STATUS.profile 'full' does not match task_created profile 'direct'"),
+        ):
+            with self.subTest(profile=value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                run = self.make_run(root, 2)
+                status_path = run / "tasks" / "T001" / "STATUS.json"
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                status["profile"] = value
+                self.write_json(status_path, status)
+                with patch("collect_status.repo_root", return_value=root):
+                    report = collect("run", 24)
+                self.assertFalse(report["valid"])
+                self.assertTrue(
+                    any(expected in item for item in report["protocol_violations"]),
+                    report["protocol_violations"],
+                )
 
     def test_unknown_artifact_protocol_makes_report_invalid(self):
         with tempfile.TemporaryDirectory() as temporary:

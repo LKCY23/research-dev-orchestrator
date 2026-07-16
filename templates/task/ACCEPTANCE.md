@@ -23,7 +23,7 @@
 
 ## Behavioral Checks
 
-- RDO_TEMPLATE_INCOMPLETE: state behavior that a reviewer must verify.
+- RDO_TEMPLATE_INCOMPLETE: state behavior that proves this task's one primary trust boundary; split unrelated acceptance groups into separate tasks.
 
 ## Merge Preconditions
 
@@ -31,7 +31,7 @@
 
 ## Blocked Conditions
 
-- RDO_TEMPLATE_INCOMPLETE: state when the worker must request `blocked`.
+- RDO_TEMPLATE_INCOMPLETE: state when the worker must request `blocked`, including discovery of another independently acceptable trust boundary.
 
 ## Pre-Merge Checks
 

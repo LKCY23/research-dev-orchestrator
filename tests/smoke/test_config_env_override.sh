@@ -25,6 +25,7 @@ python3 "${RDO_ROOT}/scripts/create_task.py" \
   --run-id smoke-run \
   --task-id T001-env \
   --goal env \
+  --profile direct \
   --allowed-paths file.txt >/dev/null
 
 RDO_RUNTIME_BACKEND=tmux python3 "${RDO_ROOT}/scripts/config_cli.py" export-env > "${repo}/env.out"

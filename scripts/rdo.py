@@ -108,6 +108,12 @@ def task_protocol(path: Path, status: dict[str, Any] | None = None) -> int:
     return version
 
 
+def _strategy_profile_is_full(protocol_version: int, profile: Any) -> bool:
+    """Preserve the legacy missing-profile Full default while v2 fails closed."""
+
+    return profile == "full" or (protocol_version == 1 and profile is None)
+
+
 def _read_text_file(path: Path, *, label: str) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -629,6 +635,10 @@ def approval_git_binding(path: Path, status: dict[str, Any]) -> dict[str, Any]:
 def strategy_submit(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
     status = load_json(path / "STATUS.json")
+    protocol_version = task_protocol(path, status)
+    profile = status.get("profile")
+    if not _strategy_profile_is_full(protocol_version, profile):
+        raise SystemExit("strategy submission requires profile='full'")
     if status.get("state") not in {"planning", "running"}:
         raise SystemExit("strategy submission requires planning or running state")
     attempt_id = status.get("current_attempt_id")
@@ -643,7 +653,6 @@ def strategy_submit(args: argparse.Namespace) -> int:
         not isinstance(payload.get("revision"), int) or payload["revision"] <= 1
     ):
         raise SystemExit("strategy revise requires revision > 1")
-    protocol_version = task_protocol(path, status)
     existing_output = path / "strategy" / f"STRATEGY-v{int(payload.get('revision', 0)):03d}.json"
     if protocol_version == ARTIFACT_PROTOCOL_VERSION and existing_output.is_file():
         existing_payload = load_json(existing_output)
@@ -772,14 +781,18 @@ def strategy_submit(args: argparse.Namespace) -> int:
 
 def strategy_review(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
+    status = load_json(path / "STATUS.json")
+    protocol_version = task_protocol(path, status)
+    profile = status.get("profile")
+    if not _strategy_profile_is_full(protocol_version, profile):
+        raise SystemExit("strategy review requires profile='full'")
     if (path / ".dispatch-lock").exists():
         raise SystemExit("strategy review is forbidden while a dispatch lock exists")
-    if load_json(path / "STATUS.json").get("state") != "strategy_review":
+    if status.get("state") != "strategy_review":
         raise SystemExit("strategy review requires strategy_review state")
     submitted = load_json(path / "strategy" / f"STRATEGY-v{args.revision:03d}.json")
     digest = canonical_digest(submitted)
-    status = load_json(path / "STATUS.json")
-    if task_protocol(path, status) == ARTIFACT_PROTOCOL_VERSION:
+    if protocol_version == ARTIFACT_PROTOCOL_VERSION:
         attempt_id = status.get("current_attempt_id")
         if not isinstance(attempt_id, str) or not attempt_id:
             raise SystemExit("v2 strategy review requires a current attempt")

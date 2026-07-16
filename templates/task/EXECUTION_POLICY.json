@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "strategy_required": true,
+  "strategy_required": "RDO_TEMPLATE_INCOMPLETE: set true only for an explicitly selected full profile; otherwise false",
   "attempt_wall_seconds": 2700,
   "max_workflows": 6,
   "max_workflow_instances": 12,

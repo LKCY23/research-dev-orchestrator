@@ -24,6 +24,9 @@ an append; its existence does not mean a dispatch or worker is active.
 ```
 
 Task events should include `task_id`. Attempt events should include `attempt_id`.
+Artifact Protocol v2 `task_created` events must also include the explicitly
+selected `profile`. Readiness and status audit require exactly one such event
+per task and bind `STATUS.profile` to it.
 
 ## Core Event Types
 

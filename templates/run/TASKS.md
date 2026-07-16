@@ -1,4 +1,4 @@
 # Tasks
 
-| Task | Goal | State | Dependencies | Notes |
-|---|---|---|---|---|
+| Task | Goal | Profile | Primary trust boundary | Independent acceptance group | State | Dependencies | Notes |
+|---|---|---|---|---|---|---|---|

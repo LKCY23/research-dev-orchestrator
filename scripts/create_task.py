@@ -23,7 +23,10 @@ from protocol import (
 from strategy import DEFAULT_EXECUTION_POLICY
 
 
-TASK_OBJECTIVE_PLACEHOLDER = "RDO_TEMPLATE_INCOMPLETE: state the single outcome this task must achieve."
+TASK_OBJECTIVE_PLACEHOLDER = (
+    "RDO_TEMPLATE_INCOMPLETE: state one independently acceptable outcome "
+    "for one primary trust boundary."
+)
 TASK_DEPENDENCIES_BLOCK = re.compile(
     r"```json rdo-task-dependencies\n.*?\n```",
     re.DOTALL,
@@ -91,7 +94,7 @@ def main() -> int:
     parser.add_argument(
         "--profile",
         choices=sorted(EXECUTION_PROFILES),
-        default="full",
+        required=True,
         help="direct=self-reviewed worker; delegated=coordinator code review; full=strategy-gated workflow",
     )
     parser.add_argument("--branch", default="")

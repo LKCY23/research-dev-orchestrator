@@ -5,10 +5,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rdo import handoff
+from rdo import _strategy_profile_is_full, handoff
 
 
 class LegacyFinalizeTests(unittest.TestCase):
+    def test_missing_profile_remains_full_only_for_legacy_strategy_commands(self) -> None:
+        self.assertTrue(_strategy_profile_is_full(1, None))
+        self.assertTrue(_strategy_profile_is_full(1, "full"))
+        self.assertFalse(_strategy_profile_is_full(1, "delegated"))
+        self.assertFalse(_strategy_profile_is_full(2, None))
+        self.assertTrue(_strategy_profile_is_full(2, "full"))
+
     def test_delegated_review_freezes_source_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

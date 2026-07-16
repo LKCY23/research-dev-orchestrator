@@ -50,6 +50,7 @@ python3 "${RDO_ROOT}/scripts/create_task.py" \
   --run-id smoke-run \
   --task-id T002-attempt \
   --goal attempt-type-guard \
+  --profile full \
   --allowed-paths file.txt >/dev/null
 task_dir="${repo}/.agent-collab/runs/smoke-run/tasks/T002-attempt"
 attempt_id="A001-claude-test"

@@ -37,6 +37,7 @@ from validation import (
     validate_attempt_schema,
     validate_event,
     validate_state_history,
+    validate_task_profile_binding,
     validate_status_schema,
 )
 
@@ -772,6 +773,9 @@ def collect(
         )
         violations.extend(status_violations)
         warnings.extend(status_warnings)
+        violations.extend(
+            validate_task_profile_binding(status, events, task_dir.name)
+        )
         violations.extend(validate_approved_task(task_dir, status))
         merge_violations, merge_warnings = validate_merged_task(
             root, task_dir, status, run_json, events

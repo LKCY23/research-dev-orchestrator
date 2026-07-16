@@ -58,6 +58,12 @@ V2 requires `artifact_protocol_version = 2`. Always include `task_id`,
 `state_history`. For `pending`, `previous_state`, `current_attempt_id`, and
 `assigned_worker` may be `null`.
 
+Artifact Protocol v2 never treats a missing `profile` as Full. The profile must
+be one explicit value from `direct|delegated|full`; only a recognized legacy
+decoder may apply its historical Full fallback. Readiness and status audit bind
+the value to the task's unique `task_created` event, so changing
+`STATUS.profile` requires a revision task rather than an in-place edit.
+
 The `evidence` object remains in the shared status shape for compatibility and
 compact display. It is not a v2 evidence index and cannot satisfy a gate. V2
 consumers resolve the current attempt and validate its exact

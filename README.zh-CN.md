@@ -135,7 +135,8 @@ flowchart TB
 
 ## Workflow
 
-预期流程是顺序的，但可以随时 resume：
+Coordinator 应先把工作拆到一个主要 trust boundary，再显式选择一种
+execution profile：
 
 ```text
 Direct:    worker 实现 -> 测试 -> 自审并修复 -> verified -> merge gate
@@ -144,6 +145,11 @@ Full:      strategy planning -> coordinator strategy review -> execution -> coor
 ```
 
 三个 profile 都保留 Git 隔离、有界 attempt supervision、evidence 和 handoff 校验。详见 [execution profiles](references/execution-profiles.md)。
+
+局部、低风险且 worker 自审足够时使用 Direct；实现范围明确但需要
+coordinator 独立判断时使用 Delegated；高风险、实质性跨模块或明确需要
+策略 gate 的任务使用 Full，且 Full 会增加 implementation 前的策略审批。
+文件数量、预计耗时或笼统的“复杂”不会自动选择 Full。
 
 合并通过 coordinator-only 的 `rdo task merge` 公开命令完成。Task approval
 会绑定被 review 的精确 commit；merge 要求 worktree 干净、只允许 fast-forward、
@@ -409,8 +415,13 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" \
   --run-id <run-id> \
   --task-id T001-data-loader \
   --goal "Implement the dataset loader and smoke tests" \
+  --profile delegated \
   --allowed-paths src tests
 ```
+
+`create_task.py` 要求显式传入 `--profile`，不会默认或自动推断 Full。
+创建后仍需补全 `TASK.md`、`CONTEXT.md` 和 `ACCEPTANCE.md` 中的语义内容与
+可执行验收命令，之后才能 dispatch。
 
 派发 worker：
 

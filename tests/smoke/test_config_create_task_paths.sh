@@ -20,6 +20,7 @@ python3 "${RDO_ROOT}/scripts/create_task.py" \
   --run-id smoke-run \
   --task-id T001-paths \
   --goal paths \
+  --profile direct \
   --allowed-paths file.txt >/dev/null
 
 python3 - <<'PY'

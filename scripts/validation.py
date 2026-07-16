@@ -108,8 +108,15 @@ def validate_status_schema(status: Any, fsm: dict[str, Any], task_name: str) -> 
     if state not in states:
         violations.append(f"{task_name}: invalid state {state!r}")
 
-    profile = status.get("profile", "full")
-    if profile not in EXECUTION_PROFILES:
+    artifact_v2 = status.get("artifact_protocol_version") == 2
+    if artifact_v2 and "profile" not in status:
+        violations.append(
+            f"{task_name}: artifact-protocol-v2 STATUS requires an explicit profile"
+        )
+    profile = status.get("profile")
+    if profile is None and not artifact_v2:
+        profile = "full"
+    if (artifact_v2 or profile is not None) and profile not in EXECUTION_PROFILES:
         violations.append(f"{task_name}: invalid execution profile {profile!r}")
 
     if state == "blocked":
@@ -132,6 +139,40 @@ def validate_status_schema(status: Any, fsm: dict[str, Any], task_name: str) -> 
         violations.append(f"{task_name}: {state} task is missing current_attempt_id")
 
     return violations
+
+
+def validate_task_profile_binding(
+    status: Any,
+    events: list[dict[str, Any]],
+    task_name: str,
+) -> list[str]:
+    """Bind a v2 task's mutable STATUS profile to its creation audit record."""
+
+    if not isinstance(status, dict) or status.get("artifact_protocol_version") != 2:
+        return []
+    created = [
+        item
+        for item in events
+        if isinstance(item, dict)
+        and item.get("event") == "task_created"
+        and item.get("task_id") == task_name
+    ]
+    if len(created) != 1:
+        return [
+            f"{task_name}: artifact-protocol-v2 task requires exactly one task_created event"
+        ]
+    frozen_profile = created[0].get("profile")
+    if frozen_profile not in EXECUTION_PROFILES:
+        return [
+            f"{task_name}: task_created event has invalid execution profile {frozen_profile!r}"
+        ]
+    declared_profile = status.get("profile")
+    if declared_profile != frozen_profile:
+        return [
+            f"{task_name}: STATUS.profile {declared_profile!r} does not match "
+            f"task_created profile {frozen_profile!r}"
+        ]
+    return []
 
 
 def validate_state_history(status: Any, fsm: dict[str, Any], task_name: str) -> list[str]:

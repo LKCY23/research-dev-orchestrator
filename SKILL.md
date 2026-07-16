@@ -31,6 +31,7 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 - `.agent-collab/rdo.toml` and `scripts/config.py` own operational defaults only. They must not configure protocol states, schema fields, events, blocker types, or protocol version.
 - Worker runtime backend is an execution detail. Default to `plain`; use `tmux` only when the user wants attachable long-running worker observation. Backend choice must not change protocol truth sources.
 - Use a read-only planning attempt and coordinator-reviewed immutable strategy revision for Full tasks. Direct and Delegated tasks intentionally skip this ceremony.
+- Select every task profile explicitly after decomposing the work to one primary trust boundary and one independently acceptable outcome. Full is never inferred from vague complexity, file count, or estimated duration.
 - Full strategy revisions must explicitly preserve compatible prior work with workflow `resume` declarations. Dispatch validates the referenced terminal attempt, completed source workflow, and exact worktree digest before carrying a checkpoint forward.
 - Optional Full resource budgets are hard only when the selected backend/I/O adapter exposes the metric; unobservable configurations fail before dispatch. Independent review requires observed reviewer agents and attempt-local review artifacts, never primary-worker self-attestation.
 - Treat backend-native tool timeouts as advisory. Attempt-local deterministic supervision owns the final process-group deadline and cleanup boundary.
@@ -39,7 +40,17 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
 
 ## Profile Routing and Stage Entry
 
-Choose the lightest execution profile whose verification boundary matches the task: Direct for small low-risk changes, Delegated for moderate single-worker changes needing independent review, and Full for ambiguous, experimental, multi-workflow, permission-sensitive, or high-risk work. Read `references/execution-profiles.md` before routing or changing task execution semantics.
+Before routing, split work that contains independently acceptable outcomes or
+multiple primary trust boundaries. Then choose the lightest profile whose
+verification boundary matches the resulting task: Direct for local low-risk
+changes with worker-owned implementation review, Delegated for bounded work
+needing independent coordinator judgment, and Full for high-risk, materially
+cross-module, experimental, multi-workflow, permission-model, hard-budget, or
+otherwise strategy-gated work. Full always adds explicit pre-implementation
+strategy approval and must be selected literally; never infer it from vague
+complexity, file count, or estimated duration. Read
+`references/execution-profiles.md` before routing or changing task execution
+semantics.
 
 On every activation or resumption, perform a read-only phase audit before substantive work or protocol state mutation:
 
@@ -72,9 +83,11 @@ Synchronize approved decisions to canonical artifacts before continuing:
 
 If no Git repository exists, remain in pre-run planning: canonical planning artifacts may be created or normalized, but do not initialize RDO runs, create worktrees, dispatch workers, or claim execution readiness.
 
-## Full Workflow
+## End-to-End Workflow
 
-This is the canonical default progression. A stage-aware entry may begin later only after the phase audit above confirms or normalizes its prerequisites.
+This is the canonical end-to-end progression across profiles. A stage-aware
+entry may begin later only after the phase audit above confirms or normalizes
+its prerequisites.
 
 1. Clarify requirements with the user and create/update `REQUIREMENTS.md`.
 2. Before design, select the design method and architecture style in `DESIGN_METHOD_SELECTION.md`.
@@ -133,7 +146,7 @@ Run scripts from the target repository root, but call the scripts by absolute pa
 ```bash
 export RESEARCH_DEV_ORCHESTRATOR_HOME=/absolute/path/to/research-dev-orchestrator
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/init_run.py" --project-slug <slug> --objective "<objective>" --target-branch <branch>
-python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" --run-id <run-id> --task-id T001-name --goal "<goal>" --allowed-paths path1 path2
+python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" --run-id <run-id> --task-id T001-name --goal "<goal>" --profile delegated --allowed-paths path1 path2
 "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_agent.sh" <run-id> <task-id>
 RDO_WORKER_BACKEND=opencode RDO_RUNTIME_BACKEND=tmux "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/dispatch_agent.sh" <run-id> <task-id>
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/collect_status.py" --run-id <run-id>
@@ -154,7 +167,7 @@ Users may invoke the skill explicitly with `$research-dev-orchestrator` or selec
 ```text
 $research-dev-orchestrator init project=<slug> objective="<text>" [target=<branch>]
 $research-dev-orchestrator plan run=<run-id> [scope=requirements|design|experiment|all]
-$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>] [profile=direct|delegated|full]
+$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> profile=direct|delegated|full [forbidden=<path,path>]
 $research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
 $research-dev-orchestrator status run=<run-id> [json] [summary] [dashboard] [diagnostics]
 $research-dev-orchestrator review run=<run-id> task=<task-id>
@@ -167,10 +180,11 @@ Read `references/command-surface.md` before acting on these intents. `review` do
 
 `init_run.py` scaffolds only. It must not make substantive research, design, or architecture decisions.
 
-`create_task.py` creates `pending` v2 task scaffolds only. It must not overwrite
-existing tasks, dispatch, create locks, or merge. The coordinator must complete
-the required task/context/acceptance contract before readiness permits
-dispatch.
+`create_task.py` creates `pending` v2 task scaffolds only and requires an
+explicit profile. It must not infer Full, overwrite existing tasks, dispatch,
+create locks, or merge. The coordinator must first split the work to one
+primary trust boundary, then complete the required task/context/acceptance
+contract before readiness permits dispatch.
 
 `protocol.py` is used by scripts for constants, template rendering, JSON helpers, and event append. Users should not call it directly.
 

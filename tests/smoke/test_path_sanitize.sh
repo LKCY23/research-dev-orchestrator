@@ -13,7 +13,7 @@ worker="$(mktemp /tmp/rdo-worker-review.XXXXXX)"
 make_review_worker "${worker}"
 
 python3 "${RDO_ROOT}/scripts/init_run.py" --run-id "smoke:run" --project-slug smoke --objective smoke --target-branch main >/dev/null
-python3 "${RDO_ROOT}/scripts/create_task.py" --run-id "smoke:run" --task-id T001-colon --goal colon --allowed-paths file.txt >/dev/null
+python3 "${RDO_ROOT}/scripts/create_task.py" --run-id "smoke:run" --task-id T001-colon --goal colon --profile full --allowed-paths file.txt >/dev/null
 complete_task_contract "smoke:run" T001-colon colon
 seed_approved_strategy "smoke:run" T001-colon
 RDO_WORKER_BACKEND=tmux RDO_IO_MODE=human RDO_TMUX_SESSION_PREFIX="rdo:bad" CLAUDE_CODE_CMD="${worker}" \

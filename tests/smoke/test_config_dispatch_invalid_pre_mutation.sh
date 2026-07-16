@@ -44,6 +44,7 @@ python3 "${RDO_ROOT}/scripts/create_task.py" \
   --run-id smoke-run-bool \
   --task-id T001-invalid-bool \
   --goal invalid-bool \
+  --profile full \
   --allowed-paths file.txt >/dev/null
 complete_task_contract smoke-run-bool T001-invalid-bool invalid-bool
 

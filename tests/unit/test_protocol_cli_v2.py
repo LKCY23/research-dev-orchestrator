@@ -178,7 +178,20 @@ class ProtocolCliV2Tests(unittest.TestCase):
                 "base_commit": self.base,
             },
         )
-        (self.run_dir / "EVENTS.ndjson").write_text("", encoding="utf-8")
+        (self.run_dir / "EVENTS.ndjson").write_text(
+            json.dumps(
+                {
+                    "at": "2026-07-15T00:00:00Z",
+                    "actor": "coordinator",
+                    "event": "task_created",
+                    "run_id": "R001",
+                    "task_id": "T001",
+                    "profile": "direct",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         self.status = {
             "task_id": "T001",
             "artifact_protocol_version": 2,
@@ -214,6 +227,36 @@ class ProtocolCliV2Tests(unittest.TestCase):
         (self.task_dir / "CONTEXT.md").write_text(CONTEXT, encoding="utf-8")
         (self.task_dir / "ACCEPTANCE.md").write_text(ACCEPTANCE, encoding="utf-8")
         self.write_json(self.task_dir / "EXECUTION_POLICY.json", POLICY)
+
+    def append_event(self, payload: dict[str, object]) -> None:
+        record = {
+            "at": "2026-07-15T00:00:00Z",
+            "actor": "coordinator",
+            "run_id": "R001",
+            **payload,
+        }
+        with (self.run_dir / "EVENTS.ndjson").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def set_task_profile(self, profile: str) -> None:
+        status = json.loads((self.task_dir / "STATUS.json").read_text(encoding="utf-8"))
+        status["profile"] = profile
+        self.write_json(self.task_dir / "STATUS.json", status)
+        policy = dict(POLICY)
+        policy["strategy_required"] = profile == "full"
+        self.write_json(self.task_dir / "EXECUTION_POLICY.json", policy)
+        events = [
+            json.loads(line)
+            for line in (self.run_dir / "EVENTS.ndjson").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for event in events:
+            if event.get("event") == "task_created" and event.get("task_id") == "T001":
+                event["profile"] = profile
+        (self.run_dir / "EVENTS.ndjson").write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
 
     def cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return run(
@@ -353,6 +396,62 @@ class ProtocolCliV2Tests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("unknown artifact protocol version", result.stderr)
 
+    def test_readiness_requires_the_explicit_status_profile_before_mutation(self) -> None:
+        mismatch = self.cli(
+            "check-task-readiness",
+            "--task-dir",
+            str(self.task_dir),
+            "--run-dir",
+            str(self.run_dir),
+            "--task-id",
+            "T001",
+            "--profile",
+            "delegated",
+            check=False,
+        )
+        self.assertNotEqual(0, mismatch.returncode)
+        self.assertIn("does not match explicit STATUS.profile 'direct'", mismatch.stderr)
+        self.assertEqual([], list((self.task_dir / "attempts").iterdir()))
+
+        status = json.loads((self.task_dir / "STATUS.json").read_text(encoding="utf-8"))
+        status["profile"] = "full"
+        self.write_json(self.task_dir / "STATUS.json", status)
+        policy = dict(POLICY)
+        policy["strategy_required"] = True
+        self.write_json(self.task_dir / "EXECUTION_POLICY.json", policy)
+        dispatch = subprocess.run(
+            [
+                str(SCRIPTS / "dispatch_agent.sh"),
+                "R001",
+                "T001",
+                "--worker",
+                "claude-code",
+                "--runtime",
+                "plain",
+                "--io",
+                "machine",
+                "--command",
+                "true",
+            ],
+            cwd=self.root,
+            env={
+                **os.environ,
+                "DISPATCH_DRY_RUN": "1",
+                "RDO_TEST_ALLOW_UNGOVERNED_COMMAND_OVERRIDE": "1",
+            },
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(0, dispatch.returncode)
+        self.assertIn(
+            "STATUS.profile 'full' does not match task_created profile 'direct'",
+            dispatch.stderr,
+        )
+        self.assertEqual([], list((self.task_dir / "attempts").iterdir()))
+        self.assertFalse((self.task_dir / ".dispatch-lock").exists())
+
     def test_freeze_and_attempt_bind_exact_task_inputs(self) -> None:
         result = self.freeze("A001")
         frozen = json.loads(result.stdout)
@@ -415,12 +514,9 @@ class ProtocolCliV2Tests(unittest.TestCase):
     def test_full_dispatch_rejects_worker_replacement_of_frozen_approved_strategy(self) -> None:
         from tests.unit.test_strategy import strategy_payload
 
-        policy = dict(POLICY)
-        policy["strategy_required"] = True
-        self.write_json(self.task_dir / "EXECUTION_POLICY.json", policy)
+        self.set_task_profile("full")
         status = json.loads((self.task_dir / "STATUS.json").read_text(encoding="utf-8"))
         status.update(
-            profile="full",
             branch="agent/T001",
             state="pending",
             previous_state=None,
@@ -586,20 +682,13 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
             dependency / "STATUS.json",
             {"task_id": "T000", "artifact_protocol_version": 2, "state": "merged"},
         )
-        (self.run_dir / "EVENTS.ndjson").write_text(
-            json.dumps(
-                {
-                    "at": "2026-07-15T00:00:00Z",
-                    "actor": "coordinator",
-                    "event": "task_merged",
-                    "run_id": "R001",
-                    "task_id": "T000",
-                    "commit": self.base,
-                    "verification": {"passed": True},
-                }
-            )
-            + "\n",
-            encoding="utf-8",
+        self.append_event(
+            {
+                "event": "task_merged",
+                "task_id": "T000",
+                "commit": self.base,
+                "verification": {"passed": True},
+            }
         )
         dependencies = json.dumps(
             {
@@ -627,17 +716,13 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
             dependency / "STATUS.json",
             {"task_id": "T000", "artifact_protocol_version": 2, "state": "merged"},
         )
-        (self.run_dir / "EVENTS.ndjson").write_text(
-            json.dumps(
-                {
-                    "event": "task_merged",
-                    "task_id": "T000",
-                    "commit": self.base,
-                    "verification": {"passed": False},
-                }
-            )
-            + "\n",
-            encoding="utf-8",
+        self.append_event(
+            {
+                "event": "task_merged",
+                "task_id": "T000",
+                "commit": self.base,
+                "verification": {"passed": False},
+            }
         )
         dependencies = json.dumps(
             {
@@ -1042,9 +1127,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
     def test_strategy_changes_requested_replay_binds_submission_and_review(self) -> None:
         from tests.unit.test_strategy import strategy_payload
 
-        policy = dict(POLICY)
-        policy["strategy_required"] = True
-        self.write_json(self.task_dir / "EXECUTION_POLICY.json", policy)
+        self.set_task_profile("full")
         frozen = self.cli(
             "freeze-task-inputs",
             "--task-dir",

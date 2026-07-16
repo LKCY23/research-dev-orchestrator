@@ -104,10 +104,16 @@ Do not invent durable design decisions without user confirmation when the choice
 ### create-task
 
 ```text
-$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> [forbidden=<path,path>] [profile=direct|delegated|full]
+$research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>" allowed=<path,path> profile=direct|delegated|full [forbidden=<path,path>]
 ```
 
-Purpose: create a task packet with an explicit execution profile. Use Direct for small low-risk work, Delegated for independent coordinator review without strategy ceremony, and Full for strategy-gated work.
+Purpose: create a task packet with an explicit execution profile. Split the
+work to one primary trust boundary before routing it. Use Direct for local
+low-risk work whose implementation review can be worker-owned, Delegated when
+independent coordinator judgment is required without strategy ceremony, and
+Full for high-risk, materially cross-module, or explicitly strategy-gated work.
+Full always adds pre-implementation strategy approval. Neither task prose nor
+apparent complexity may silently select it.
 
 Action: run `scripts/create_task.py`, then complete every required v2
 task/context/acceptance section and machine contract before dispatch. The

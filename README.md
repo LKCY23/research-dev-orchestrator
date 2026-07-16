@@ -139,7 +139,8 @@ Implementation details are intentionally secondary in the diagram:
 
 ## Workflow
 
-RDO selects one of three execution profiles:
+The coordinator explicitly selects one of three execution profiles after
+splitting the work to one primary trust boundary:
 
 ```text
 Direct:    worker implement -> test -> self-review/fix -> verified -> merge gate
@@ -148,6 +149,12 @@ Full:      strategy planning -> coordinator strategy review -> execution -> coor
 ```
 
 Every profile keeps Git isolation, bounded attempt supervision, evidence, and validated handoff. See [execution profiles](references/execution-profiles.md).
+
+Use Direct when local low-risk work can rely on worker self-review, Delegated
+when the implementation is bounded but needs independent coordinator judgment,
+and Full for high-risk, materially cross-module, or explicitly strategy-gated
+work. Full adds pre-implementation strategy approval. File count, estimated
+duration, or vague complexity never selects it automatically.
 
 Merge is exposed through the coordinator-only `rdo task merge` command. Task
 approval binds the exact reviewed commit; merge is clean, fast-forward-only,
@@ -446,12 +453,14 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/create_task.py" \
   --run-id <run-id> \
   --task-id T001-data-loader \
   --goal "Implement the dataset loader and smoke tests" \
+  --profile delegated \
   --allowed-paths src tests \
   --read-paths src tests pyproject.toml
 ```
 
 `create_task.py` scaffolds a v2 packet; it does not invent deliverables,
-invariants, interfaces, or acceptance checks. Before dispatch, complete all
+invariants, interfaces, acceptance checks, or a profile. `--profile` is
+required; Full must be selected explicitly. Before dispatch, complete all
 required sections in `TASK.md`, `CONTEXT.md`, and `ACCEPTANCE.md`, including at
 least one executable required command. Dispatch runs readiness before any
 attempt, lock, worktree, or running-state mutation and rejects an incomplete

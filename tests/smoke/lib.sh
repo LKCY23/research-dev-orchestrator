@@ -55,6 +55,7 @@ init_raw_run_and_task() {
     --run-id "${run_id}" \
     --task-id "${task_id}" \
     --goal "${goal}" \
+    --profile full \
     --allowed-paths file.txt >/dev/null
 
   complete_task_contract "${run_id}" "${task_id}" "${goal}"

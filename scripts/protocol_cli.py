@@ -52,6 +52,7 @@ from validation import (
     validate_attempt_schema,
     validate_event,
     validate_state_history,
+    validate_task_profile_binding,
     validate_worker_handoff,
 )
 
@@ -120,6 +121,28 @@ def _dependency_resolver(run_dir: Path):
 
 
 def _readiness(task_dir: Path, run_dir: Path, task_id: str, profile: str):
+    try:
+        status = load_json(task_dir / "STATUS.json")
+    except Exception as exc:
+        raise TaskContractError(f"STATUS.json is unreadable: {exc}") from exc
+    if not isinstance(status, dict):
+        raise TaskContractError("STATUS.json must contain a JSON object")
+    try:
+        events, _warning = read_event_journal(
+            run_dir,
+            tolerate_interrupted_tail=True,
+        )
+    except EventJournalError as exc:
+        raise TaskContractError(f"EVENTS.ndjson is invalid: {exc}") from exc
+    binding_errors = validate_task_profile_binding(status, events, task_id)
+    if binding_errors:
+        raise TaskContractError(binding_errors[0])
+    declared_profile = status.get("profile")
+    if declared_profile != profile:
+        raise TaskContractError(
+            "requested execution profile "
+            f"{profile!r} does not match explicit STATUS.profile {declared_profile!r}"
+        )
     return evaluate_task_readiness(
         task_dir,
         task_id=task_id,

@@ -54,7 +54,13 @@ class CreateTaskV2Tests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def create_task(self, task_id: str, *extra: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def create_task(
+        self,
+        task_id: str,
+        *extra: str,
+        profile: str = "delegated",
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 sys.executable,
@@ -65,6 +71,8 @@ class CreateTaskV2Tests(unittest.TestCase):
                 task_id,
                 "--goal",
                 "Implement the v2 artifact boundary",
+                "--profile",
+                profile,
                 "--allowed-paths",
                 "src",
                 "tests",
@@ -94,12 +102,11 @@ class CreateTaskV2Tests(unittest.TestCase):
             "--dependencies",
             "T001-base",
             "T002-data",
-            "--profile",
-            "direct",
             "--branch",
             "agent/custom-task-branch",
             "--worktree",
             "/tmp/custom-task-worktree",
+            profile="direct",
         )
         task_dir = self.task_dir("T003-work")
 
@@ -188,6 +195,70 @@ class CreateTaskV2Tests(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.task_dir(task_id).exists())
+
+    def test_profile_is_required_and_full_is_never_implicit(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CREATE_TASK),
+                "--run-id",
+                "v2-run",
+                "--task-id",
+                "T020-missing-profile",
+                "--goal",
+                "Do not infer a profile",
+                "--allowed-paths",
+                "src",
+            ],
+            cwd=self.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--profile", result.stderr)
+        self.assertFalse(self.task_dir("T020-missing-profile").exists())
+
+        self.create_task("T021-explicit-full", profile="full")
+        task_dir = self.task_dir("T021-explicit-full")
+        status = json.loads((task_dir / "STATUS.json").read_text(encoding="utf-8"))
+        policy = json.loads((task_dir / "EXECUTION_POLICY.json").read_text(encoding="utf-8"))
+        self.assertEqual("full", status["profile"])
+        self.assertTrue(policy["strategy_required"])
+
+    def test_profile_matrix_binds_status_policy_and_creation_event(self) -> None:
+        for index, (profile, strategy_required) in enumerate(
+            (("direct", False), ("delegated", False), ("full", True)),
+            start=30,
+        ):
+            task_id = f"T{index:03d}-{profile}"
+            with self.subTest(profile=profile):
+                self.create_task(task_id, profile=profile)
+                task_dir = self.task_dir(task_id)
+                status = json.loads((task_dir / "STATUS.json").read_text(encoding="utf-8"))
+                policy = json.loads(
+                    (task_dir / "EXECUTION_POLICY.json").read_text(encoding="utf-8")
+                )
+                events = [
+                    json.loads(line)
+                    for line in (
+                        self.repo
+                        / ".agent-collab"
+                        / "runs"
+                        / "v2-run"
+                        / "EVENTS.ndjson"
+                    ).read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                event = next(
+                    item
+                    for item in reversed(events)
+                    if item.get("event") == "task_created"
+                    and item.get("task_id") == task_id
+                )
+                self.assertEqual(profile, status["profile"])
+                self.assertIs(strategy_required, policy["strategy_required"])
+                self.assertEqual(profile, event["profile"])
 
 
 if __name__ == "__main__":
