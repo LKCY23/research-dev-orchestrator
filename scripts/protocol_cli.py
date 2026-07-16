@@ -46,6 +46,7 @@ from task_contract import (
     validate_task_inputs_payload,
     write_task_inputs_immutable,
 )
+from supervisor import terminate_processes
 from validation import (
     HandoffValidationResult,
     parse_exit_code,
@@ -55,6 +56,13 @@ from validation import (
     validate_task_profile_binding,
     validate_worker_handoff,
 )
+
+
+def write_attempt_state(path: Path, payload: Mapping[str, Any]) -> None:
+    write_json(path, dict(payload))
+    snapshot_path = path.parent / "runtime" / "DISPATCH_ATTEMPT.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(snapshot_path, dict(payload))
 
 
 def _task_protocol_version(task_dir: Path) -> int:
@@ -488,9 +496,13 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
         "worker_id": args.worker_id,
         "parent_attempt_id": args.parent_attempt_id or None,
         "execution_mode": args.execution_mode,
+        "requested_execution_mode": args.requested_execution_mode or args.execution_mode,
+        "requested_session_id": args.requested_session_id,
+        "resume_fallback_reason": args.resume_fallback_reason or None,
         "resume_reason": args.resume_reason,
         "permission_mode": args.permission_mode,
         "state": "created",
+        "outcome": None,
         "handoff_valid": None,
         "handoff_state": None,
         "started_at": utc_now(),
@@ -523,7 +535,8 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
         )
     elif args.artifact_protocol_version != 1:
         raise SystemExit("artifact protocol version must be 1 or 2")
-    write_json(Path(args.path), payload)
+    path = Path(args.path)
+    write_attempt_state(path, payload)
     return 0
 
 
@@ -571,7 +584,7 @@ def cmd_set_attempt_running(args: argparse.Namespace) -> int:
     path = Path(args.attempt_path)
     attempt = load_json(path)
     attempt["state"] = "running"
-    write_json(path, attempt)
+    write_attempt_state(path, attempt)
     return 0
 
 
@@ -587,13 +600,48 @@ def cmd_record_session(args: argparse.Namespace) -> int:
     attempt = load_json(attempt_path)
     attempt["backend_session_id"] = session_id
     attempt["session_id"] = session_id
-    write_json(attempt_path, attempt)
+    write_attempt_state(attempt_path, attempt)
     status_path = Path(args.status_path)
     status = load_json(status_path)
     assigned = status.get("assigned_worker")
     if isinstance(assigned, dict) and assigned.get("worker_id") == attempt.get("worker_id"):
         assigned["backend_session_id"] = session_id
         assigned["session_id"] = session_id
+        write_json(status_path, status)
+    return 0
+
+
+def cmd_record_resume_fallback(args: argparse.Namespace) -> int:
+    failure = _optional_json(args.failure_path) or {}
+    attempt_path = Path(args.attempt_path)
+    attempt = load_json(attempt_path)
+    if not isinstance(attempt, dict):
+        raise SystemExit("ATTEMPT.json must be an object")
+    attempt["requested_execution_mode"] = "resume"
+    attempt["requested_session_id"] = args.requested_session_id
+    attempt["execution_mode"] = "start"
+    attempt["resume_fallback_reason"] = args.reason
+    attempt["resume_fallback"] = {
+        "source": args.source,
+        "reason": args.reason,
+        "recorded_at": utc_now(),
+        "failure": failure.get("failure") if isinstance(failure.get("failure"), dict) else None,
+    }
+    attempt["backend_session_id"] = args.fallback_session_id
+    attempt["session_id"] = args.fallback_session_id
+    runtime = attempt.get("runtime")
+    if isinstance(runtime, dict):
+        runtime["requested_command"] = runtime.get("command")
+        runtime["command"] = args.command
+        runtime["supervisor_command"] = args.supervisor_command
+    write_attempt_state(attempt_path, attempt)
+
+    status_path = Path(args.status_path)
+    status = load_json(status_path)
+    assigned = status.get("assigned_worker") if isinstance(status, dict) else None
+    if isinstance(assigned, dict) and assigned.get("worker_id") == attempt.get("worker_id"):
+        assigned["backend_session_id"] = args.fallback_session_id
+        assigned["session_id"] = args.fallback_session_id
         write_json(status_path, status)
     return 0
 
@@ -1937,9 +1985,98 @@ def _validate_completed_replay(
     return reasons
 
 
+def _optional_json(path_value: str) -> dict[str, Any] | None:
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.exists():
+        return None
+    try:
+        payload = load_json(path)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _failed_attempt_outcome(
+    *,
+    task_dir: Path,
+    attempt_id: str,
+    startup: Mapping[str, Any] | None,
+    supervisor: Mapping[str, Any] | None,
+    exit_code: int | None,
+) -> str:
+    if isinstance(startup, Mapping) and startup.get("state") in {
+        "worker_startup_failed",
+        "tui_startup_failed",
+    }:
+        return "startup_failed"
+    if isinstance(supervisor, Mapping) and supervisor.get("timed_out") is True:
+        return "timed_out_unfinalized"
+    attempt_dir = task_dir / "attempts" / attempt_id
+    attempt_metadata = _optional_json(str(attempt_dir / "ATTEMPT.json")) or {}
+    publication = supervisor.get("publication") if isinstance(supervisor, Mapping) else None
+    candidate_paths = [
+        attempt_dir / "runtime" / "HANDOFF_READY.json",
+        attempt_dir / "COMPLETION.json",
+        attempt_dir / "HANDOFF.json",
+        attempt_dir / "EVIDENCE.json",
+    ]
+    has_candidate = any(path.exists() for path in candidate_paths)
+    if attempt_metadata.get("artifact_protocol_version", 1) == 1:
+        legacy_handoff = _optional_json(str(task_dir / "HANDOFF.json"))
+        if isinstance(legacy_handoff, dict) and legacy_handoff.get("_template") is not True:
+            has_candidate = True
+    if (
+        isinstance(supervisor, Mapping)
+        and supervisor.get("publication_invalidated") is True
+    ) or isinstance(publication, Mapping) and publication.get("payload") is not None:
+        has_candidate = True
+    if has_candidate or exit_code is None or exit_code == 0:
+        return "invalid_handoff"
+    return "execution_failed"
+
+
+def _failure_status_fields(
+    outcome: str,
+    startup_failure: Mapping[str, Any] | None = None,
+) -> tuple[str, str, str]:
+    if outcome == "startup_failed":
+        failure_code = str((startup_failure or {}).get("code") or "worker_startup_failed")
+        failure_message = str(
+            (startup_failure or {}).get("message") or "worker startup failed"
+        )
+        blocker = (
+            "needs_user"
+            if failure_code
+            in {"authentication_required", "permission_confirmation_required"}
+            else "environment"
+        )
+        return "Worker startup failed", blocker, f"{failure_code}: {failure_message}"
+    if outcome == "timed_out_unfinalized":
+        return (
+            "Worker timed out before finalization",
+            "budget",
+            "attempt timed out without a valid finalized handoff",
+        )
+    if outcome == "execution_failed":
+        return (
+            "Worker execution failed",
+            "needs_coordinator",
+            "worker started but exited without a valid handoff",
+        )
+    return (
+        "Invalid worker handoff",
+        "needs_coordinator",
+        "invalid worker handoff",
+    )
+
+
 def cmd_validate_handoff(args: argparse.Namespace) -> int:
     attempt_path = Path(args.attempt_path)
     task_dir = Path(args.task_dir)
+    startup_payload = _optional_json(getattr(args, "startup_path", ""))
+    supervisor_payload = _optional_json(getattr(args, "supervisor_result", ""))
     status_error = None
     try:
         status = load_json(Path(args.status_path))
@@ -2169,42 +2306,39 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
 
     if not result.valid:
         startup_failure = None
-        if args.startup_path:
-            startup_path = Path(args.startup_path)
-            if startup_path.exists():
-                try:
-                    startup = load_json(startup_path)
-                except json.JSONDecodeError:
-                    startup = None
-                if isinstance(startup, dict) and startup.get("state") in {
-                    "worker_startup_failed",
-                    "tui_startup_failed",
-                }:
-                    failure = startup.get("failure")
-                    startup_failure = failure if isinstance(failure, dict) else {}
-                    if not startup_failure:
-                        evidence = startup.get("startup_evidence")
-                        startup_failure = {
-                            "code": str(startup.get("state")),
-                            "message": str(evidence or "worker startup failed"),
-                        }
+        if isinstance(startup_payload, dict) and startup_payload.get("state") in {
+            "worker_startup_failed",
+            "tui_startup_failed",
+        }:
+            failure = startup_payload.get("failure")
+            startup_failure = failure if isinstance(failure, dict) else {}
+            if not startup_failure:
+                evidence = startup_payload.get("startup_evidence")
+                startup_failure = {
+                    "code": str(startup_payload.get("state")),
+                    "message": str(evidence or "worker startup failed"),
+                }
+        outcome = _failed_attempt_outcome(
+            task_dir=task_dir,
+            attempt_id=args.attempt_id,
+            startup=startup_payload,
+            supervisor=supervisor_payload,
+            exit_code=result.exit_code,
+        )
         attempt["state"] = "invalid_handoff"
+        attempt["outcome"] = outcome
         attempt["handoff_valid"] = False
         attempt["handoff_state"] = None
         if startup_failure is not None:
             attempt["startup_failure"] = startup_failure
-        write_json(attempt_path, attempt)
+        write_attempt_state(attempt_path, attempt)
         try:
-            if startup_failure is not None:
-                failure_code = str(startup_failure.get("code") or "worker_startup_failed")
-                failure_message = str(startup_failure.get("message") or "worker startup failed")
-                summary = "Worker startup failed"
-                blocker_type = "environment"
-                blocking_reason = f"{failure_code}: {failure_message}"
-            else:
-                summary = "Invalid worker handoff"
-                blocker_type = "needs_coordinator"
-                blocking_reason = "invalid worker handoff: " + "; ".join(result.reasons[:3])
+            summary, blocker_type, blocking_reason = _failure_status_fields(
+                outcome,
+                startup_failure,
+            )
+            if outcome == "invalid_handoff" and result.reasons:
+                blocking_reason += ": " + "; ".join(result.reasons[:3])
             apply_dispatch_terminal_transition(
                 Path(args.status_path),
                 target_state="blocked",
@@ -2222,13 +2356,14 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
         return 4
 
     attempt["state"] = "completed"
+    attempt["outcome"] = "completed"
     attempt["handoff_valid"] = True
     attempt["handoff_state"] = result.handoff_state
     if verified_commit is not None:
         attempt["source_commit"] = verified_commit
         if result.handoff_state == "verified":
             attempt["verified_commit"] = verified_commit
-    write_json(attempt_path, attempt)
+    write_attempt_state(attempt_path, attempt)
     request = result.request or {}
     if result.handoff_state == "blocked":
         blocker_type = str(request.get("blocker_type") or "")
@@ -2259,6 +2394,261 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
         trusted_status=trusted_status,
     )
     return 0
+
+
+def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
+    """Idempotently close an active attempt after dispatcher failure."""
+
+    status_path = Path(args.status_path)
+    attempt_path = Path(args.attempt_path)
+    task_dir = Path(args.task_dir)
+    try:
+        status = load_json(status_path)
+    except Exception as exc:
+        print(f"dispatch reconciliation could not read STATUS.json: {exc}", file=sys.stderr)
+        return 2
+    attempt_recovered = False
+    try:
+        attempt = load_json(attempt_path)
+        if not isinstance(attempt, dict):
+            raise ValueError("ATTEMPT.json must be an object")
+    except Exception as exc:
+        snapshot_path = attempt_path.parent / "runtime" / "DISPATCH_ATTEMPT.json"
+        try:
+            attempt = load_json(snapshot_path)
+        except Exception as snapshot_exc:
+            print(
+                "dispatch reconciliation could not recover ATTEMPT.json: "
+                f"{exc}; snapshot: {snapshot_exc}",
+                file=sys.stderr,
+            )
+            return 2
+        if not isinstance(attempt, dict):
+            print("dispatch attempt snapshot must be an object", file=sys.stderr)
+            return 2
+        if attempt_path.exists():
+            quarantine = attempt_path.with_name(
+                f"ATTEMPT.corrupt-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+            )
+            os.replace(attempt_path, quarantine)
+        attempt["recovered_from_dispatch_snapshot"] = True
+        write_attempt_state(attempt_path, attempt)
+        attempt_recovered = True
+    if not isinstance(status, dict):
+        print("dispatch reconciliation requires object STATUS.json", file=sys.stderr)
+        return 2
+    if status.get("current_attempt_id") != args.attempt_id:
+        return 0
+
+    active_state = "planning" if attempt.get("phase") == "planning" else "running"
+    if status.get("state") not in {"planning", "running"}:
+        return 0
+
+    startup = _optional_json(args.startup_path)
+    supervisor = _optional_json(args.supervisor_result)
+    timeout_marker = _optional_json(getattr(args, "timeout_marker", ""))
+    cleanup_result = _optional_json(getattr(args, "cleanup_result", ""))
+    cleanup_failure = None
+    if isinstance(cleanup_result, dict):
+        surviving_pids = cleanup_result.get("surviving_pids")
+        has_survivors = isinstance(surviving_pids, list) and bool(surviving_pids)
+        if cleanup_result.get("terminated") is not True or has_survivors:
+            cleanup_failure = dict(cleanup_result)
+
+    if (
+        cleanup_failure is None
+        and attempt.get("state") == "completed"
+        and attempt.get("handoff_valid") is True
+    ):
+        target = attempt.get("handoff_state")
+        if target not in {"strategy_review", "verified", "review", "blocked"}:
+            return 2
+        request_path = (
+            attempt_path.parent / "HANDOFF.json"
+            if (attempt_path.parent / "HANDOFF.json").exists()
+            else task_dir / "HANDOFF.json"
+        )
+        request = _optional_json(str(request_path)) or {}
+        blocker = request.get("conditional_blocker")
+        blocker_type = ""
+        blocking_reason = ""
+        needs_coordinator = False
+        if target == "blocked":
+            if isinstance(blocker, dict):
+                blocker_type = str(blocker.get("blocker_type") or "")
+                blocking_reason = str(blocker.get("reason") or "")
+            else:
+                blocker_type = str(request.get("blocker_type") or "needs_coordinator")
+                blocking_reason = str(request.get("blocking_reason") or "")
+            needs_coordinator = True
+        apply_dispatch_terminal_transition(
+            status_path,
+            target_state=str(target),
+            summary=str(request.get("summary") or "Recovered validated worker handoff"),
+            needs_coordinator=needs_coordinator,
+            blocker_type=blocker_type,
+            blocking_reason=blocking_reason,
+            trusted_status={
+                "current_attempt_id": args.attempt_id,
+                "active_state": active_state,
+            },
+        )
+        return 0
+
+    if isinstance(timeout_marker, dict) and timeout_marker.get("timed_out") is True:
+        supervisor = {**(supervisor or {}), "timed_out": True}
+    exit_code = None
+    if isinstance(timeout_marker, dict) and isinstance(timeout_marker.get("exit_code"), int):
+        exit_code = int(timeout_marker["exit_code"])
+    elif isinstance(supervisor, dict) and isinstance(supervisor.get("exit_code"), int):
+        exit_code = int(supervisor["exit_code"])
+    elif str(args.dispatch_exit_code).lstrip("-").isdigit():
+        exit_code = int(args.dispatch_exit_code)
+
+    if attempt.get("state") == "invalid_handoff":
+        outcome = str(attempt.get("outcome") or "invalid_handoff")
+        startup_failure = (
+            attempt.get("startup_failure")
+            if isinstance(attempt.get("startup_failure"), dict)
+            else None
+        )
+    else:
+        outcome = _failed_attempt_outcome(
+            task_dir=task_dir,
+            attempt_id=args.attempt_id,
+            startup=startup,
+            supervisor=supervisor,
+            exit_code=exit_code,
+        )
+        if outcome == "invalid_handoff":
+            # The trap has not performed complete handoff validation.  Treat
+            # an otherwise unclassified dispatcher abort as execution failure
+            # instead of claiming a handoff-specific protocol finding.
+            outcome = "execution_failed"
+        startup_failure = None
+        if isinstance(startup, dict) and isinstance(startup.get("failure"), dict):
+            startup_failure = dict(startup["failure"])
+        attempt.update(
+            state="invalid_handoff",
+            outcome=outcome,
+            handoff_valid=False,
+            handoff_state=None,
+            ended_at=utc_now(),
+            exit_code=exit_code,
+            dispatcher_failure={
+                "exit_code": int(args.dispatch_exit_code),
+                "reconciled_at": utc_now(),
+                "attempt_recovered": attempt_recovered,
+            },
+        )
+        if startup_failure is not None:
+            attempt["startup_failure"] = startup_failure
+    if cleanup_failure is not None:
+        attempt["cleanup_failure"] = cleanup_failure
+    write_attempt_state(attempt_path, attempt)
+
+    summary, blocker_type, blocking_reason = _failure_status_fields(
+        outcome,
+        startup_failure,
+    )
+    if cleanup_failure is not None:
+        surviving_pids = cleanup_failure.get("surviving_pids")
+        if isinstance(surviving_pids, list) and surviving_pids:
+            blocker_type = "irrecoverable"
+            summary = "Worker process cleanup failed"
+            blocking_reason = (
+                "Dispatcher could not terminate worker descendants "
+                f"{surviving_pids}; the dispatch lock was retained for coordinator recovery."
+            )
+        else:
+            blocker_type = "environment"
+            summary = "Worker process cleanup could not be verified"
+            reason = str(cleanup_failure.get("reason") or "unknown cleanup failure")
+            blocking_reason = (
+                f"Dispatcher cleanup was not verifiable ({reason}); "
+                "the dispatch lock was retained for coordinator recovery."
+            )
+    apply_dispatch_terminal_transition(
+        status_path,
+        target_state="blocked",
+        summary=summary,
+        needs_coordinator=True,
+        blocker_type=blocker_type,
+        blocking_reason=blocking_reason,
+        trusted_status={
+            "current_attempt_id": args.attempt_id,
+            "active_state": active_state,
+        },
+    )
+    if args.run_dir:
+        try:
+            append_event_line(
+                Path(args.run_dir),
+                {
+                    "at": utc_now(),
+                    "actor": "dispatch",
+                    "event": "dispatcher_reconciled",
+                    "run_id": args.run_id,
+                    "task_id": args.task_id,
+                    "attempt_id": args.attempt_id,
+                    "outcome": outcome,
+                    "dispatch_exit_code": int(args.dispatch_exit_code),
+                    "cleanup_failed": cleanup_failure is not None,
+                },
+            )
+        except Exception as exc:
+            print(f"dispatch reconciliation event append failed: {exc}", file=sys.stderr)
+    print(
+        json.dumps(
+            {
+                "attempt_id": args.attempt_id,
+                "outcome": outcome,
+                "cleanup_failed": cleanup_failure is not None,
+            },
+            sort_keys=True,
+        )
+    )
+    # Reconciliation itself succeeded, but a non-zero result tells the shell
+    # trap that releasing the execution mutex would be unsafe.
+    return 3 if cleanup_failure is not None else 0
+
+
+def cmd_terminate_attempt_processes(args: argparse.Namespace) -> int:
+    state = _optional_json(args.supervisor_state)
+    if not isinstance(state, dict):
+        print(
+            json.dumps(
+                {
+                    "terminated": False,
+                    "reason": "supervisor_state_missing",
+                    "surviving_pids": [],
+                }
+            )
+        )
+        return 2
+    pids = {
+        int(value)
+        for value in state.get("observed_pids", [])
+        if isinstance(value, int) and value > 1
+    }
+    pgids = {
+        int(value)
+        for value in state.get("observed_pgids", [])
+        if isinstance(value, int) and value > 1
+    }
+    survivors = terminate_processes(pgids, pids)
+    print(
+        json.dumps(
+            {
+                "terminated": True,
+                "observed_pids": sorted(pids),
+                "observed_pgids": sorted(pgids),
+                "surviving_pids": list(survivors),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0 if not survivors else 2
 
 
 def cmd_write_dispatch_diagnostics(args: argparse.Namespace) -> int:
@@ -2306,7 +2696,8 @@ def cmd_write_tmux_timeout_diagnostics(args: argparse.Namespace) -> int:
         "timeout_seconds": int(args.timeout_seconds),
         "dispatch_exit_code": 5,
         "worker_exit_code": None,
-        "dispatch_lock_retained": True,
+        "dispatch_lock_retained": False,
+        "attempt_cancel_requested": True,
         "dispatch_lock_dir": args.dispatch_lock_dir,
         "attempt_dir": args.attempt_dir,
     }
@@ -2322,14 +2713,14 @@ def cmd_write_tmux_timeout_diagnostics(args: argparse.Namespace) -> int:
                 "- reason: tmux_wait_timeout",
                 "- dispatch_exit_code: 5",
                 "- worker_exit_code: null",
-                "- dispatch_lock_retained: true",
+                "- dispatch_lock_retained: false",
+                "- attempt_cancel_requested: true",
                 f"- tmux_session: {args.tmux_session}",
                 f"- attach_command: {args.attach_command}",
                 f"- timeout_seconds: {args.timeout_seconds}",
                 f"- time: {utc_now()}",
                 "",
-                "Dispatch lost supervision before the attempt-local exit_code file appeared.",
-                "Do not assume the worker stopped. Use Lock Recovery Review before removing .dispatch-lock.",
+                "Dispatch cancelled the tmux session and reconciled the attempt before returning.",
                 "",
             ]
         ),
@@ -2397,6 +2788,9 @@ def build_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--session-id", default="")
     attempt.add_argument("--worker-backend", default="claude-code")
     attempt.add_argument("--execution-mode", default="start")
+    attempt.add_argument("--requested-execution-mode", default="")
+    attempt.add_argument("--requested-session-id", default="")
+    attempt.add_argument("--resume-fallback-reason", default="")
     attempt.add_argument("--resume-reason", default="")
     attempt.add_argument("--phase", choices=["planning", "execution"], required=True)
     attempt.add_argument("--strategy-id", default="")
@@ -2437,6 +2831,18 @@ def build_parser() -> argparse.ArgumentParser:
     record_session.add_argument("--session-path", required=True)
     record_session.set_defaults(func=cmd_record_session)
 
+    fallback = sub.add_parser("record-resume-fallback")
+    fallback.add_argument("--status-path", required=True)
+    fallback.add_argument("--attempt-path", required=True)
+    fallback.add_argument("--failure-path", required=True)
+    fallback.add_argument("--requested-session-id", default="")
+    fallback.add_argument("--fallback-session-id", default="")
+    fallback.add_argument("--reason", required=True)
+    fallback.add_argument("--source", choices=["preflight", "runtime"], default="runtime")
+    fallback.add_argument("--command", required=True)
+    fallback.add_argument("--supervisor-command", required=True)
+    fallback.set_defaults(func=cmd_record_resume_fallback)
+
     validate = sub.add_parser("validate-handoff")
     validate.add_argument("--status-path", required=True)
     validate.add_argument("--attempt-id", required=True)
@@ -2444,6 +2850,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--attempt-path", required=True)
     validate.add_argument("--exit-code-raw", required=True)
     validate.add_argument("--startup-path", default="")
+    validate.add_argument("--supervisor-result", default="")
     validate.add_argument("--worktree", default="")
     validate.add_argument("--expected-profile", default="")
     validate.add_argument("--expected-task-id", default="")
@@ -2462,6 +2869,25 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--expected-task-base-commit", default="")
     validate.add_argument("--expected-worktree-before-sha256", default="")
     validate.set_defaults(func=cmd_validate_handoff)
+
+    reconcile = sub.add_parser("reconcile-dispatch-exit")
+    reconcile.add_argument("--status-path", required=True)
+    reconcile.add_argument("--task-dir", required=True)
+    reconcile.add_argument("--attempt-path", required=True)
+    reconcile.add_argument("--attempt-id", required=True)
+    reconcile.add_argument("--startup-path", default="")
+    reconcile.add_argument("--supervisor-result", default="")
+    reconcile.add_argument("--timeout-marker", default="")
+    reconcile.add_argument("--cleanup-result", default="")
+    reconcile.add_argument("--dispatch-exit-code", required=True)
+    reconcile.add_argument("--run-dir", default="")
+    reconcile.add_argument("--run-id", default="")
+    reconcile.add_argument("--task-id", default="")
+    reconcile.set_defaults(func=cmd_reconcile_dispatch_exit)
+
+    terminate = sub.add_parser("terminate-attempt-processes")
+    terminate.add_argument("--supervisor-state", required=True)
+    terminate.set_defaults(func=cmd_terminate_attempt_processes)
 
     diagnostics = sub.add_parser("write-dispatch-diagnostics")
     diagnostics.add_argument("--run-dir", required=True)

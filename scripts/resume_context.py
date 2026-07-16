@@ -118,6 +118,7 @@ def build_resume_context(
     attempt_metadata["carried_forward_workflows"] = sorted(reused)
     attempt_metadata["remaining_workflows"] = payload["remaining_workflows"]
     write_json(attempt_path, attempt_metadata)
+    write_json(runtime / "DISPATCH_ATTEMPT.json", attempt_metadata)
     workflows_path = runtime / "WORKFLOWS.ndjson"
     existing = workflow_records(attempt_dir)
     already_carried = {

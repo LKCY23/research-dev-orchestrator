@@ -77,6 +77,16 @@ completed
 invalid_handoff
 ```
 
+## Attempt Outcomes
+
+```text
+startup_failed
+execution_failed
+timed_out_unfinalized
+invalid_handoff
+completed
+```
+
 ## Execution Profiles
 
 ```text
@@ -140,6 +150,7 @@ worker_blocked
 worker_review_ready
 worker_verified
 worker_exit_without_valid_status
+dispatcher_reconciled
 dispatch_lock_removed
 coordinator_reviewed
 codex_reviewed

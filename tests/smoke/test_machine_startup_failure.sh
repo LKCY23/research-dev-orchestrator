@@ -45,5 +45,9 @@ assert status["blocker_type"] == "environment", status
 assert status["summary"] == "Worker startup failed", status
 assert "early_exit" in status["blocking_reason"], status
 assert attempt["startup_failure"]["code"] == "early_exit", attempt
+assert attempt["outcome"] == "startup_failed", attempt
 assert not (task / ".dispatch-lock").exists()
 PY
+
+python3 "${RDO_ROOT}/scripts/collect_status.py" --run-id smoke-run --json > "${repo}/status.json"
+assert_json_expr "${repo}/status.json" "payload['valid'] is True"

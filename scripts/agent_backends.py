@@ -262,9 +262,10 @@ def build_command(
         if backend_id == "claude-code":
             argv[1:1] = ["--resume", session_id]
         elif backend_id == "codex":
-            exec_index = argv.index("exec")
-            argv.insert(exec_index + 1, "resume")
-            argv.insert(len(argv) - 1, session_id)
+            # `resume` is a subcommand of `exec` in machine mode and of
+            # `codex` in human mode.  Keep all parent-command options,
+            # including `--cd`, before that subcommand.
+            argv[len(argv) - 1 : len(argv) - 1] = ["resume", session_id]
         elif backend_id == "opencode":
             argv.insert(len(argv) - 1, "--session")
             argv.insert(len(argv) - 1, session_id)

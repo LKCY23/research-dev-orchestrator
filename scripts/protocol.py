@@ -77,6 +77,13 @@ TASK_STATES = {
 
 BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "irrecoverable"}
 ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
+ATTEMPT_OUTCOMES = {
+    "startup_failed",
+    "execution_failed",
+    "timed_out_unfinalized",
+    "invalid_handoff",
+    "completed",
+}
 HANDOFF_STATES = {"strategy_review", "verified", "review", "blocked", None}
 EXECUTION_PROFILES = {"direct", "delegated", "full"}
 EXECUTION_MODES = {"start", "resume", "replace"}
@@ -115,6 +122,7 @@ CORE_EVENTS = {
     "worker_review_ready",
     "worker_verified",
     "worker_exit_without_valid_status",
+    "dispatcher_reconciled",
     "dispatch_lock_removed",
     "coordinator_reviewed",
     "codex_reviewed",
@@ -143,6 +151,7 @@ TASK_EVENTS = {
     "worker_review_ready",
     "worker_verified",
     "worker_exit_without_valid_status",
+    "dispatcher_reconciled",
     "dispatch_lock_removed",
     "coordinator_reviewed",
     "codex_reviewed",
@@ -168,6 +177,7 @@ ATTEMPT_EVENTS = {
     "worker_review_ready",
     "worker_verified",
     "worker_exit_without_valid_status",
+    "dispatcher_reconciled",
     "attempt_timed_out",
     "worker_instruction_submitted",
     "worker_interrupted",

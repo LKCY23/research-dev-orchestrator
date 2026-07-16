@@ -174,6 +174,84 @@ class CollectStatusV2Tests(unittest.TestCase):
                 any("STATUS planning requires profile='full'" in item for item in violations)
             )
 
+    def test_cleanup_failure_allows_only_a_matching_retained_dispatch_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary) / "tasks" / "T001"
+            attempt = task / "attempts" / "A001"
+            attempt.mkdir(parents=True)
+            status = {
+                "task_id": "T001",
+                "artifact_protocol_version": 2,
+                "profile": "delegated",
+                "state": "blocked",
+                "current_attempt_id": "A001",
+                "blocker_type": "irrecoverable",
+                "blocking_reason": "worker descendant survived cleanup",
+            }
+            self.write_json(task / "STATUS.json", status)
+            self.write_json(
+                attempt / "ATTEMPT.json",
+                {
+                    "attempt_id": "A001",
+                    "task_id": "T001",
+                    "agent": "claude-code",
+                    "agent_name": "worker",
+                    "session_id": "",
+                    "state": "invalid_handoff",
+                    "outcome": "execution_failed",
+                    "handoff_valid": False,
+                    "handoff_state": None,
+                    "started_at": utc_now(),
+                    "ended_at": utc_now(),
+                    "exit_code": 6,
+                    "phase": "execution",
+                    "cleanup_failure": {
+                        "terminated": True,
+                        "surviving_pids": [43210],
+                    },
+                    "runtime": {
+                        "backend": "tmux",
+                        "cli": "claude",
+                        "command": "claude",
+                        "cwd": str(Path(temporary)),
+                        "tmux_session": "rdo-cleanup",
+                        "attach_command": "tmux attach -t rdo-cleanup",
+                    },
+                },
+            )
+            dispatch_lock = task / ".dispatch-lock"
+            dispatch_lock.mkdir()
+            (dispatch_lock / "attempt_id").write_text("A001\n", encoding="utf-8")
+            (dispatch_lock / "pid").write_text("43211\n", encoding="utf-8")
+            (dispatch_lock / "tmux_session").write_text(
+                "rdo-cleanup\n", encoding="utf-8"
+            )
+
+            violations, warnings, _attempt = validate_attempt(task, status, 10, 60)
+            self.assertEqual([], violations)
+            self.assertTrue(any("intentionally retained" in item for item in warnings))
+
+            status["blocker_type"] = "environment"
+            violations, _warnings, _attempt = validate_attempt(task, status, 10, 60)
+            self.assertTrue(
+                any("STATUS.blocker_type must be irrecoverable" in item for item in violations)
+            )
+
+            status["blocker_type"] = "irrecoverable"
+            (dispatch_lock / "attempt_id").write_text("A999\n", encoding="utf-8")
+            violations, _warnings, _attempt = validate_attempt(task, status, 10, 60)
+            self.assertTrue(
+                any("attempt_id does not match" in item for item in violations)
+            )
+
+            for path in dispatch_lock.iterdir():
+                path.unlink()
+            dispatch_lock.rmdir()
+            violations, _warnings, _attempt = validate_attempt(task, status, 10, 60)
+            self.assertTrue(
+                any("requires retained .dispatch-lock" in item for item in violations)
+            )
+
     def make_published_task(
         self,
         root: Path,

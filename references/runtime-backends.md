@@ -119,9 +119,26 @@ For dispatch, explicit environment variables override `.agent-collab/rdo.toml`. 
 
 Before lock or attempt creation, dispatch validates the requested runtime/IO
 pair, executable availability, CLI version invocation, requested permission
-mode, command construction, and authentication when the backend exposes a
-deterministic auth probe. An unavailable `auto` or `yolo` mode is an error; RDO
-does not widen permissions or fall back to an interactive mode.
+mode, command construction, authentication, native resume syntax, and local
+session availability when the backend exposes deterministic probes. Capability
+checks use the installed CLI's help surface rather than a hard-coded version
+table.
+
+Session availability is three-valued:
+
+```text
+present  deterministic local storage contains the session
+missing  storage was inspected successfully and the session is absent
+unknown  storage cannot be inspected authoritatively
+```
+
+A missing session does not replace the logical worker. Dispatch records the
+requested resume, keeps `worker_id` and attempt lineage, and performs one
+explicit full-context start fallback. Claude may reuse the requested UUID with
+`--session-id`; Codex confirms the new thread from `thread.started`. An
+`unknown` session may be attempted once; a pre-start `session_not_found`
+result permits one runtime fallback. No fallback is allowed after a valid
+worker-start event.
 
 For `plain + machine`, the adapter returns structured `argv`, environment, and
 one prompt transport. With `arg`, the prompt appears only in `argv` and stdin is
@@ -224,19 +241,19 @@ dispatch exits 4
 
 ## Tmux Timeout
 
-Timeout before `exit_code` exists means dispatch lost supervision. It does not prove the worker stopped.
+Timeout before `exit_code` exists requires explicit cancellation and
+reconciliation; it is not permission to abandon a live worker.
 
 On timeout:
 
 ```text
 dispatch exits 5
-do not validate handoff
-do not release .dispatch-lock
-leave ATTEMPT.state = running
-leave ATTEMPT.ended_at = null
-leave ATTEMPT.exit_code = null
+cancel the tmux session
+record ATTEMPT.state = invalid_handoff
+record ATTEMPT.outcome = timed_out_unfinalized
+move STATUS to blocked with blocker_type=budget
 write diagnostics
-require Lock Recovery Review
+release .dispatch-lock after reconciliation
 ```
 
 Timeout diagnostics should record:
@@ -246,11 +263,13 @@ Timeout diagnostics should record:
   "reason": "tmux_wait_timeout",
   "dispatch_exit_code": 5,
   "worker_exit_code": null,
-  "dispatch_lock_retained": true
+  "dispatch_lock_retained": false,
+  "attempt_cancel_requested": true
 }
 ```
 
-`dispatch_exit_code` is the exit code of `dispatch_claude.sh`. It must not be written to `ATTEMPT.exit_code`.
+`dispatch_exit_code` remains the exit code of `dispatch_claude.sh`;
+`ATTEMPT.exit_code` records the synthetic supervised timeout code `124`.
 
 ## Tmux Missing
 

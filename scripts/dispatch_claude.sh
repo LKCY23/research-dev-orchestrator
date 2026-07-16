@@ -30,6 +30,8 @@ DIAGNOSTICS_DIR="${RUN_DIR}/diagnostics"
 STATUS_UPDATED=0
 DISPATCH_LOCK_ACQUIRED=0
 KEEP_DISPATCH_LOCK_ON_EXIT=0
+PROCESS_CLEANUP_FAILED=0
+TMUX_WORKER_LAUNCHED=0
 
 sanitize_name() {
   LC_ALL=C tr -c 'A-Za-z0-9_.-' '-' | sed 's/^-*//; s/-*$//'
@@ -86,6 +88,134 @@ append_event() {
     --status-path "${STATUS_PATH}"
 }
 
+cleanup_attempt_processes() {
+  [[ -n "${ATTEMPT_DIR:-}" ]] || return 2
+  local result_path="${ATTEMPT_DIR}/runtime/CLEANUP.json"
+  local temporary="${result_path}.tmp"
+  mkdir -p "${ATTEMPT_DIR}/runtime"
+  python3 "${PROTOCOL_CLI}" terminate-attempt-processes \
+    --supervisor-state "${ATTEMPT_DIR}/runtime/supervisor.json" \
+    > "${temporary}"
+  local cleanup_code=$?
+  mv "${temporary}" "${result_path}"
+  return "${cleanup_code}"
+}
+
+run_tmux_worker_once() {
+  TMUX_WORKER_LAUNCHED=0
+  EXIT_CODE_FILE="${ATTEMPT_DIR}/exit_code"
+  RUNNER_PATH="${ATTEMPT_DIR}/run-worker.sh"
+  DONE_SIGNAL="rdo-done-${TMUX_SESSION}"
+  rm -f "${EXIT_CODE_FILE}" "${EXIT_CODE_FILE}.tmp"
+  python3 "${DISPATCH_ASSETS}" render-tmux-runner \
+    --output "${RUNNER_PATH}" \
+    --worktree-path "${WORKTREE_PATH}" \
+    --command "${RDO_WORKER_COMMAND}" \
+    --prompt-path "${ATTEMPT_DIR}/prompt.md" \
+    --transcript-path "${TRANSCRIPT_PATH}" \
+    --exit-code-file "${EXIT_CODE_FILE}" \
+    --done-signal "${DONE_SIGNAL}" \
+    --keep-session "${RDO_TMUX_KEEP_SESSION}" \
+    --prompt-transport "${PROMPT_TRANSPORT}" \
+    --submit-key "${PROMPT_SUBMIT_KEY}" \
+    --post-paste-delay-ms "${PROMPT_POST_PASTE_DELAY_MS}" \
+    --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+    --startup-timeout-seconds "${RDO_STARTUP_TIMEOUT_SECONDS}" \
+    --backend-id "${RDO_WORKER_BACKEND}"
+  TMUX_COMMAND="$(python3 - "$RUNNER_PATH" <<'PY'
+import shlex
+import sys
+
+print("exec " + shlex.quote(sys.argv[1]))
+PY
+)"
+  tmux new-session -d -s "${TMUX_SESSION}" "${TMUX_COMMAND}"
+  TMUX_WORKER_LAUNCHED=1
+  if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
+    tmux pipe-pane -o -t "${TMUX_SESSION}" "cat >> '${TRANSCRIPT_PATH}'" || true
+  fi
+  WAIT_START="$(date +%s)"
+  while [[ ! -f "${EXIT_CODE_FILE}" ]]; do
+    STARTUP_PROBE_MARKER="${ATTEMPT_DIR}/runtime/human-startup-probed"
+    if [[ "${RDO_IO_MODE}" == "human" && ! -f "${STARTUP_PROBE_MARKER}" ]]; then
+      PANE_SNAPSHOT="${ATTEMPT_DIR}/runtime/startup-pane.txt"
+      tmux capture-pane -p -t "${TMUX_SESSION}" > "${PANE_SNAPSHOT}" 2>/dev/null || true
+      set +e
+      python3 "${SCRIPT_DIR}/human_startup_probe.py" \
+        --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+        --pane-path "${PANE_SNAPSHOT}" \
+        --backend "${RDO_WORKER_BACKEND}" >/dev/null
+      HUMAN_PROBE_CODE=$?
+      set -e
+      if [[ "${HUMAN_PROBE_CODE}" -eq 0 ]]; then
+        touch "${STARTUP_PROBE_MARKER}"
+        append_event "worker_waiting_for_user"
+        echo "Worker is waiting for startup input; attach with: ${TMUX_ATTACH_COMMAND}" >&2
+      elif [[ "${HUMAN_PROBE_CODE}" -eq 2 ]]; then
+        touch "${STARTUP_PROBE_MARKER}"
+        append_event "worker_startup_failed"
+        set +e
+        cleanup_attempt_processes
+        HUMAN_CLEANUP_CODE=$?
+        set -e
+        if [[ "${HUMAN_CLEANUP_CODE}" -ne 0 ]]; then
+          PROCESS_CLEANUP_FAILED=1
+          exit 6
+        fi
+        tmux send-keys -t "${TMUX_SESSION}" C-c 2>/dev/null || true
+        sleep 0.2
+        tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+        if [[ ! -f "${EXIT_CODE_FILE}" ]]; then
+          printf '125\n' > "${EXIT_CODE_FILE}.tmp"
+          mv "${EXIT_CODE_FILE}.tmp" "${EXIT_CODE_FILE}"
+        fi
+      fi
+    fi
+    if [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" != "0" ]]; then
+      NOW="$(date +%s)"
+      if (( NOW - WAIT_START >= RDO_TMUX_WAIT_TIMEOUT_SECONDS )); then
+        python3 - "${ATTEMPT_DIR}/runtime/DISPATCH_TIMEOUT.json" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = dict(
+    reason="tmux_wait_timeout",
+    exit_code=124,
+    timed_out=True,
+    timeout_source="dispatcher_tmux_wait",
+)
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+        write_tmux_timeout_diagnostics
+        exit 5
+      fi
+    fi
+    sleep 1
+  done
+  if [[ "${RDO_IO_MODE}" == "human" && -f "${TRANSCRIPT_PATH}" ]]; then
+    set +e
+    python3 "${SCRIPT_DIR}/human_startup_probe.py" \
+      --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+      --pane-path "${TRANSCRIPT_PATH}" \
+      --backend "${RDO_WORKER_BACKEND}" >/dev/null
+    set -e
+  fi
+  EXIT_CODE_RAW="$(cat "${EXIT_CODE_FILE}" 2>/dev/null || true)"
+  if [[ "${RDO_TMUX_KEEP_SESSION}" != "1" ]]; then
+    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+  fi
+  if [[ "${EXIT_CODE_RAW}" =~ ^[0-9]+$ ]]; then
+    EXIT_CODE="${EXIT_CODE_RAW}"
+  else
+    EXIT_CODE=125
+  fi
+}
+
 dispatch_lock_matches_current_attempt() {
   [[ "${DISPATCH_LOCK_ACQUIRED}" == "1" ]] || return 1
   [[ -d "${DISPATCH_LOCK_DIR}" ]] || return 1
@@ -110,9 +240,55 @@ lock_file_matches_current_attempt() {
 
 on_exit() {
   local code="$?"
+  local reconcile_code=0
+  local cleanup_code=0
   if [[ "${code}" -eq 0 ]]; then
     release_dispatch_lock
     return 0
+  fi
+  if [[ "${RDO_RUNTIME_BACKEND:-}" == "tmux" && \
+        "${TMUX_WORKER_LAUNCHED}" == "1" && \
+        ( -z "${EXIT_CODE_FILE:-}" || ! -f "${EXIT_CODE_FILE}" || \
+          "${PROCESS_CLEANUP_FAILED}" == "1" ) ]]; then
+    set +e
+    cleanup_attempt_processes
+    cleanup_code=$?
+    set -e
+    if [[ "${cleanup_code}" -ne 0 ]]; then
+      PROCESS_CLEANUP_FAILED=1
+    else
+      PROCESS_CLEANUP_FAILED=0
+    fi
+  fi
+  if [[ "${RDO_RUNTIME_BACKEND:-}" == "tmux" && -n "${TMUX_SESSION:-}" ]] && \
+     tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
+    tmux send-keys -t "${TMUX_SESSION}" C-c 2>/dev/null || true
+    sleep 0.2
+    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+  fi
+  if [[ -n "${ATTEMPT_ID:-}" && -n "${ATTEMPT_DIR:-}" && \
+        -d "${ATTEMPT_DIR}" && -f "${STATUS_PATH}" ]]; then
+    set +e
+    python3 "${PROTOCOL_CLI}" reconcile-dispatch-exit \
+      --status-path "${STATUS_PATH}" \
+      --task-dir "${TASK_DIR}" \
+      --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
+      --attempt-id "${ATTEMPT_ID}" \
+      --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+      --supervisor-result "${SUPERVISOR_RESULT:-}" \
+      --timeout-marker "${ATTEMPT_DIR}/runtime/DISPATCH_TIMEOUT.json" \
+      --cleanup-result "${ATTEMPT_DIR}/runtime/CLEANUP.json" \
+      --dispatch-exit-code "${code}" \
+      --run-dir "${RUN_DIR}" \
+      --run-id "${RUN_ID}" \
+      --task-id "${TASK_ID}" >/dev/null
+    reconcile_code=$?
+    set -e
+    if [[ "${reconcile_code}" -ne 0 || "${PROCESS_CLEANUP_FAILED}" == "1" ]]; then
+      KEEP_DISPATCH_LOCK_ON_EXIT=1
+    else
+      KEEP_DISPATCH_LOCK_ON_EXIT=0
+    fi
   fi
   if [[ -d "${RUN_DIR}" ]]; then
     python3 "${PROTOCOL_CLI}" write-dispatch-diagnostics \
@@ -336,10 +512,6 @@ if [[ -z "${RDO_WORKER_COMMAND}" ]]; then
     --agent-name "${RDO_WORKER_AGENT_NAME}" >/dev/null
 fi
 
-PREFLIGHT_JSON="$(python3 "${BACKEND_PREFLIGHT}" \
-  --backend "${RDO_WORKER_BACKEND}" \
-  --command "${RDO_WORKER_COMMAND}")" || exit 2
-
 BACKEND_PROFILE_COMPILE_ARGS=(
   compile
   --repo-root "${REPO_ROOT}"
@@ -412,6 +584,30 @@ esac
 if [[ "${RDO_EXECUTION_MODE}" == "resume" && -z "${RDO_BACKEND_SESSION_ID}" ]]; then
   echo "resume requires a backend session id" >&2
   exit 2
+fi
+REQUESTED_EXECUTION_MODE="${RDO_EXECUTION_MODE}"
+REQUESTED_SESSION_ID="${RDO_BACKEND_SESSION_ID}"
+RESUME_FALLBACK_REASON=""
+PREFLIGHT_JSON="$(python3 "${BACKEND_PREFLIGHT}" \
+  --backend "${RDO_WORKER_BACKEND}" \
+  --command "${RDO_WORKER_COMMAND}" \
+  --execution-mode "${REQUESTED_EXECUTION_MODE}" \
+  --session-id "${REQUESTED_SESSION_ID}" \
+  --cwd "${REPO_ROOT}" \
+  --io-mode "${RDO_IO_MODE}")" || exit 2
+RESUME_FALLBACK_REQUIRED="$(python3 -c '
+import json, sys
+print("1" if json.loads(sys.argv[1]).get("resume", {}).get("fallback_required") else "0")
+' "${PREFLIGHT_JSON}")"
+if [[ "${RESUME_FALLBACK_REQUIRED}" == "1" ]]; then
+  RESUME_FALLBACK_REASON="$(python3 -c '
+import json, sys
+print(json.loads(sys.argv[1]).get("resume", {}).get("fallback_reason") or "resume_unavailable")
+' "${PREFLIGHT_JSON}")"
+  RDO_EXECUTION_MODE="start"
+  if [[ "${RDO_WORKER_BACKEND}" != "claude-code" ]]; then
+    RDO_BACKEND_SESSION_ID=""
+  fi
 fi
 if [[ "${RDO_EXECUTION_MODE}" != "resume" && "${RDO_WORKER_BACKEND}" == "claude-code" && -z "${RDO_BACKEND_SESSION_ID}" ]]; then
   RDO_BACKEND_SESSION_ID="$(python3 - <<'PY'
@@ -688,6 +884,9 @@ python3 "${PROTOCOL_CLI}" create-attempt \
   --session-id "${RDO_BACKEND_SESSION_ID}" \
   --worker-backend "${RDO_WORKER_BACKEND}" \
   --execution-mode "${RDO_EXECUTION_MODE}" \
+  --requested-execution-mode "${REQUESTED_EXECUTION_MODE}" \
+  --requested-session-id "${REQUESTED_SESSION_ID}" \
+  --resume-fallback-reason "${RESUME_FALLBACK_REASON}" \
   --resume-reason "${STATUS_STATE}" \
   --phase "${RDO_ATTEMPT_PHASE}" \
   --strategy-id "${STRATEGY_ID}" \
@@ -746,69 +945,201 @@ else
     EXIT_CODE=$?
     set -e
     EXIT_CODE_RAW="${EXIT_CODE}"
-  else
-    EXIT_CODE_FILE="${ATTEMPT_DIR}/exit_code"
-    RUNNER_PATH="${ATTEMPT_DIR}/run-worker.sh"
-    DONE_SIGNAL="rdo-done-${TMUX_SESSION}"
-    rm -f "${EXIT_CODE_FILE}" "${EXIT_CODE_FILE}.tmp"
-    python3 "${DISPATCH_ASSETS}" render-tmux-runner \
-      --output "${RUNNER_PATH}" \
-      --worktree-path "${WORKTREE_PATH}" \
-      --command "${RDO_WORKER_COMMAND}" \
-      --prompt-path "${ATTEMPT_DIR}/prompt.md" \
-      --transcript-path "${TRANSCRIPT_PATH}" \
-      --exit-code-file "${EXIT_CODE_FILE}" \
-      --done-signal "${DONE_SIGNAL}" \
-      --keep-session "${RDO_TMUX_KEEP_SESSION}" \
-      --prompt-transport "${PROMPT_TRANSPORT}" \
-      --submit-key "${PROMPT_SUBMIT_KEY}" \
-      --post-paste-delay-ms "${PROMPT_POST_PASTE_DELAY_MS}" \
-      --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
-      --startup-timeout-seconds "${RDO_STARTUP_TIMEOUT_SECONDS}" \
-      --backend-id "${RDO_WORKER_BACKEND}"
-    TMUX_COMMAND="$(python3 - "$RUNNER_PATH" <<'PY'
+    if [[ "${REGISTERED_BACKEND_COMMAND}" == "1" && \
+          "${REQUESTED_EXECUTION_MODE}" == "resume" && \
+          "${RDO_EXECUTION_MODE}" == "resume" && \
+          "${EXIT_CODE}" -eq 125 && \
+          -f "${ATTEMPT_DIR}/runtime/STARTUP.json" ]]; then
+      RUNTIME_FALLBACK="$(python3 - "${ATTEMPT_DIR}/runtime/STARTUP.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+failure = payload.get("failure") if isinstance(payload, dict) else None
+print("1" if isinstance(failure, dict) and failure.get("recoverable_resume_failure") is True else "0")
+PY
+)"
+      if [[ "${RUNTIME_FALLBACK}" == "1" ]]; then
+        cp "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+          "${ATTEMPT_DIR}/runtime/RESUME_STARTUP_FAILURE.json"
+        [[ ! -f "${SUPERVISOR_RESULT}" ]] || cp "${SUPERVISOR_RESULT}" \
+          "${ATTEMPT_DIR}/runtime/RESUME_SUPERVISOR_FAILURE.json"
+        [[ ! -f "${TRANSCRIPT_PATH}" ]] || cp "${TRANSCRIPT_PATH}" \
+          "${ATTEMPT_DIR}/runtime/resume-failure-transcript.log"
+        FALLBACK_SESSION_ID=""
+        if [[ "${RDO_WORKER_BACKEND}" == "claude-code" ]]; then
+          FALLBACK_SESSION_ID="${REQUESTED_SESSION_ID}"
+        fi
+        FALLBACK_COMMAND_JSON="$(python3 "${AGENT_BACKEND_CLI}" command \
+          --backend "${RDO_WORKER_BACKEND}" \
+          --io-mode "${RDO_IO_MODE}" \
+          --permission-mode "${RDO_PERMISSION_MODE}" \
+          --cwd "${WORKTREE_PATH}" \
+          --prompt-path "${ATTEMPT_DIR}/prompt.md" \
+          --agent-name "${RDO_WORKER_AGENT_NAME}" \
+          --execution-mode start \
+          --session-id "${FALLBACK_SESSION_ID}" \
+          --backend-profile "${BACKEND_PROFILE_PATH}" \
+          --json)"
+        FALLBACK_ORIGINAL_COMMAND="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["command"])' "${FALLBACK_COMMAND_JSON}")"
+        FALLBACK_ARGV_JSON="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["argv"], separators=(",", ":")))' "${FALLBACK_COMMAND_JSON}")"
+        FALLBACK_ENVIRONMENT_JSON="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["environment"], separators=(",", ":")))' "${FALLBACK_COMMAND_JSON}")"
+        FALLBACK_PROMPT_TRANSPORT="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["prompt_transport"])' "${FALLBACK_COMMAND_JSON}")"
+        FALLBACK_WORKER_COMMAND="$(python3 - \
+          "${SCRIPT_DIR}/machine_attempt_supervisor.py" "${RDO_WORKER_BACKEND}" \
+          "${FALLBACK_ARGV_JSON}" "${FALLBACK_ENVIRONMENT_JSON}" "${WORKTREE_PATH}" \
+          "${ATTEMPT_DIR}/prompt.md" "${FALLBACK_PROMPT_TRANSPORT}" "${RDO_STARTUP_TIMEOUT_SECONDS}" \
+          "${ATTEMPT_TIMEOUT_SECONDS}" "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+          "${SUPERVISOR_RESULT}" "${ATTEMPT_DIR}/runtime/supervisor.json" \
+          "${TRANSCRIPT_PATH}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" \
+          "${ATTEMPT_DIR}/runtime/SESSION.json" "${FALLBACK_SESSION_ID}" \
+          "${BACKEND_PROFILE_PATH}" "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
+          "${HANDOFF_PUBLICATION_PATH}" "${TASK_DIR}" "${ATTEMPT_ID}" <<'PY'
 import shlex
 import sys
 
-print("exec " + shlex.quote(sys.argv[1]))
+(
+    script, backend, argv_json, environment_json, cwd, prompt_path,
+    prompt_transport, startup_timeout, timeout, startup_result,
+    supervisor_result, supervisor_state, transcript, strategy_id,
+    strategy_sha256, session_result, existing_session_id, backend_profile,
+    artifact_protocol_version, publication_path, task_dir, attempt_id,
+) = sys.argv[1:]
+parts = [
+    sys.executable, script, "--backend", backend,
+    "--argv-json", argv_json, "--environment-json", environment_json,
+    "--cwd", cwd, "--prompt-path", prompt_path,
+    "--prompt-transport", prompt_transport,
+    "--startup-timeout-seconds", startup_timeout,
+    "--timeout-seconds", timeout, "--startup-result", startup_result,
+    "--supervisor-result", supervisor_result, "--supervisor-state", supervisor_state,
+    "--transcript", transcript, "--strategy-id", strategy_id,
+    "--strategy-sha256", strategy_sha256,
+    "--session-result", session_result,
+    "--existing-session-id", existing_session_id,
+    "--backend-profile", backend_profile,
+    "--artifact-protocol-version", artifact_protocol_version,
+    "--publication-path", publication_path,
+    "--task-dir", task_dir,
+    "--attempt-id", attempt_id,
+]
+print(" ".join(shlex.quote(part) for part in parts))
 PY
 )"
-    tmux new-session -d -s "${TMUX_SESSION}" "${TMUX_COMMAND}"
-    if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
-      tmux pipe-pane -o -t "${TMUX_SESSION}" "cat >> '${TRANSCRIPT_PATH}'" || true
-    fi
-    WAIT_START="$(date +%s)"
-    while [[ ! -f "${EXIT_CODE_FILE}" ]]; do
-      WAITING_MARKER="${ATTEMPT_DIR}/runtime/worker-waiting-for-user"
-      if [[ "${RDO_IO_MODE}" == "human" && ! -f "${WAITING_MARKER}" ]]; then
-        PANE_SNAPSHOT="${ATTEMPT_DIR}/runtime/startup-pane.txt"
-        tmux capture-pane -p -t "${TMUX_SESSION}" > "${PANE_SNAPSHOT}" 2>/dev/null || true
-        if python3 "${SCRIPT_DIR}/human_startup_probe.py" \
-          --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
-          --pane-path "${PANE_SNAPSHOT}" >/dev/null; then
-          touch "${WAITING_MARKER}"
-          append_event "worker_waiting_for_user"
-          echo "Worker is waiting for startup input; attach with: ${TMUX_ATTACH_COMMAND}" >&2
-        fi
+        python3 "${PROTOCOL_CLI}" record-resume-fallback \
+          --status-path "${STATUS_PATH}" \
+          --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
+          --failure-path "${ATTEMPT_DIR}/runtime/RESUME_STARTUP_FAILURE.json" \
+          --requested-session-id "${REQUESTED_SESSION_ID}" \
+          --fallback-session-id "${FALLBACK_SESSION_ID}" \
+          --reason "runtime_session_not_found" \
+          --source runtime \
+          --command "${FALLBACK_ORIGINAL_COMMAND}" \
+          --supervisor-command "${FALLBACK_WORKER_COMMAND}"
+        rm -f "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+          "${ATTEMPT_DIR}/runtime/SESSION.json" \
+          "${SUPERVISOR_RESULT}"
+        RDO_EXECUTION_MODE="start"
+        RDO_BACKEND_SESSION_ID="${FALLBACK_SESSION_ID}"
+        RDO_WORKER_COMMAND="${FALLBACK_WORKER_COMMAND}"
+        set +e
+        (cd "${WORKTREE_PATH}" && eval "${RDO_WORKER_COMMAND}" < /dev/null)
+        EXIT_CODE=$?
+        set -e
+        EXIT_CODE_RAW="${EXIT_CODE}"
       fi
-      if [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" != "0" ]]; then
-        NOW="$(date +%s)"
-        if (( NOW - WAIT_START >= RDO_TMUX_WAIT_TIMEOUT_SECONDS )); then
-          KEEP_DISPATCH_LOCK_ON_EXIT=1
-          write_tmux_timeout_diagnostics
-          exit 5
-        fi
-      fi
-      sleep 1
-    done
-    EXIT_CODE_RAW="$(cat "${EXIT_CODE_FILE}" 2>/dev/null || true)"
-    if [[ "${RDO_TMUX_KEEP_SESSION}" != "1" ]]; then
-      tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
     fi
-    if [[ "${EXIT_CODE_RAW}" =~ ^[0-9]+$ ]]; then
-      EXIT_CODE="${EXIT_CODE_RAW}"
-    else
-      EXIT_CODE=125
+  else
+    run_tmux_worker_once
+    if [[ "${REGISTERED_BACKEND_COMMAND}" == "1" && \
+          "${REQUESTED_EXECUTION_MODE}" == "resume" && \
+          "${RDO_EXECUTION_MODE}" == "resume" && \
+          -f "${ATTEMPT_DIR}/runtime/STARTUP.json" ]]; then
+      RUNTIME_FALLBACK="$(python3 - "${ATTEMPT_DIR}/runtime/STARTUP.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+failure = payload.get("failure") if isinstance(payload, dict) else None
+print("1" if isinstance(failure, dict) and failure.get("recoverable_resume_failure") is True else "0")
+PY
+)"
+      if [[ "${RUNTIME_FALLBACK}" == "1" ]]; then
+        cp "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+          "${ATTEMPT_DIR}/runtime/RESUME_STARTUP_FAILURE.json"
+        [[ ! -f "${SUPERVISOR_RESULT}" ]] || cp "${SUPERVISOR_RESULT}" \
+          "${ATTEMPT_DIR}/runtime/RESUME_SUPERVISOR_FAILURE.json"
+        [[ ! -f "${TRANSCRIPT_PATH}" ]] || cp "${TRANSCRIPT_PATH}" \
+          "${ATTEMPT_DIR}/runtime/resume-failure-transcript.log"
+        tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+        FALLBACK_SESSION_ID=""
+        if [[ "${RDO_WORKER_BACKEND}" == "claude-code" ]]; then
+          FALLBACK_SESSION_ID="${REQUESTED_SESSION_ID}"
+        fi
+        FALLBACK_COMMAND_JSON="$(python3 "${AGENT_BACKEND_CLI}" command \
+          --backend "${RDO_WORKER_BACKEND}" \
+          --io-mode "${RDO_IO_MODE}" \
+          --permission-mode "${RDO_PERMISSION_MODE}" \
+          --cwd "${WORKTREE_PATH}" \
+          --prompt-path "${ATTEMPT_DIR}/prompt.md" \
+          --agent-name "${RDO_WORKER_AGENT_NAME}" \
+          --execution-mode start \
+          --session-id "${FALLBACK_SESSION_ID}" \
+          --backend-profile "${BACKEND_PROFILE_PATH}" \
+          --json)"
+        FALLBACK_ORIGINAL_COMMAND="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["command"])' "${FALLBACK_COMMAND_JSON}")"
+        PROMPT_TRANSPORT="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["prompt_transport"])' "${FALLBACK_COMMAND_JSON}")"
+        PROMPT_SUBMIT_KEY="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("submit_key") or "")' "${FALLBACK_COMMAND_JSON}")"
+        PROMPT_POST_PASTE_DELAY_MS="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("post_paste_delay_ms") or 0)' "${FALLBACK_COMMAND_JSON}")"
+        FALLBACK_WORKER_COMMAND="$(python3 - \
+          "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" \
+          "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${FALLBACK_ORIGINAL_COMMAND}" \
+          "${STRATEGY_ID}" "${STRATEGY_SHA256}" "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
+          "${HANDOFF_PUBLICATION_PATH}" "${TASK_DIR}" "${ATTEMPT_ID}" \
+          "${ATTEMPT_DIR}/runtime/FINALIZATION.json" <<'PY'
+import shlex
+import sys
+
+script, timeout, result, cwd, command, strategy_id, strategy_sha256, artifact_protocol_version, publication_path, task_dir, attempt_id, finalization_path = sys.argv[1:]
+print(" ".join([
+    shlex.quote(sys.executable), shlex.quote(script),
+    "--timeout-seconds", shlex.quote(timeout),
+    "--result", shlex.quote(result),
+    "--cwd", shlex.quote(cwd),
+    "--strategy-id", shlex.quote(strategy_id),
+    "--strategy-sha256", shlex.quote(strategy_sha256),
+    "--artifact-protocol-version", shlex.quote(artifact_protocol_version),
+    "--publication-path", shlex.quote(publication_path),
+    "--task-dir", shlex.quote(task_dir),
+    "--attempt-id", shlex.quote(attempt_id),
+    "--finalization-path", shlex.quote(finalization_path),
+    "--finalization-timeout-seconds", "90",
+    "--shell-command", shlex.quote(command),
+]))
+PY
+)"
+        python3 "${PROTOCOL_CLI}" record-resume-fallback \
+          --status-path "${STATUS_PATH}" \
+          --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
+          --failure-path "${ATTEMPT_DIR}/runtime/RESUME_STARTUP_FAILURE.json" \
+          --requested-session-id "${REQUESTED_SESSION_ID}" \
+          --fallback-session-id "${FALLBACK_SESSION_ID}" \
+          --reason "runtime_session_not_found" \
+          --source runtime \
+          --command "${FALLBACK_ORIGINAL_COMMAND}" \
+          --supervisor-command "${FALLBACK_WORKER_COMMAND}"
+        rm -f "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+          "${ATTEMPT_DIR}/runtime/SESSION.json" \
+          "${ATTEMPT_DIR}/runtime/human-startup-probed" \
+          "${ATTEMPT_DIR}/runtime/startup-pane.txt" \
+          "${ATTEMPT_DIR}/runtime/DISPATCH_TIMEOUT.json" \
+          "${SUPERVISOR_RESULT}"
+        : > "${TRANSCRIPT_PATH}"
+        RDO_EXECUTION_MODE="start"
+        RDO_BACKEND_SESSION_ID="${FALLBACK_SESSION_ID}"
+        RDO_WORKER_COMMAND="${FALLBACK_WORKER_COMMAND}"
+        run_tmux_worker_once
+      fi
     fi
   fi
   {
@@ -898,6 +1229,7 @@ python3 "${PROTOCOL_CLI}" validate-handoff \
   --task-dir "${TASK_DIR}" \
   --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
   --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
+  --supervisor-result "${SUPERVISOR_RESULT}" \
   --worktree "${WORKTREE_PATH}" \
   --expected-profile "${TASK_PROFILE}" \
   --expected-task-id "${TASK_ID}" \

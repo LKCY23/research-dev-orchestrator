@@ -25,6 +25,11 @@ terminates as `worker_startup_failed`. Tmux human startup records
 `tui_process_started -> prompt_submitted`, with `tui_startup_failed` when the
 best-effort submission path fails. Startup evidence is separate from handoff
 evidence and does not grant a task terminal state.
+Dispatch also maintains a dispatcher-owned recovery snapshot in
+`runtime/DISPATCH_ATTEMPT.json`. Every trusted dispatcher mutation refreshes the
+snapshot, including session capture and resume fallback, so reconciliation may
+restore the latest known metadata from a missing or corrupt mutable
+`ATTEMPT.json`, quarantine corrupt bytes, and then record the terminal outcome.
 collect_status.py validates invariants across task status, the current attempt,
 locks, events, and the version-routed artifact publication.
 No destructive overwrite; use a new run, new attempt, or revision task.
@@ -41,7 +46,19 @@ LOCK           = human-readable ownership metadata
 
 Release `.dispatch-lock` after the worker process exits and handoff validation finishes, including invalid handoff. Keep `LOCK` for audit until Codex review or triage.
 
-If `.dispatch-lock` exists while `STATUS.state` is neither `planning` nor `running`, report a protocol violation. A stale execution mutex can block future dispatch even when the task appears ready for review or triage.
+If dispatcher shutdown cannot verify that the worker process tree was
+terminated, record the deterministic result in `runtime/CLEANUP.json`, copy it
+to `ATTEMPT.json.cleanup_failure`, move the task out of its active state, and
+retain `.dispatch-lock` for explicit coordinator recovery. Surviving PIDs are an
+`irrecoverable` blocker; missing cleanup supervision evidence is an
+`environment` blocker.
+
+Except for the narrowly validated cleanup-failure state above, if
+`.dispatch-lock` exists while `STATUS.state` is neither `planning` nor
+`running`, report a protocol violation. The exception requires a blocked task,
+a terminal failed attempt, matching tmux/attempt lock metadata, and the exact
+blocker implied by `cleanup_failure`. Any other stale execution mutex can block
+future dispatch even when the task appears ready for review or triage.
 
 ## ATTEMPT.json Schema
 
@@ -68,11 +85,15 @@ If `.dispatch-lock` exists while `STATUS.state` is neither `planning` nor `runni
   "backend_session_id": "s8d21",
   "session_id": "s8d21",
   "execution_mode": "start",
+  "requested_execution_mode": "resume",
+  "requested_session_id": "s8d21",
+  "resume_fallback_reason": "session_missing",
   "resume_context_sha256": "...",
   "carried_forward_workflows": ["WF-implementation"],
   "remaining_workflows": ["WF-acceptance"],
   "permission_mode": "auto",
   "state": "completed",
+  "outcome": "completed",
   "handoff_valid": true,
   "handoff_state": "review",
   "verified_commit": null,
@@ -103,9 +124,13 @@ worker_id: stable logical worker identifier for ordinary attempts on the task
 parent_attempt_id: previous attempt ID for resume/replace lineage; null for the first attempt
 session_id: string; may be empty only if runtime cannot provide one
 execution_mode: start|resume|replace
+requested_execution_mode: originally requested start|resume|replace mode
+requested_session_id: native session requested before preflight; may be empty
+resume_fallback_reason: null unless resume deterministically fell back to a full-context start
 resume_context_sha256: digest of derived runtime/RESUME_CONTEXT.json when Full execution materializes resume context
 carried_forward_workflows/remaining_workflows: workflow ID lists compiled by dispatch; empty/absent outside Full execution
 state: created|running|completed|invalid_handoff
+outcome: null while active; startup_failed|execution_failed|timed_out_unfinalized|invalid_handoff|completed when terminal
 phase: planning|execution
 strategy_id/strategy_sha256: required for Full execution; null for planning and Direct/Delegated execution
 backend_profile_sha256: digest of the pure compiled backend profile
@@ -137,9 +162,35 @@ verified_commit: exact finalize-time Git HEAD for a completed Direct verified at
   the same publication and complete only the missing transition.
 - `invalid_handoff`: the worker exited but did not produce a legal handoff request, evidence bundle, or process result.
 
+`state` remains the compatibility lifecycle envelope. `outcome` supplies the
+precise terminal cause without adding worker/process states to the task FSM:
+
+```text
+startup_failed
+  No valid backend startup event was reached. Examples include authentication,
+  permission confirmation, missing native session, and invalid CLI arguments.
+
+execution_failed
+  Startup succeeded, but execution exited without a candidate handoff.
+
+timed_out_unfinalized
+  The supervised attempt deadline expired before a valid finalized handoff.
+
+invalid_handoff
+  Candidate publication or handoff bytes existed but failed deterministic
+  protocol validation.
+
+completed
+  Dispatch validated and applied the handoff.
+```
+
 If a tmux runner writes an empty or non-integer `exit_code` file, classify the attempt as `invalid_handoff`, set `ended_at`, leave `exit_code = null`, append `worker_exit_without_valid_status`, and release `.dispatch-lock` after diagnostics.
 
-If tmux dispatch times out before the `exit_code` file exists, do not mark the attempt ended. Leave `ATTEMPT.state = running`, `ended_at = null`, and `exit_code = null`; keep `.dispatch-lock` and require Lock Recovery Review.
+If tmux dispatch reaches its configured wait timeout before the `exit_code`
+file exists, dispatch cancels the tmux session, records
+`outcome = timed_out_unfinalized`, moves the task to `blocked`, and releases
+`.dispatch-lock` only after reconciliation succeeds. It must not return while
+leaving the task permanently `running`.
 
 Do not use attempt state to represent task success. `completed` means the attempt completed protocol handoff, not that the task is approved or merged.
 

@@ -60,6 +60,7 @@ worker_blocked
 worker_review_ready
 worker_verified
 worker_exit_without_valid_status
+dispatcher_reconciled
 dispatch_lock_removed
 coordinator_reviewed
 codex_reviewed
@@ -75,6 +76,10 @@ session_closed
 Do not record every small edit. Record events needed to reconstruct the history of requirements, design, dispatch, review, merge, experiments, blockers, and session closeout.
 
 `strategy_review_ready`, `worker_review_ready`, `worker_verified`, `worker_blocked`, and `worker_exit_without_valid_status` describe worker outcomes, but the event actor is `dispatch` because dispatch validates handoff and applies the task transition. Workers do not write terminal `STATUS.json` transitions directly.
+
+`dispatcher_reconciled` records fail-safe convergence after an abnormal
+dispatcher exit. It includes the current attempt's precise `outcome` and the
+dispatcher exit code; it must not overwrite a later coordinator-owned state.
 
 `workflow_carried_forward` is also a dispatch event. It identifies `source_attempt_id`, `source_workflow_id`, the target `workflow_id`, and `checkpoint_sha256`; it may satisfy target workflow dependencies exactly like `workflow_completed`.
 

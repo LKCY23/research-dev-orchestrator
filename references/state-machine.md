@@ -40,7 +40,12 @@ Workers must not write `STATUS.json` states. Planning workers request strategy r
 
 ## Attempt Invariants
 
-Do not add worker/process failure states to the task FSM. A worker that exits without valid handoff causes dispatch to set `ATTEMPT.state = invalid_handoff` and move the task to `blocked` with `blocker_type = needs_coordinator` for triage.
+Do not add worker/process failure states to the task FSM. A worker that exits
+without valid handoff causes dispatch to keep the compatibility envelope
+`ATTEMPT.state = invalid_handoff`, record the precise `ATTEMPT.outcome`, and
+move the task to `blocked`. Startup failures use `environment` or `needs_user`,
+timeouts use `budget`, and execution or handoff failures use
+`needs_coordinator`.
 
 `running`, `review`, and `blocked` have cross-file invariants defined in `attempt-lifecycle.md`, including `.dispatch-lock` execution mutex semantics and worker `exit_code` handoff rules.
 

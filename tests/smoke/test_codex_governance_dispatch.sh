@@ -35,6 +35,9 @@ if "--version" in sys.argv:
 if sys.argv[1:3] == ["login", "status"]:
     print("Logged in")
     raise SystemExit(0)
+if "--help" in sys.argv:
+    print("fake Codex help")
+    raise SystemExit(0)
 
 print(json.dumps({"type": "thread.started", "thread_id": "root"}), flush=True)
 for index in (1, 2):

@@ -235,6 +235,25 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
         self.assertEqual(startup["state"], "worker_startup_failed")
         self.assertEqual(startup["failure"]["code"], "early_exit")
 
+    def test_missing_session_error_is_classified_before_handoff(self):
+        _, result, _, startup = self.run_supervisor(
+            transport="arg",
+            event=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "errors": [
+                        "No conversation found with session ID: "
+                        "11111111-1111-1111-1111-111111111111"
+                    ],
+                }
+            ),
+        )
+        self.assertEqual(result.returncode, 125)
+        self.assertEqual(startup["state"], "worker_startup_failed")
+        self.assertEqual(startup["failure"]["code"], "session_not_found")
+        self.assertTrue(startup["failure"]["recoverable_resume_failure"])
+
     def test_hard_turn_budget_terminates_machine_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

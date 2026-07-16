@@ -127,6 +127,116 @@ def load_fsm() -> dict[str, Any]:
     return load_json(skill_root() / "references" / "state-machine.json")
 
 
+def cleanup_failure_contract(
+    payload: Any,
+) -> tuple[str | None, list[int], list[str]]:
+    """Return the required blocker and validation reasons for cleanup evidence."""
+
+    if payload is None:
+        return None, [], []
+    if not isinstance(payload, dict):
+        return None, [], ["ATTEMPT.cleanup_failure must be an object"]
+
+    reasons: list[str] = []
+    terminated = payload.get("terminated")
+    if not isinstance(terminated, bool):
+        reasons.append("ATTEMPT.cleanup_failure.terminated must be boolean")
+
+    raw_survivors = payload.get("surviving_pids")
+    survivors: list[int] = []
+    if not isinstance(raw_survivors, list):
+        reasons.append("ATTEMPT.cleanup_failure.surviving_pids must be a list")
+    elif any(
+        not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1
+        for pid in raw_survivors
+    ):
+        reasons.append(
+            "ATTEMPT.cleanup_failure.surviving_pids must contain process IDs greater than 1"
+        )
+    else:
+        survivors = list(raw_survivors)
+
+    if terminated is True and not survivors:
+        reasons.append("ATTEMPT.cleanup_failure does not describe a cleanup failure")
+    if terminated is False and not survivors:
+        reason = payload.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            reasons.append(
+                "unverified cleanup without survivors requires a concrete reason"
+            )
+
+    blocker_type = "irrecoverable" if survivors else "environment"
+    return blocker_type, survivors, reasons
+
+
+def retained_cleanup_lock_reasons(
+    task_dir: Path,
+    status: dict[str, Any],
+    attempt: dict[str, Any],
+    dispatch_lock: Path,
+    expected_blocker: str,
+) -> list[str]:
+    """Validate the one terminal state in which the dispatch mutex is retained."""
+
+    reasons: list[str] = []
+    attempt_id = str(status.get("current_attempt_id") or "")
+    runtime = attempt.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    if status.get("state") != "blocked":
+        reasons.append("STATUS must be blocked")
+    if attempt.get("state") != "invalid_handoff":
+        reasons.append("ATTEMPT.state must be invalid_handoff")
+    if attempt.get("outcome") not in {
+        "startup_failed",
+        "execution_failed",
+        "timed_out_unfinalized",
+        "invalid_handoff",
+    }:
+        reasons.append("ATTEMPT.outcome must be a terminal failure")
+    if runtime.get("backend") != "tmux":
+        reasons.append("ATTEMPT.runtime.backend must be tmux")
+    if status.get("blocker_type") != expected_blocker:
+        reasons.append(f"STATUS.blocker_type must be {expected_blocker}")
+    if not dispatch_lock.is_dir():
+        reasons.append(".dispatch-lock must be a directory")
+        return reasons
+
+    lock_attempt = dispatch_lock / "attempt_id"
+    if not lock_attempt.exists():
+        reasons.append(".dispatch-lock is missing attempt_id")
+    elif (
+        lock_attempt.read_text(encoding="utf-8", errors="replace").strip()
+        != attempt_id
+    ):
+        reasons.append(".dispatch-lock attempt_id does not match current attempt")
+
+    pid_path = dispatch_lock / "pid"
+    if not pid_path.exists():
+        reasons.append(".dispatch-lock is missing pid")
+    else:
+        pid_text = pid_path.read_text(encoding="utf-8", errors="replace").strip()
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            reasons.append(".dispatch-lock pid is not an integer")
+        else:
+            if pid <= 1:
+                reasons.append(".dispatch-lock pid must be greater than 1")
+
+    expected_session = runtime.get("tmux_session")
+    session_path = dispatch_lock / "tmux_session"
+    if not session_path.exists():
+        reasons.append(".dispatch-lock is missing tmux_session")
+    elif (
+        not isinstance(expected_session, str)
+        or session_path.read_text(encoding="utf-8", errors="replace").strip()
+        != expected_session
+    ):
+        reasons.append(".dispatch-lock tmux_session does not match ATTEMPT.runtime")
+    return reasons
+
+
 def validate_attempt(
     task_dir: Path,
     status: dict[str, Any],
@@ -178,6 +288,10 @@ def validate_attempt(
         runtime = {}
 
     attempt_state = attempt.get("state")
+    cleanup_blocker, _cleanup_survivors, cleanup_reasons = (
+        cleanup_failure_contract(attempt.get("cleanup_failure"))
+    )
+    violations.extend(f"{task_dir.name}: {reason}" for reason in cleanup_reasons)
     if attempt_state == "created":
         started = parse_iso(attempt.get("started_at"))
         if started:
@@ -309,7 +423,28 @@ def validate_attempt(
                     f"STATUS writes ({recovery_age:.1f}s old); replay may complete the transition"
                 )
     elif dispatch_lock.exists():
-        violations.append(f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}")
+        if cleanup_blocker is None or cleanup_reasons:
+            violations.append(
+                f"{task_dir.name}: .dispatch-lock exists while STATUS state is {state!r}"
+            )
+        else:
+            retained_reasons = retained_cleanup_lock_reasons(
+                task_dir,
+                status,
+                attempt,
+                dispatch_lock,
+                cleanup_blocker,
+            )
+            if retained_reasons:
+                violations.append(
+                    f"{task_dir.name}: retained cleanup-failure lock is invalid: "
+                    + "; ".join(retained_reasons)
+                )
+            else:
+                warnings.append(
+                    f"{task_dir.name}: .dispatch-lock is intentionally retained "
+                    "because worker process cleanup could not be verified"
+                )
     if state == "strategy_review":
         if attempt_state != "completed" or attempt.get("handoff_valid") is not True or attempt.get("handoff_state") != "strategy_review":
             violations.append(
@@ -370,8 +505,26 @@ def validate_attempt(
                 if isinstance(request, dict) and request.get("requested_state") != "blocked":
                     violations.append(f"{task_dir.name}: STATUS blocked requires HANDOFF.json requested_state=blocked")
         elif attempt_state == "invalid_handoff":
-            if status.get("blocker_type") != "needs_coordinator":
-                violations.append(f"{task_dir.name}: invalid_handoff blocked task requires blocker_type=needs_coordinator")
+            outcome = attempt.get("outcome")
+            if cleanup_blocker is not None and not cleanup_reasons:
+                expected_blockers = {cleanup_blocker}
+                if not dispatch_lock.exists():
+                    violations.append(
+                        f"{task_dir.name}: cleanup failure requires retained .dispatch-lock"
+                    )
+            else:
+                expected_blockers = {
+                    "startup_failed": {"environment", "needs_user"},
+                    "timed_out_unfinalized": {"budget"},
+                    "execution_failed": {"needs_coordinator", "environment", "budget"},
+                    "invalid_handoff": {"needs_coordinator"},
+                    None: {"needs_coordinator"},
+                }.get(outcome, {"needs_coordinator"})
+            if status.get("blocker_type") not in expected_blockers:
+                violations.append(
+                    f"{task_dir.name}: {outcome or 'legacy invalid_handoff'} blocked task "
+                    f"requires blocker_type in {sorted(expected_blockers)}"
+                )
         else:
             violations.append(f"{task_dir.name}: STATUS blocked requires completed or invalid_handoff attempt")
 
@@ -831,6 +984,17 @@ def collect(
                 f"{task_dir.name}: {warning}" for warning in resolved_artifacts.warnings
             )
 
+        attempt = None
+        current_attempt_id = status.get("current_attempt_id")
+        if isinstance(current_attempt_id, str) and current_attempt_id:
+            attempt_path = task_dir / "attempts" / current_attempt_id / "ATTEMPT.json"
+            try:
+                loaded_attempt = load_json(attempt_path)
+            except Exception:
+                loaded_attempt = None
+            if isinstance(loaded_attempt, dict):
+                attempt = loaded_attempt
+
         tasks.append(
             {
                 "task_id": status.get("task_id", task_dir.name),
@@ -843,6 +1007,19 @@ def collect(
                 "blocker_type": status.get("blocker_type"),
                 "blocking_reason": status.get("blocking_reason"),
                 "summary": status.get("summary"),
+                "current_attempt": (
+                    {
+                        "attempt_id": attempt.get("attempt_id"),
+                        "state": attempt.get("state"),
+                        "outcome": attempt.get("outcome"),
+                        "phase": attempt.get("phase"),
+                        "started_at": attempt.get("started_at"),
+                        "ended_at": attempt.get("ended_at"),
+                        "exit_code": attempt.get("exit_code"),
+                    }
+                    if isinstance(attempt, dict)
+                    else None
+                ),
                 "handoff_index": handoff_index,
                 "artifact_resolution": artifact_resolution,
                 "lock": lock_info,

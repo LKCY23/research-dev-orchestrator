@@ -24,11 +24,12 @@ status = json.load(open(task / "STATUS.json", encoding="utf-8"))
 attempt = json.load(open(task / "attempts" / status["current_attempt_id"] / "ATTEMPT.json", encoding="utf-8"))
 assert status["state"] == "blocked"
 assert status["blocker_type"] == "needs_coordinator"
-assert "invalid worker handoff" in status["blocking_reason"]
+assert "worker started but exited without a valid handoff" in status["blocking_reason"]
 assert status["state_history"][-1]["from"] == "running"
 assert status["state_history"][-1]["to"] == "blocked"
 assert status["state_history"][-1]["actor"] == "dispatch"
 assert attempt["state"] == "invalid_handoff"
+assert attempt["outcome"] == "execution_failed"
 assert attempt["exit_code"] == 1
 assert not (task / ".dispatch-lock").exists()
 PY

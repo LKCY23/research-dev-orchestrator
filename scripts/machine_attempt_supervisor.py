@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from backend_startup import classify_startup_failure
 from completion import publication_path as expected_publication_path
 from completion import validate_publication
 from protocol import utc_now
@@ -174,9 +175,8 @@ def main() -> int:
         else transcript_path.parent / "runtime"
     )
     usage = UsageSupervisor(usage_runtime, args.backend, resource_budget)
-    observed_session_id = args.existing_session_id
-    if observed_session_id and session_path is not None:
-        atomic_json(session_path, {"backend_id": args.backend, "session_id": observed_session_id})
+    requested_session_id = args.existing_session_id
+    observed_session_id = ""
     env = os.environ.copy()
     env.update(environment)
     env, supervision_token = supervision_environment(env)
@@ -223,6 +223,7 @@ def main() -> int:
     assert process.stdout is not None
     selector.register(process.stdout, selectors.EVENT_READ)
     buffer = b""
+    startup_output = bytearray()
     observed_pids = {process.pid}
     observed_pgids = {process.pid}
     termination_pids = {process.pid}
@@ -244,6 +245,9 @@ def main() -> int:
                 transcript.write(chunk)
                 transcript.flush()
                 os.write(1, chunk)
+                startup_output.extend(chunk)
+                if len(startup_output) > 65536:
+                    del startup_output[:-65536]
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
@@ -261,6 +265,16 @@ def main() -> int:
                         if session_path is not None:
                             atomic_json(session_path, {"backend_id": args.backend, "session_id": observed_session_id})
                     if evidence and startup["state"] != "worker_started":
+                        if not observed_session_id and requested_session_id:
+                            observed_session_id = requested_session_id
+                            if session_path is not None:
+                                atomic_json(
+                                    session_path,
+                                    {
+                                        "backend_id": args.backend,
+                                        "session_id": observed_session_id,
+                                    },
+                                )
                         startup["state"] = "worker_started"
                         startup["worker_started_at"] = utc_now()
                         startup["startup_evidence"] = {"decoder": args.backend, "event": evidence}
@@ -296,7 +310,16 @@ def main() -> int:
             if startup["state"] != "worker_started" and elapsed >= args.startup_timeout_seconds:
                 startup_failed = True
                 startup["state"] = "worker_startup_failed"
-                startup["failure"] = {"code": "startup_timeout", "message": "no valid backend startup event"}
+                startup["failure"] = classify_startup_failure(
+                    args.backend,
+                    startup_output.decode("utf-8", errors="replace"),
+                ) or {
+                    "code": "startup_timeout",
+                    "message": "no valid backend startup event",
+                    "category": "startup",
+                    "recoverable_resume_failure": False,
+                    "backend_id": args.backend,
+                }
                 atomic_json(startup_path, startup)
                 break
             if usage.check_clock():
@@ -367,9 +390,16 @@ def main() -> int:
             if startup["state"] != "worker_started":
                 startup_failed = True
                 startup["state"] = "worker_startup_failed"
-                startup["failure"] = {
+                startup["failure"] = classify_startup_failure(
+                    args.backend,
+                    startup_output.decode("utf-8", errors="replace"),
+                    returncode=exit_code_now,
+                ) or {
                     "code": "early_exit",
                     "message": f"worker exited before a valid startup event (exit {exit_code_now})",
+                    "category": "startup",
+                    "recoverable_resume_failure": False,
+                    "backend_id": args.backend,
                 }
                 atomic_json(startup_path, startup)
 

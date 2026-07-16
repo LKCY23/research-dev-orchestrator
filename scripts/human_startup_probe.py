@@ -6,28 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any
 
+from backend_startup import classify_human_startup
 from protocol import utc_now
 
 
-WAIT_PATTERNS = (
-    re.compile(r"do you trust", re.IGNORECASE),
-    re.compile(r"trust (?:this|the) (?:folder|workspace|directory|project)", re.IGNORECASE),
-    re.compile(r"authentication required", re.IGNORECASE),
-    re.compile(r"(?:log|sign) in to continue", re.IGNORECASE),
-    re.compile(r"press enter to continue", re.IGNORECASE),
-    re.compile(r"confirm.*dangerously", re.IGNORECASE),
-)
-
-
 def waiting_reason(pane_text: str) -> str | None:
-    for pattern in WAIT_PATTERNS:
-        match = pattern.search(pane_text)
-        if match:
-            return match.group(0)
+    assessment = classify_human_startup("", pane_text)
+    if assessment and assessment["kind"] == "waiting":
+        return str(assessment["reason"])
     return None
 
 
@@ -42,10 +31,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Probe a tmux human worker for startup gates.")
     parser.add_argument("--startup-path", required=True)
     parser.add_argument("--pane-path", required=True)
+    parser.add_argument("--backend", default="")
     args = parser.parse_args()
     pane_text = Path(args.pane_path).read_text(encoding="utf-8", errors="replace")
-    reason = waiting_reason(pane_text)
-    if reason is None:
+    assessment = classify_human_startup(args.backend, pane_text)
+    if assessment is None:
         return 1
     startup_path = Path(args.startup_path)
     try:
@@ -54,6 +44,18 @@ def main() -> int:
         payload = {"mode": "human"}
     if not isinstance(payload, dict) or payload.get("state") == "tui_startup_failed":
         return 1
+    if assessment["kind"] == "failed":
+        failure = dict(assessment["failure"])
+        payload.update(
+            state="tui_startup_failed",
+            failed_at=utc_now(),
+            failure=failure,
+            startup_evidence={"event": "pane_startup_failure"},
+        )
+        atomic_json(startup_path, payload)
+        print(failure["code"])
+        return 2
+    reason = str(assessment["reason"])
     payload.update(
         state="worker_waiting_for_user",
         waiting_since=utc_now(),

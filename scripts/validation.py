@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from protocol import (
+    ATTEMPT_OUTCOMES,
     ATTEMPT_STATES,
     ATTEMPT_EVENTS,
     BLOCKER_TYPES,
@@ -287,6 +288,9 @@ def validate_attempt_schema(
         violations.append(f"{task_name}: ATTEMPT.json task_id does not match STATUS task_id")
     if attempt.get("state") not in ATTEMPT_STATES:
         violations.append(f"{task_name}: invalid ATTEMPT.state {attempt.get('state')!r}")
+    outcome = attempt.get("outcome")
+    if outcome is not None and outcome not in ATTEMPT_OUTCOMES:
+        violations.append(f"{task_name}: invalid ATTEMPT.outcome {outcome!r}")
     if attempt.get("handoff_state") not in HANDOFF_STATES:
         violations.append(f"{task_name}: invalid ATTEMPT.handoff_state {attempt.get('handoff_state')!r}")
     if parse_iso(attempt.get("started_at")) is None:
@@ -328,6 +332,12 @@ def validate_attempt_schema(
     if attempt_state == "invalid_handoff":
         if attempt.get("handoff_valid") is not False:
             violations.append(f"{task_name}: invalid_handoff ATTEMPT requires handoff_valid=false")
+    if attempt_state in {"created", "running"} and outcome is not None:
+        violations.append(f"{task_name}: active ATTEMPT requires outcome=null")
+    if attempt_state == "completed" and outcome not in {None, "completed"}:
+        violations.append(f"{task_name}: completed ATTEMPT requires outcome=completed")
+    if attempt_state == "invalid_handoff" and outcome == "completed":
+        violations.append(f"{task_name}: invalid_handoff ATTEMPT cannot have outcome=completed")
 
     return violations
 

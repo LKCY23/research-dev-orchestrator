@@ -16,6 +16,22 @@ io mode             = machine or human interaction shape
 
 Attempts are supervision slices, not conversation boundaries. When dispatch records `execution_mode=resume`, the adapter reuses the assigned worker's native session ID: Claude Code `--resume`, Codex `exec resume`, OpenCode `run --session`, and Kimi `--session`. A first attempt uses `start`; an intentional backend/worker replacement uses `replace` and starts a new session while retaining attempt lineage.
 
+Resume is capability- and session-gated. Dispatch records both the requested
+mode and the effective mode. If a Claude or Codex session is deterministically
+missing, the same logical worker receives the complete frozen task prompt in a
+new native start rather than pretending that resume succeeded. A backend may
+retry this fallback once only when failure occurs before its recognized startup
+event.
+
+For Codex machine mode, `resume` follows all `exec` options:
+
+```text
+codex ... exec --ignore-user-config --json --cd <cwd> resume <session> <prompt>
+```
+
+Options such as `--cd` must not be placed after the `resume` subcommand unless
+the installed CLI explicitly reports support there.
+
 ## Supported Backends
 
 ```text

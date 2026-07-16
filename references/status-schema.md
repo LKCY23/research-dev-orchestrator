@@ -132,9 +132,12 @@ zero-exit, digest-valid publication and source-commit boundary, plus
 `blocker_type`, and a non-empty `blocking_reason`. A normal blocked request has
 a completed attempt, a valid attempt-local publication with
 `HANDOFF.json.requested_state = blocked`, and a concrete
-`conditional_blocker`. An invalid or missing publication instead produces
-`ATTEMPT.state = invalid_handoff`, `handoff_valid = false`, and coordinator
-triage. Dispatch, never the worker, writes the final task transition.
+`conditional_blocker`. An invalid or missing publication instead produces the
+compatibility envelope `ATTEMPT.state = invalid_handoff`,
+`handoff_valid = false`, plus a precise `ATTEMPT.outcome`. Startup failures may
+require `environment` or `needs_user`, timeouts use `budget`, and execution or
+handoff failures require coordinator triage. Dispatch, never the worker, writes
+the final task transition.
 Monitoring reports candidate bytes from this invalid-handoff case as
 `publication_state = rejected`; the bundle remains null and strict consumers
 must not treat those bytes as published evidence.

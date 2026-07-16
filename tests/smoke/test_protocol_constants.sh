@@ -16,7 +16,12 @@ import protocol  # noqa: E402
 constants = (root / "references" / "protocol-constants.md").read_text(encoding="utf-8")
 fsm = json.loads((root / "references" / "state-machine.json").read_text(encoding="utf-8"))
 
-for required in sorted(protocol.BLOCKER_TYPES | protocol.RUNTIME_BACKENDS | protocol.ATTEMPT_STATES):
+for required in sorted(
+    protocol.BLOCKER_TYPES
+    | protocol.RUNTIME_BACKENDS
+    | protocol.ATTEMPT_STATES
+    | protocol.ATTEMPT_OUTCOMES
+):
     assert required in constants, required
 
 doc_task_states = set(
