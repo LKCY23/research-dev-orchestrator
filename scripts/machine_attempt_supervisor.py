@@ -50,6 +50,30 @@ def startup_event(backend: str, line: bytes) -> str | None:
     return None
 
 
+def worker_progress_event(backend: str, line: bytes) -> str | None:
+    """Return evidence that the backend progressed beyond session allocation."""
+
+    try:
+        payload = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    event_type = payload.get("type")
+    if backend == "codex":
+        if event_type in {"turn.completed", "turn_completed"}:
+            return str(event_type)
+        if event_type in {"item.started", "item.completed"}:
+            item = payload.get("item")
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if isinstance(item_type, str) and item_type and item_type != "error":
+                return f"{event_type}:{item_type}"
+        return None
+    if backend == "claude-code" and event_type == "assistant":
+        return "assistant"
+    return startup_event(backend, line)
+
+
 def session_id_from_event(backend: str, line: bytes) -> str:
     try:
         payload = json.loads(line)
@@ -203,6 +227,8 @@ def main() -> int:
         "worker_started_at": None,
         "startup_timeout_seconds": args.startup_timeout_seconds,
         "startup_evidence": None,
+        "worker_progress_at": None,
+        "worker_progress_evidence": None,
         "failure": None,
     }
     atomic_json(startup_path, startup)
@@ -217,6 +243,11 @@ def main() -> int:
         startup["state"] = "worker_started"
         startup["worker_started_at"] = utc_now()
         startup["startup_evidence"] = {"decoder": "custom-process", "event": "process_started"}
+        startup["worker_progress_at"] = startup["worker_started_at"]
+        startup["worker_progress_evidence"] = {
+            "decoder": "custom-process",
+            "event": "process_started",
+        }
         atomic_json(startup_path, startup)
 
     selector = selectors.DefaultSelector()
@@ -231,6 +262,7 @@ def main() -> int:
     timed_out = False
     startup_failed = False
     budget_exceeded = False
+    worker_progress_observed = args.custom_command
     publication_requested = False
     publication_deadline: float | None = None
     last_state_write = 0.0
@@ -259,6 +291,7 @@ def main() -> int:
                         budget_exceeded = True
                         break
                     evidence = startup_event(args.backend, line)
+                    progress = worker_progress_event(args.backend, line)
                     candidate_session_id = session_id_from_event(args.backend, line)
                     if candidate_session_id and not observed_session_id:
                         observed_session_id = candidate_session_id
@@ -278,6 +311,14 @@ def main() -> int:
                         startup["state"] = "worker_started"
                         startup["worker_started_at"] = utc_now()
                         startup["startup_evidence"] = {"decoder": args.backend, "event": evidence}
+                        atomic_json(startup_path, startup)
+                    if progress and not worker_progress_observed:
+                        worker_progress_observed = True
+                        startup["worker_progress_at"] = utc_now()
+                        startup["worker_progress_evidence"] = {
+                            "decoder": args.backend,
+                            "event": progress,
+                        }
                         atomic_json(startup_path, startup)
                 if budget_exceeded:
                     break
@@ -313,6 +354,7 @@ def main() -> int:
                 startup["failure"] = classify_startup_failure(
                     args.backend,
                     startup_output.decode("utf-8", errors="replace"),
+                    include_model_unavailable=args.backend == "codex",
                 ) or {
                     "code": "startup_timeout",
                     "message": "no valid backend startup event",
@@ -382,25 +424,44 @@ def main() -> int:
             )
             if buffer:
                 evidence = startup_event(args.backend, buffer)
+                progress = worker_progress_event(args.backend, buffer)
                 if evidence and startup["state"] != "worker_started":
                     startup["state"] = "worker_started"
                     startup["worker_started_at"] = utc_now()
                     startup["startup_evidence"] = {"decoder": args.backend, "event": evidence}
                     atomic_json(startup_path, startup)
-            if startup["state"] != "worker_started":
+                if progress and not worker_progress_observed:
+                    worker_progress_observed = True
+                    startup["worker_progress_at"] = utc_now()
+                    startup["worker_progress_evidence"] = {
+                        "decoder": args.backend,
+                        "event": progress,
+                    }
+                    atomic_json(startup_path, startup)
+            classified_failure = classify_startup_failure(
+                args.backend,
+                startup_output.decode("utf-8", errors="replace"),
+                returncode=exit_code_now,
+                include_model_unavailable=args.backend == "codex",
+            )
+            failed_before_codex_progress = bool(
+                args.backend == "codex"
+                and exit_code_now != 0
+                and not worker_progress_observed
+                and classified_failure is not None
+            )
+            if startup["state"] != "worker_started" or failed_before_codex_progress:
                 startup_failed = True
                 startup["state"] = "worker_startup_failed"
-                startup["failure"] = classify_startup_failure(
-                    args.backend,
-                    startup_output.decode("utf-8", errors="replace"),
-                    returncode=exit_code_now,
-                ) or {
+                startup["failure"] = classified_failure or {
                     "code": "early_exit",
                     "message": f"worker exited before a valid startup event (exit {exit_code_now})",
                     "category": "startup",
                     "recoverable_resume_failure": False,
                     "backend_id": args.backend,
                 }
+                if failed_before_codex_progress:
+                    startup["failure_detected_after_start_event"] = True
                 atomic_json(startup_path, startup)
 
     exit_code = (

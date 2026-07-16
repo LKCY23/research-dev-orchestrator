@@ -34,6 +34,14 @@ timeout terminates the process group, records `worker_startup_failed`, and is
 classified as an environment blocker. This deadline is independent of the
 larger attempt wall timeout.
 
+For Codex, `thread.started` proves native session allocation but does not prove
+that a model request was accepted. The supervisor separately records
+`worker_progress_evidence` on the first non-error model/tool item. A known
+provider, model, authentication, resume, or invocation rejection before that
+progress may therefore rewrite the startup record to `worker_startup_failed`
+even when a thread ID was already issued. This prevents backend configuration
+failures from being reported as task implementation failures.
+
 ## Enforcement Layers
 
 - Attempt: total wall time, termination, exit result, and no surviving descendants.

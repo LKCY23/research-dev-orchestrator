@@ -137,8 +137,11 @@ requested resume, keeps `worker_id` and attempt lineage, and performs one
 explicit full-context start fallback. Claude may reuse the requested UUID with
 `--session-id`; Codex confirms the new thread from `thread.started`. An
 `unknown` session may be attempted once; a pre-start `session_not_found`
-result permits one runtime fallback. No fallback is allowed after a valid
-worker-start event.
+result permits one runtime fallback. For Codex, `thread.started` alone is
+session-allocation evidence, not model progress; a deterministic
+`session_not_found` rejection before the first non-error model/tool item may
+still use that one fallback. No fallback is allowed after
+`worker_progress_evidence` exists.
 
 For `plain + machine`, the adapter returns structured `argv`, environment, and
 one prompt transport. With `arg`, the prompt appears only in `argv` and stdin is
@@ -146,6 +149,10 @@ one prompt transport. With `arg`, the prompt appears only in `argv` and stdin is
 first recognized machine event advances `runtime/STARTUP.json` from
 `prompt_dispatched` to `worker_started`. Timeout or early exit becomes
 `worker_startup_failed` and blocks the task with `blocker_type=environment`.
+Codex also records the first non-error model/tool item separately. A recognized
+provider/model rejection after `thread.started` but before that progress is a
+startup failure (`model_unavailable` for model access/support errors), not an
+execution failure.
 
 For `tmux + human`, startup records TUI process creation and prompt submission.
 These are transport observations, not proof that the model acted on the prompt.

@@ -11,7 +11,11 @@ from pathlib import Path
 
 from artifact_bundle import publish_bundle
 from completion import write_completion
-from machine_attempt_supervisor import session_id_from_event, startup_event
+from machine_attempt_supervisor import (
+    session_id_from_event,
+    startup_event,
+    worker_progress_event,
+)
 from supervisor import pid_alive
 from task_contract import TASK_INPUT_FILENAMES, build_task_inputs_payload
 
@@ -156,6 +160,23 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
         self.assertIsNone(startup_event("claude-code", b'{"type":"assistant"}'))
         self.assertIsNone(startup_event("codex", b"not-json"))
 
+    def test_codex_progress_requires_model_or_tool_output(self):
+        self.assertIsNone(worker_progress_event("codex", b'{"type":"thread.started"}'))
+        self.assertIsNone(worker_progress_event("codex", b'{"type":"turn.started"}'))
+        self.assertIsNone(
+            worker_progress_event(
+                "codex",
+                b'{"type":"item.completed","item":{"type":"error"}}',
+            )
+        )
+        self.assertEqual(
+            "item.completed:reasoning",
+            worker_progress_event(
+                "codex",
+                b'{"type":"item.completed","item":{"type":"reasoning"}}',
+            ),
+        )
+
     def run_supervisor(self, *, transport: str, event: str | None):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
@@ -253,6 +274,159 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
         self.assertEqual(startup["state"], "worker_startup_failed")
         self.assertEqual(startup["failure"]["code"], "session_not_found")
         self.assertTrue(startup["failure"]["recoverable_resume_failure"])
+
+    def test_codex_model_rejection_after_thread_start_is_startup_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("work\n", encoding="utf-8")
+            worker = root / "worker.py"
+            worker.write_text(
+                textwrap.dedent(
+                    """
+                    import json
+
+                    print(json.dumps({
+                        "type": "thread.started",
+                        "thread_id": "11111111-1111-1111-1111-111111111111",
+                    }), flush=True)
+                    print(json.dumps({"type": "turn.started"}), flush=True)
+                    print(json.dumps({
+                        "type": "error",
+                        "message": (
+                            "The 'gpt-5.6-lune' model is not supported when "
+                            "using Codex with a ChatGPT account."
+                        ),
+                    }), flush=True)
+                    print(json.dumps({
+                        "type": "turn.failed",
+                        "error": {"message": "model unavailable"},
+                    }), flush=True)
+                    raise SystemExit(1)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                str(SUPERVISOR),
+                "--backend",
+                "codex",
+                "--argv-json",
+                json.dumps([sys.executable, str(worker)]),
+                "--cwd",
+                str(root),
+                "--prompt-path",
+                str(root / "prompt.md"),
+                "--prompt-transport",
+                "arg",
+                "--startup-timeout-seconds",
+                "1",
+                "--timeout-seconds",
+                "2",
+                "--startup-result",
+                str(root / "STARTUP.json"),
+                "--supervisor-result",
+                str(root / "result.json"),
+                "--supervisor-state",
+                str(root / "state.json"),
+                "--transcript",
+                str(root / "transcript.log"),
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(125, result.returncode, result.stderr)
+            startup = json.loads((root / "STARTUP.json").read_text())
+            supervisor = json.loads((root / "result.json").read_text())
+            self.assertEqual("worker_startup_failed", startup["state"])
+            self.assertEqual("model_unavailable", startup["failure"]["code"])
+            self.assertTrue(startup["failure_detected_after_start_event"])
+            self.assertEqual(
+                "thread.started",
+                startup["startup_evidence"]["event"],
+            )
+            self.assertIsNone(startup["worker_progress_evidence"])
+            self.assertTrue(supervisor["startup_failed"])
+
+    def test_codex_model_phrase_after_real_progress_is_execution_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("work\n", encoding="utf-8")
+            worker = root / "worker.py"
+            worker.write_text(
+                textwrap.dedent(
+                    """
+                    import json
+
+                    print(json.dumps({
+                        "type": "thread.started",
+                        "thread_id": "11111111-1111-1111-1111-111111111111",
+                    }), flush=True)
+                    print(json.dumps({"type": "turn.started"}), flush=True)
+                    print(json.dumps({
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "The fixture says model example is not supported.",
+                        },
+                    }), flush=True)
+                    print(json.dumps({
+                        "type": "error",
+                        "message": (
+                            "The 'example' model is not supported when using "
+                            "Codex with a ChatGPT account."
+                        ),
+                    }), flush=True)
+                    raise SystemExit(1)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            command = [
+                sys.executable,
+                str(SUPERVISOR),
+                "--backend",
+                "codex",
+                "--argv-json",
+                json.dumps([sys.executable, str(worker)]),
+                "--cwd",
+                str(root),
+                "--prompt-path",
+                str(root / "prompt.md"),
+                "--prompt-transport",
+                "arg",
+                "--startup-timeout-seconds",
+                "1",
+                "--timeout-seconds",
+                "2",
+                "--startup-result",
+                str(root / "STARTUP.json"),
+                "--supervisor-result",
+                str(root / "result.json"),
+                "--supervisor-state",
+                str(root / "state.json"),
+                "--transcript",
+                str(root / "transcript.log"),
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(1, result.returncode, result.stderr)
+            startup = json.loads((root / "STARTUP.json").read_text())
+            supervisor = json.loads((root / "result.json").read_text())
+            self.assertEqual("worker_started", startup["state"])
+            self.assertEqual(
+                "item.completed:agent_message",
+                startup["worker_progress_evidence"]["event"],
+            )
+            self.assertIsNone(startup["failure"])
+            self.assertFalse(supervisor["startup_failed"])
 
     def test_hard_turn_budget_terminates_machine_worker(self):
         with tempfile.TemporaryDirectory() as temporary:

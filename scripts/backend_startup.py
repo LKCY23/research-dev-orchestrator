@@ -40,6 +40,22 @@ _INVALID_CLI = (
     re.compile(r"\bunknown (?:option|argument)\b", re.IGNORECASE),
     re.compile(r"\binvalid value\b.{0,80}--[a-z0-9-]+", re.IGNORECASE | re.DOTALL),
 )
+_MODEL_UNAVAILABLE = (
+    re.compile(
+        r"\bthe ['\"]?[^'\"\r\n]+['\"]? model is not supported "
+        r"when using codex with a chatgpt account\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bmodel ['\"]?[^'\"\r\n]+['\"]? (?:is )?not supported\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bmodel ['\"]?[^'\"\r\n]+['\"]? does not exist or you do not have access\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bmodel_not_found\b", re.IGNORECASE),
+)
 _WAITING = (
     re.compile(r"\bdo you trust\b", re.IGNORECASE),
     re.compile(
@@ -63,6 +79,7 @@ def classify_startup_failure(
     text: str,
     *,
     returncode: int | None = None,
+    include_model_unavailable: bool = False,
 ) -> dict[str, Any] | None:
     """Classify bounded startup output without invoking a model."""
 
@@ -103,6 +120,16 @@ def classify_startup_failure(
             "recoverable_resume_failure": False,
             "backend_id": backend_id,
         }
+    if include_model_unavailable:
+        reason = _match(_MODEL_UNAVAILABLE, bounded)
+        if reason:
+            return {
+                "code": "model_unavailable",
+                "message": reason,
+                "category": "configuration",
+                "recoverable_resume_failure": False,
+                "backend_id": backend_id,
+            }
     if returncode is not None and returncode != 0:
         return None
     return None

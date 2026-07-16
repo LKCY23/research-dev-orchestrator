@@ -39,6 +39,14 @@ class HumanStartupProbeTests(unittest.TestCase):
     def test_normal_tui_output_is_not_waiting(self):
         self.assertIsNone(waiting_reason("Claude Code\n> working on task"))
 
+    def test_human_output_does_not_treat_model_phrase_as_startup_failure(self):
+        self.assertIsNone(
+            classify_human_startup(
+                "codex",
+                "The diagnostic says model example is not supported in this fixture.",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
