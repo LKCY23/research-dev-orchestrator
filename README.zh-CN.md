@@ -499,7 +499,7 @@ Smoke tests 使用 fake workers。它们验证 protocol 和 orchestration 行为
 - Python scripts compile。
 - Bash scripts parse。
 - Skill metadata valid。
-- Protocol smoke tests pass。
+- Python unit tests 与 protocol smoke tests 通过。
 - `git diff --check` pass。
 
 本地等价检查：
@@ -507,12 +507,14 @@ Smoke tests 使用 fake workers。它们验证 protocol 和 orchestration 行为
 ```bash
 python3 .github/ci/quick_validate_skill.py .
 python3 -m py_compile scripts/*.py .github/ci/quick_validate_skill.py
-bash -n scripts/dispatch_claude.sh scripts/dispatch_agent.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
-RDO_KEEP_SMOKE_REPOS=0 scripts/run_smoke_tests.sh
+bash -n scripts/*.sh tests/smoke/*.sh
+RDO_KEEP_SMOKE_REPOS=0 scripts/run_all_tests.sh
 git diff --check
 ```
 
-本地调试时，可以去掉 `RDO_KEEP_SMOKE_REPOS=0` 来保留临时 smoke-test repositories。
+只需要一类测试时，分别使用 `scripts/run_unit_tests.sh` 或
+`scripts/run_smoke_tests.sh`。本地调试 smoke tests 时，可以去掉
+`RDO_KEEP_SMOKE_REPOS=0` 来保留临时 repositories。
 
 ## Repository Layout
 

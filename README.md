@@ -563,7 +563,7 @@ The smoke tests use fake workers. They validate the protocol and orchestration b
 - Python scripts compile.
 - Bash scripts parse.
 - Skill metadata is valid.
-- Protocol smoke tests pass.
+- Python unit tests and protocol smoke tests pass.
 - `git diff --check` passes.
 
 Local CI equivalent:
@@ -571,12 +571,14 @@ Local CI equivalent:
 ```bash
 python3 .github/ci/quick_validate_skill.py .
 python3 -m py_compile scripts/*.py .github/ci/quick_validate_skill.py
-bash -n scripts/dispatch_claude.sh scripts/dispatch_agent.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
-RDO_KEEP_SMOKE_REPOS=0 scripts/run_smoke_tests.sh
+bash -n scripts/*.sh tests/smoke/*.sh
+RDO_KEEP_SMOKE_REPOS=0 scripts/run_all_tests.sh
 git diff --check
 ```
 
-For local debugging, omit `RDO_KEEP_SMOKE_REPOS=0` to keep temporary smoke-test repositories.
+Use `scripts/run_unit_tests.sh` or `scripts/run_smoke_tests.sh` when only one
+suite is relevant. For local smoke debugging, omit `RDO_KEEP_SMOKE_REPOS=0` to
+keep temporary repositories.
 
 ## Repository Layout
 

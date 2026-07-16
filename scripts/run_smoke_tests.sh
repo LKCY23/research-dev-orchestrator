@@ -45,7 +45,10 @@ if [[ "${pattern}" == */* ]]; then
 fi
 
 shopt -s nullglob
+saved_ifs="${IFS}"
+IFS=
 test_scripts=("${TEST_DIR}"/${pattern})
+IFS="${saved_ifs}"
 shopt -u nullglob
 if [[ "${#test_scripts[@]}" -eq 0 ]]; then
   echo "smoke selector matched no tests: ${pattern}" >&2

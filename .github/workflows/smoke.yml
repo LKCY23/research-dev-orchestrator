@@ -40,11 +40,15 @@ jobs:
 
       - name: Bash syntax
         run: |
-          bash -n scripts/dispatch_claude.sh scripts/dispatch_agent.sh scripts/run_smoke_tests.sh tests/smoke/*.sh
+          bash -n scripts/*.sh tests/smoke/*.sh
 
       - name: Skill validation
         run: |
           python3 .github/ci/quick_validate_skill.py .
+
+      - name: Unit tests
+        run: |
+          scripts/run_unit_tests.sh
 
       - name: Smoke tests
         env:

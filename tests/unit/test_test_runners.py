@@ -73,14 +73,16 @@ class FixtureTest(unittest.TestCase):
         *,
         exit_code: int = 0,
         noise_lines: int = 1,
+        noise_width: int = 0,
     ) -> None:
         body = [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
             f"printf '%s\\n' '{marker}' >> \"${{RDO_RUNNER_CALL_LOG}}\"",
         ]
+        filler = "X" * noise_width
         body.extend(
-            f"echo '{marker.upper()}_NOISE_{index:02d}'"
+            f"echo '{filler}{marker.upper()}_NOISE_{index:02d}'"
             for index in range(1, noise_lines + 1)
         )
         body.append(f"exit {exit_code}")
@@ -98,6 +100,7 @@ class FixtureTest(unittest.TestCase):
                 "RDO_RUNNER_CALL_LOG": str(self.call_log),
                 "RDO_TEST_LOG_DIR": str(log_dir),
                 "RDO_TEST_TAIL_LINES": "5",
+                "RDO_TEST_TAIL_BYTES": "256",
             }
         )
         result = subprocess.run(
@@ -173,6 +176,14 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(0, smoke_pattern.returncode, smoke_pattern.stderr)
         self.assertEqual(["smoke-two"], self.calls())
 
+        self.clear_calls()
+        self.write_smoke("test with space.sh", "smoke-space")
+        smoke_space, _ = self.run_runner(
+            "run_smoke_tests.sh", "--match", "test with space.sh"
+        )
+        self.assertEqual(0, smoke_space.returncode, smoke_space.stderr)
+        self.assertEqual(["smoke-space"], self.calls())
+
     def test_zero_match_is_an_explicit_failure(self) -> None:
         unit, _ = self.run_runner("run_unit_tests.sh", "--pattern", "missing*.py")
         smoke, _ = self.run_runner("run_smoke_tests.sh", "--match", "missing*.sh")
@@ -214,6 +225,7 @@ class FixtureTest(unittest.TestCase):
             "smoke-fail",
             exit_code=7,
             noise_lines=20,
+            noise_width=2048,
         )
 
         result, log_dir = self.run_runner(
@@ -224,6 +236,7 @@ class FixtureTest(unittest.TestCase):
         self.assertNotIn("SMOKE-FAIL_NOISE_01", result.stderr)
         self.assertIn("SMOKE-FAIL_NOISE_20", result.stderr)
         self.assertLessEqual(len(result.stderr.splitlines()), 8)
+        self.assertLessEqual(len(result.stderr.encode("utf-8")), 768)
         full_log = (log_dir / "smoke-test_fail.sh.log").read_text(encoding="utf-8")
         self.assertIn("SMOKE-FAIL_NOISE_01", full_log)
         self.assertIn("SMOKE-FAIL_NOISE_20", full_log)

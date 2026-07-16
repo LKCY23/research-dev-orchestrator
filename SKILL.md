@@ -163,7 +163,9 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-
 ```
 
 The unit and smoke commands run independently and capture verbose output in
-temporary logs. Use `run_all_tests.sh` only when both suites are required.
+temporary logs. Failure diagnostics default to the last 80 lines and at most
+16 KiB; override those caps with `RDO_TEST_TAIL_LINES` and
+`RDO_TEST_TAIL_BYTES`. Use `run_all_tests.sh` only when both suites are required.
 
 ## Coordinator Intent Surface
 
