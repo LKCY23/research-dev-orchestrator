@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "L02-context-needle",
+  "title": "Large-context read discipline",
+  "description": "A localized defect with one relevant normative section in a document larger than the bounded-read threshold; reading behavior is measured rather than correctness-gated.",
+  "fixture": "fixture/base",
+  "setup_patch": "cases/L02-context-needle/setup.patch",
+  "profiles": ["direct", "delegated"],
+  "task_id": "T902",
+  "goal": "Restore documented lease duration resolution for non-default queue configurations",
+  "task_dir": "cases/L02-context-needle/task",
+  "verifier": {
+    "argv": [
+      "python3",
+      "-B",
+      "cases/L02-context-needle/verify.py",
+      "{worktree}"
+    ],
+    "timeout_seconds": 30
+  },
+  "worker_timeout_seconds": 240,
+  "expected_changed_paths": ["src/miniqueue/queue.py"],
+  "expected_initial_verifier_exit": 1
+}

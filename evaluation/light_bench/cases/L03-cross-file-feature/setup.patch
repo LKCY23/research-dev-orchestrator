@@ -1,0 +1,46 @@
+diff --git a/tests/test_cancellation.py b/tests/test_cancellation.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_cancellation.py
+@@ -0,0 +1,41 @@
++from __future__ import annotations
++
++import unittest
++
++from _support import SRC  # noqa: F401
++from miniqueue import JobState, ManualClock, Queue
++
++
++class CancellationTests(unittest.TestCase):
++    def test_cancel_queued_job_is_terminal_and_not_leased(self) -> None:
++        clock = ManualClock(50)
++        queue = Queue(clock=clock)
++        queue.enqueue({"kind": "work"}, job_id="job")
++
++        cancelled = queue.cancel("job", reason="not needed")
++
++        self.assertEqual(JobState.CANCELLED, cancelled.state)
++        self.assertTrue(cancelled.terminal)
++        self.assertEqual("not needed", cancelled.last_error)
++        self.assertEqual(50, cancelled.completed_at)
++        self.assertEqual(0, cancelled.attempts)
++        self.assertIsNone(queue.lease_next("worker"))
++
++    def test_cancel_without_reason_uses_stable_text(self) -> None:
++        queue = Queue(clock=ManualClock(4))
++        queue.enqueue({"kind": "work"}, job_id="job")
++        self.assertEqual("cancelled", queue.cancel("job").last_error)
++
++    def test_stats_count_cancelled_separately(self) -> None:
++        queue = Queue(clock=ManualClock())
++        queue.enqueue({"kind": "work"}, job_id="cancel-me")
++        queue.enqueue({"kind": "work"}, job_id="keep-me")
++        queue.cancel("cancel-me")
++        stats = queue.stats()
++        self.assertEqual(1, stats.cancelled)
++        self.assertEqual(1, stats.queued)
++        self.assertEqual(2, stats.total)
++
++
++if __name__ == "__main__":
++    unittest.main()

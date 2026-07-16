@@ -1,0 +1,12 @@
+diff --git a/src/miniqueue/retry.py b/src/miniqueue/retry.py
+--- a/src/miniqueue/retry.py
++++ b/src/miniqueue/retry.py
+@@ -49,7 +49,7 @@ class RetryPolicy:
+ 
+         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+             raise InvalidJobError("attempt must be a positive integer")
+-        raw = self.base_delay * (self.multiplier ** (attempt - 1))
++        raw = self.base_delay * (self.multiplier ** attempt)
+         capped = min(raw, self.max_delay)
+         if self.spread == 0 or capped == 0:
+             return float(capped)

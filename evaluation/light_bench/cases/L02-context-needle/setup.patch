@@ -1,0 +1,12 @@
+diff --git a/src/miniqueue/queue.py b/src/miniqueue/queue.py
+--- a/src/miniqueue/queue.py
++++ b/src/miniqueue/queue.py
+@@ -210,7 +210,7 @@ class Queue:
+ 
+     def _resolve_lease_seconds(self, requested: float | None) -> float:
+         if requested is None:
+-            return float(self.config.default_lease_seconds)
++            return 30.0
+         if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+             raise InvalidJobError("ttl_seconds must be numeric")
+         if requested <= 0:

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "L01-located-fix",
+  "title": "Located retry off-by-one fix",
+  "description": "A one-line, path-located retry regression used to measure fixed orchestration overhead.",
+  "fixture": "fixture/base",
+  "setup_patch": "cases/L01-located-fix/setup.patch",
+  "profiles": ["direct", "delegated"],
+  "task_id": "T901",
+  "goal": "Restore the one-based retry delay contract",
+  "task_dir": "cases/L01-located-fix/task",
+  "verifier": {
+    "argv": [
+      "python3",
+      "-B",
+      "cases/L01-located-fix/verify.py",
+      "{worktree}"
+    ],
+    "timeout_seconds": 30
+  },
+  "worker_timeout_seconds": 180,
+  "expected_changed_paths": ["src/miniqueue/retry.py"],
+  "expected_initial_verifier_exit": 1
+}

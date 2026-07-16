@@ -1,0 +1,24 @@
+{
+  "smoke-live": [
+    {
+      "case": "L01-located-fix",
+      "profiles": ["direct"]
+    }
+  ],
+  "context": [
+    {
+      "case": "L02-context-needle",
+      "profiles": ["direct", "delegated"]
+    }
+  ],
+  "profiles": [
+    {
+      "case": "L01-located-fix",
+      "profiles": ["direct", "delegated"]
+    },
+    {
+      "case": "L03-cross-file-feature",
+      "profiles": ["direct", "delegated", "full"]
+    }
+  ]
+}

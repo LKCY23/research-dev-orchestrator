@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "strategy_required": false,
+  "attempt_wall_seconds": 420,
+  "max_workflows": 5,
+  "max_workflow_instances": 8,
+  "max_parallel_workflows": 2,
+  "max_subagents": 4,
+  "max_parallel_subagents": 2,
+  "default_command_seconds": 45,
+  "max_enumerated_cases": 500,
+  "allow_unbounded_search": false,
+  "allowed_paths": ["src/miniqueue/model.py", "src/miniqueue/queue.py"],
+  "read_paths": ["src", "tests", "docs/INDEX.md", "docs/DESIGN.md"],
+  "forbidden_paths": [],
+  "context_sources": ["docs/DESIGN.md"]
+}

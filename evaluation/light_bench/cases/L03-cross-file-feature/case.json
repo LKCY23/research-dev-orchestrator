@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "L03-cross-file-feature",
+  "title": "Cross-file queued-job cancellation",
+  "description": "A bounded feature spanning lifecycle validation, persistence, queue mutation, and statistics.",
+  "fixture": "fixture/base",
+  "setup_patch": "cases/L03-cross-file-feature/setup.patch",
+  "profiles": ["direct", "delegated", "full"],
+  "task_id": "T903",
+  "goal": "Add durable queued-job cancellation across the MiniQueue model and queue",
+  "task_dir": "cases/L03-cross-file-feature/task",
+  "profile_policy_overrides": {
+    "full": {
+      "strategy_required": true
+    }
+  },
+  "verifier": {
+    "argv": [
+      "python3",
+      "-B",
+      "cases/L03-cross-file-feature/verify.py",
+      "{worktree}"
+    ],
+    "timeout_seconds": 30
+  },
+  "worker_timeout_seconds": 420,
+  "expected_changed_paths": [
+    "src/miniqueue/model.py",
+    "src/miniqueue/queue.py"
+  ],
+  "expected_initial_verifier_exit": 1
+}
