@@ -157,8 +157,13 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/render_dashboard.py" --run-id <r
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/config_cli.py" validate
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/remove_dispatch_lock.py" --run-id <run-id> --task-id <task-id> --reason "<approved reason>" --confirmed
 python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/close_session.py" --run-id <run-id> --summary "<session summary>" --changed "<change>" --next-action "<next>"
-"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/run_smoke_tests.sh"
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/run_unit_tests.sh" [--pattern 'test_*.py']
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/run_smoke_tests.sh" [--match 'test_*.sh']
+"$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/run_all_tests.sh"
 ```
+
+The unit and smoke commands run independently and capture verbose output in
+temporary logs. Use `run_all_tests.sh` only when both suites are required.
 
 ## Coordinator Intent Surface
 
