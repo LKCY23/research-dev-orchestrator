@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from typing import Any
+
+from protocol import utc_now
 
 
 LARGE_MARKDOWN_BYTES = 16 * 1024
 SECTION_MAX_BYTES = 16 * 1024
+CONTEXT_ACCESS_LOG = "CONTEXT_ACCESS.ndjson"
 
 
 def _resolve_under(root: Path, value: str) -> Path:
@@ -118,6 +123,82 @@ def normalize_tool_input(backend: str, tool_name: str, tool_input: dict[str, Any
             "limit": tool_input.get("limit"),
         }
     return operation, dict(tool_input)
+
+
+def _access_path_metadata(
+    policy: dict[str, Any], raw_path: Any
+) -> tuple[str | None, int | None]:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None, None
+    worktree = Path(policy["worktree"]).resolve()
+    source = _resolve_under(worktree, raw_path)
+    display = (
+        source.relative_to(worktree).as_posix() or "."
+        if _contains(worktree, source)
+        else "outside_worktree"
+    )
+    source_size: int | None = None
+    if _contains(worktree, source) and source.is_file():
+        try:
+            source_size = source.stat().st_size
+        except OSError:
+            # Telemetry must not change the policy decision when a file races
+            # with the hook between classification and metadata collection.
+            source_size = None
+    return display, source_size
+
+
+def record_context_access(
+    *,
+    runtime: Path,
+    policy: dict[str, Any],
+    backend: str,
+    operation: str,
+    tool_input: dict[str, Any],
+    decision: str,
+    reason: str,
+    coverage: str,
+    scope: str | None = None,
+    bounded: bool | None = None,
+) -> None:
+    """Append one content-free, normalized read-policy decision.
+
+    O_APPEND plus a single os.write keeps concurrent hook processes from
+    racing on a shared file offset. Records describe requests and decisions,
+    not proof that the backend subsequently completed the read.
+    """
+    raw_path = tool_input.get("file_path") or tool_input.get("path")
+    display_path, source_size = _access_path_metadata(policy, raw_path)
+    offset = tool_input.get("offset")
+    limit = tool_input.get("limit")
+    if bounded is None:
+        bounded = operation in {"Grep", "Glob"} or offset is not None or limit is not None
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "at": utc_now(),
+        "backend": backend,
+        "event": "context_access",
+        "operation": operation,
+        "bounded": bool(bounded),
+        "offset": offset,
+        "limit": limit,
+        "decision": decision,
+        "reason": reason,
+        "source_size_bytes": source_size,
+        "coverage": coverage,
+    }
+    if display_path is not None:
+        record["path"] = display_path
+    else:
+        record["scope"] = scope or ("." if operation in {"Grep", "Glob"} else "unspecified")
+    encoded = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    descriptor = os.open(runtime / CONTEXT_ACCESS_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        written = os.write(descriptor, encoded)
+        if written != len(encoded):
+            raise OSError(f"short context access log write: {written}/{len(encoded)} bytes")
+    finally:
+        os.close(descriptor)
 
 
 def evaluate_read(policy: dict[str, Any], tool_input: dict[str, Any], tool_name: str = "Read") -> str | None:

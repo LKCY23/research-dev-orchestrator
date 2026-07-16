@@ -358,17 +358,21 @@ def compile_backend_profile(
         or (backend_id == "codex" and codex_stream_required),
     })
     if backend_id == "claude-code":
-        context_adapter = {"id": "claude-pretooluse", "version": 1,
-                           "enforcement_level": "tool_blocking", "enforced_tools": ["Read", "Grep", "Glob"]}
+        context_adapter = {"id": "claude-pretooluse", "version": 2,
+                           "enforcement_level": "tool_blocking", "enforced_tools": ["Read", "Grep", "Glob"],
+                           "request_log": "CONTEXT_ACCESS.ndjson", "telemetry_coverage": "native_tool"}
     elif backend_id == "kimi-code":
-        context_adapter = {"id": "kimi-pretooluse", "version": 1,
-                           "enforcement_level": "fail_open_tool_blocking", "enforced_tools": ["Read", "Grep", "Glob"]}
+        context_adapter = {"id": "kimi-pretooluse", "version": 2,
+                           "enforcement_level": "fail_open_tool_blocking", "enforced_tools": ["Read", "Grep", "Glob"],
+                           "request_log": "CONTEXT_ACCESS.ndjson", "telemetry_coverage": "native_tool"}
     elif backend_id == "opencode" and backend_settings.get("context_plugin_enabled"):
-        context_adapter = {"id": "opencode-tool-execute-before", "version": 1,
-                           "enforcement_level": "tool_blocking", "enforced_tools": ["read", "grep", "glob"]}
+        context_adapter = {"id": "opencode-tool-execute-before", "version": 2,
+                           "enforcement_level": "tool_blocking", "enforced_tools": ["read", "grep", "glob"],
+                           "request_log": "CONTEXT_ACCESS.ndjson", "telemetry_coverage": "native_tool"}
     elif backend_id == "codex":
-        context_adapter = {"id": "codex-pretooluse", "version": 1,
+        context_adapter = {"id": "codex-pretooluse", "version": 2,
                            "enforcement_level": "best_effort", "enforced_tools": ["Bash"],
+                           "request_log": "CONTEXT_ACCESS.ndjson", "telemetry_coverage": "best_effort",
                            "known_gaps": ["unified_exec interception is incomplete", "indirect script reads are unclassified"]}
     else:
         context_adapter = {"id": "prompt-and-cli", "version": 1,
@@ -424,6 +428,34 @@ def materialize_backend_profile(profile: dict[str, Any], runtime_dir: Path) -> d
         raise BackendGovernanceError("compiled backend profile is missing context access policy")
     read_policy_path = runtime_dir / "READ_POLICY.json"
     _atomic_json(read_policy_path, read_policy)
+    adapter = profile.get("context_access", {}).get("adapter", {})
+    request_log = adapter.get("request_log") if isinstance(adapter, dict) else None
+    if request_log == "CONTEXT_ACCESS.ndjson":
+        access_log = runtime_dir / request_log
+        try:
+            descriptor = os.open(
+                access_log,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            pass
+        else:
+            initialized = {
+                "schema_version": 1,
+                "event": "context_telemetry_initialized",
+                "backend": profile.get("backend_id"),
+                "coverage": adapter.get("telemetry_coverage"),
+            }
+            encoded = (json.dumps(initialized, sort_keys=True) + "\n").encode("utf-8")
+            try:
+                written = os.write(descriptor, encoded)
+                if written != len(encoded):
+                    raise OSError(
+                        f"short context telemetry initialization: {written}/{len(encoded)} bytes"
+                    )
+            finally:
+                os.close(descriptor)
     settings_path: Path | None = None
     if profile["backend_id"] == "claude-code":
         settings_path = runtime_dir / "claude-settings.json"

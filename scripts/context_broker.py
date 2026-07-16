@@ -70,7 +70,9 @@ def audit(policy_path: Path, payload: dict[str, Any]) -> None:
     data = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
     descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(descriptor, data)
+        written = os.write(descriptor, data)
+        if written != len(data):
+            raise OSError(f"short context request log write: {written}/{len(data)} bytes")
     finally:
         os.close(descriptor)
 
@@ -173,7 +175,15 @@ def main() -> int:
     policy = load_json(policy_path)
     handlers = {"index": command_index, "search": command_search, "get": command_get}
     result = handlers[args.action](args, policy)
+    content = result.get("content")
+    rendered = json.dumps(result, indent=2, ensure_ascii=False) + "\n"
+    nested_sources = result.get("sources") if isinstance(result.get("sources"), list) else []
+    result_truncated = bool(result.get("truncated", False)) or any(
+        isinstance(item, dict) and item.get("truncated") is True
+        for item in nested_sources
+    )
     audit(policy_path, {
+        "schema_version": 1,
         "action": args.action,
         "source": getattr(args, "source", ""),
         "query": getattr(args, "query", ""),
@@ -181,8 +191,11 @@ def main() -> int:
         "question": getattr(args, "question", ""),
         "result_sources": [item.get("source") for item in result.get("sources", [])]
         if isinstance(result.get("sources"), list) else [result.get("source")],
+        "result_bytes": len(rendered.encode("utf-8")),
+        "result_content_bytes": len(content.encode("utf-8")) if isinstance(content, str) else 0,
+        "result_truncated": result_truncated,
     })
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    sys.stdout.write(rendered)
     return 0
 
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from protocol import load_json, utc_now
-from read_policy import evaluate_read
+from read_policy import evaluate_read, record_context_access
 
 
 READ_COMMANDS = {"cat", "head", "tail", "sed"}
@@ -20,8 +20,50 @@ LIST_COMMANDS = {"find", "ls"}
 
 
 def append_event(runtime: Path, payload: dict[str, Any]) -> None:
-    with (runtime / "CONTEXT_HOOK_EVENTS.ndjson").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    descriptor = os.open(
+        runtime / "CONTEXT_HOOK_EVENTS.ndjson",
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o600,
+    )
+    try:
+        written = os.write(descriptor, encoded)
+        if written != len(encoded):
+            raise OSError(f"short context hook log write: {written}/{len(encoded)} bytes")
+    finally:
+        os.close(descriptor)
+
+
+def append_event_safely(runtime: Path, payload: dict[str, Any]) -> None:
+    try:
+        append_event(runtime, payload)
+    except Exception as exc:
+        print(f"RDO context diagnostic append failed: {exc}", file=sys.stderr)
+
+
+def display_scope(policy: dict[str, Any], cwd: Path) -> str:
+    worktree = Path(policy["worktree"]).resolve()
+    try:
+        return cwd.relative_to(worktree).as_posix() or "."
+    except ValueError:
+        return "outside_worktree"
+
+
+def display_path(policy: dict[str, Any], path: Path) -> str:
+    worktree = Path(policy["worktree"]).resolve()
+    try:
+        return path.resolve().relative_to(worktree).as_posix() or "."
+    except ValueError:
+        return "outside_worktree"
+
+
+def record_context_access_safely(**kwargs: Any) -> None:
+    try:
+        record_context_access(**kwargs)
+    except Exception as exc:
+        # Codex interception is best-effort, but telemetry health must not
+        # replace a policy decision that was already computed.
+        print(f"RDO context telemetry append failed: {exc}", file=sys.stderr)
 
 
 def segments(command: str) -> list[list[str]]:
@@ -91,15 +133,31 @@ def main() -> int:
             continue
         operation, paths, bounded = details
         classified += 1
-        for path in paths:
-            tool_input: dict[str, Any] = {"file_path": str(path)}
-            if bounded:
-                tool_input["limit"] = 1
-            reason = evaluate_read(policy, tool_input, operation)
+        if not paths:
+            # Grep/Glob without a path use cwd as their native search scope.
+            # A Read command with no resolvable path was already allowed by
+            # this best-effort adapter; keep that behavior and expose the
+            # coverage gap rather than inventing a hard denial.
+            tool_input: dict[str, Any] = {}
+            reason = evaluate_read(policy, tool_input, operation) if operation != "Read" else None
+            record_context_access_safely(
+                runtime=runtime,
+                policy=policy,
+                backend="codex",
+                operation=operation,
+                tool_input=tool_input,
+                decision="deny" if reason else "allow",
+                reason=reason or (
+                    "" if operation != "Read" else "no resolvable path in shell command"
+                ),
+                coverage="best_effort",
+                scope=display_scope(policy, cwd),
+                bounded=bounded,
+            )
             if reason:
-                append_event(runtime, {
+                append_event_safely(runtime, {
                     "at": utc_now(), "backend": "codex", "event": "read_denied",
-                    "operation": operation, "path": str(path), "reason": reason,
+                    "operation": operation, "scope": display_scope(policy, cwd), "reason": reason,
                 })
                 print(json.dumps({
                     "hookSpecificOutput": {
@@ -109,7 +167,37 @@ def main() -> int:
                     }
                 }))
                 return 0
-    append_event(runtime, {
+        for path in paths:
+            tool_input: dict[str, Any] = {"file_path": str(path)}
+            policy_input = dict(tool_input)
+            if bounded:
+                policy_input["limit"] = 1
+            reason = evaluate_read(policy, policy_input, operation)
+            record_context_access_safely(
+                runtime=runtime,
+                policy=policy,
+                backend="codex",
+                operation=operation,
+                tool_input=tool_input,
+                decision="deny" if reason else "allow",
+                reason=reason or "",
+                coverage="best_effort",
+                bounded=bounded,
+            )
+            if reason:
+                append_event_safely(runtime, {
+                    "at": utc_now(), "backend": "codex", "event": "read_denied",
+                    "operation": operation, "path": display_path(policy, path), "reason": reason,
+                })
+                print(json.dumps({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason,
+                    }
+                }))
+                return 0
+    append_event_safely(runtime, {
         "at": utc_now(), "backend": "codex",
         "event": "shell_read_classified" if classified else "shell_read_unclassified",
         "classified_segments": classified,

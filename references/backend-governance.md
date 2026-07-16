@@ -121,6 +121,23 @@ Context Broker uses `rg` for bounded search and a deterministic Markdown heading
 parser for section retrieval. Results include source digests and request
 metadata. It does not call an LLM or a document-extraction agent.
 
+Supported native read/search adapters also append normalized, content-free
+request facts to attempt-local `CONTEXT_ACCESS.ndjson`. Each record identifies
+the backend, operation, path or search scope, requested bounds, allow/deny
+decision, source size when known, and the adapter's telemetry coverage. These
+records describe intercepted tool requests, not operating-system reads: Claude
+Code, Kimi Code, and OpenCode report native-tool coverage, while Codex remains
+best-effort. Context Broker requests remain separately auditable in
+`CONTEXT_REQUESTS.ndjson`.
+
+Materialization initializes the access log with a sentinel so consumers can
+distinguish a genuine zero-request attempt from missing telemetry. Access-log
+append failures are diagnostic only and do not replace the allow/deny decision.
+Paths outside the assigned worktree are recorded as `outside_worktree`, not as
+host-absolute paths. Broker audit records do retain the submitted search query
+or section question and therefore follow the same retention boundary as other
+attempt artifacts.
+
 The first policy version is deliberately stateless: it rejects other
 worktrees, forbidden/out-of-scope paths, and unbounded reads of large Markdown
 outside the write scope. It has no cumulative byte budget, counter, or lock.

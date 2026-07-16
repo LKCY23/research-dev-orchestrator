@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from protocol import load_json
-from read_policy import evaluate_read, normalize_tool_input
+from read_policy import evaluate_read, normalize_tool_input, record_context_access
 
 
 def main() -> int:
@@ -34,6 +34,22 @@ def main() -> int:
         hook_input.get("tool_input", {}),
     )
     reason = evaluate_read(policy, tool_input, tool_name)
+    try:
+        record_context_access(
+            runtime=runtime,
+            policy=policy,
+            backend=args.backend,
+            operation=tool_name,
+            tool_input=tool_input,
+            decision="deny" if reason else "allow",
+            reason=reason or "",
+            coverage="native_tool",
+        )
+    except Exception as exc:
+        # Observability must not replace the policy decision. In particular, a
+        # full disk must not turn an allowed read into a denial or hide the
+        # original reason for a denied read.
+        print(f"RDO context telemetry append failed: {exc}", file=sys.stderr)
     if args.format == "decision":
         print(json.dumps({"decision": "deny" if reason else "allow", "reason": reason or ""}))
     elif reason:

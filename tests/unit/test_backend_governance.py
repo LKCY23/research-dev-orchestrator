@@ -155,6 +155,15 @@ class BackendGovernanceTests(unittest.TestCase):
         profile = self.compile()
         self.assertFalse((self.task / "attempts").exists())
         self.assertIn("superpowers@claude-plugins-official", profile["governance"]["disabled_plugins"])
+        self.assertEqual(2, profile["context_access"]["adapter"]["version"])
+        self.assertEqual(
+            "CONTEXT_ACCESS.ndjson",
+            profile["context_access"]["adapter"]["request_log"],
+        )
+        self.assertEqual(
+            "native_tool",
+            profile["context_access"]["adapter"]["telemetry_coverage"],
+        )
         self.assertEqual(profile["native_agent_limits"], {
             "max_spawns": 1,
             "max_parallel": 1,
@@ -177,6 +186,11 @@ class BackendGovernanceTests(unittest.TestCase):
         self.assertFalse(settings["enabledPlugins"]["superpowers@claude-plugins-official"])
         self.assertIn("PreToolUse", settings["hooks"])
         self.assertEqual(result["profile_path"], str(runtime / "BACKEND_PROFILE.json"))
+        initialized = json.loads(
+            (runtime / "CONTEXT_ACCESS.ndjson").read_text(encoding="utf-8").strip()
+        )
+        self.assertEqual("context_telemetry_initialized", initialized["event"])
+        self.assertEqual("native_tool", initialized["coverage"])
 
         command = build_command(
             backend_id="claude-code",
@@ -268,6 +282,9 @@ class BackendGovernanceTests(unittest.TestCase):
         self.assertIn("--dangerously-bypass-hook-trust", command)
         self.assertIn("hooks.PreToolUse", command)
         self.assertEqual(profile["context_access"]["adapter"]["enforcement_level"], "best_effort")
+        self.assertEqual(2, profile["context_access"]["adapter"]["version"])
+        self.assertEqual("CONTEXT_ACCESS.ndjson", profile["context_access"]["adapter"]["request_log"])
+        self.assertEqual("best_effort", profile["context_access"]["adapter"]["telemetry_coverage"])
 
         human_command = build_command(
             backend_id="codex",
@@ -378,6 +395,9 @@ class BackendGovernanceTests(unittest.TestCase):
             profile["context_access"]["adapter"]["enforcement_level"],
             "fail_open_tool_blocking",
         )
+        self.assertEqual(2, profile["context_access"]["adapter"]["version"])
+        self.assertEqual("CONTEXT_ACCESS.ndjson", profile["context_access"]["adapter"]["request_log"])
+        self.assertEqual("native_tool", profile["context_access"]["adapter"]["telemetry_coverage"])
         command = build_command(
             backend_id="kimi-code",
             io_mode="machine",
@@ -478,6 +498,9 @@ class BackendGovernanceTests(unittest.TestCase):
             profile["context_access"]["adapter"]["enforcement_level"],
             "tool_blocking",
         )
+        self.assertEqual(2, profile["context_access"]["adapter"]["version"])
+        self.assertEqual("CONTEXT_ACCESS.ndjson", profile["context_access"]["adapter"]["request_log"])
+        self.assertEqual("native_tool", profile["context_access"]["adapter"]["telemetry_coverage"])
         for io_mode in ("machine", "human"):
             command = build_command(
                 backend_id="opencode",
