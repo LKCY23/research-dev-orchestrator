@@ -21,6 +21,75 @@ RUN_LIFECYCLE_INTEGRATION = os.environ.get("RDO_RUN_LIGHT_BENCH_INTEGRATION") ==
 
 
 class LightBenchTests(unittest.TestCase):
+    def test_run_rejects_output_inside_measured_rdo_root_before_writing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rdo_root = Path(temporary) / "rdo"
+            dispatch = rdo_root / "scripts" / "dispatch_agent.sh"
+            dispatch.parent.mkdir(parents=True)
+            dispatch.write_text("#!/bin/sh\n", encoding="utf-8")
+            output = rdo_root / "results"
+            args = bench.build_parser().parse_args([
+                "run",
+                "--case", "L01-located-fix",
+                "--profile", "direct",
+                "--backend", "codex",
+                "--rdo-root", str(rdo_root),
+                "--output", str(output),
+            ])
+            with mock.patch.object(bench, "run_one") as run_one:
+                with self.assertRaisesRegex(ValueError, "outside measured RDO root"):
+                    bench.command_run(args)
+            run_one.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_ab_rejects_nonempty_output_before_loading_stale_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / "baseline"
+            candidate = root / "candidate"
+            for rdo_root in (baseline, candidate):
+                dispatch = rdo_root / "scripts" / "dispatch_agent.sh"
+                dispatch.parent.mkdir(parents=True)
+                dispatch.write_text("#!/bin/sh\n", encoding="utf-8")
+            output = root / "results"
+            output.mkdir()
+            (output / "stale.json").write_text("{}\n", encoding="utf-8")
+            args = bench.build_parser().parse_args([
+                "ab",
+                "--case", "L01-located-fix",
+                "--profile", "direct",
+                "--backend", "codex",
+                "--baseline-rdo", str(baseline),
+                "--candidate-rdo", str(candidate),
+                "--model-label", "same-model",
+                "--output", str(output),
+            ])
+            with mock.patch.object(bench, "run_one") as run_one:
+                with self.assertRaisesRegex(ValueError, "new or empty"):
+                    bench.command_ab(args)
+            run_one.assert_not_called()
+
+    def test_ab_rejects_identical_baseline_and_candidate_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rdo_root = Path(temporary) / "rdo"
+            dispatch = rdo_root / "scripts" / "dispatch_agent.sh"
+            dispatch.parent.mkdir(parents=True)
+            dispatch.write_text("#!/bin/sh\n", encoding="utf-8")
+            args = bench.build_parser().parse_args([
+                "ab",
+                "--case", "L01-located-fix",
+                "--profile", "direct",
+                "--backend", "codex",
+                "--baseline-rdo", str(rdo_root),
+                "--candidate-rdo", str(rdo_root),
+                "--model-label", "same-model",
+                "--output", str(Path(temporary) / "output"),
+            ])
+            with mock.patch.object(bench, "run_one") as run_one:
+                with self.assertRaisesRegex(ValueError, "must be distinct"):
+                    bench.command_ab(args)
+            run_one.assert_not_called()
+
     def test_cases_are_discoverable_and_complete(self):
         cases = bench.discover_cases()
         self.assertEqual(

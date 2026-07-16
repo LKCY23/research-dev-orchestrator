@@ -1085,18 +1085,56 @@ def selected_matrix(args: argparse.Namespace, cases: dict[str, BenchCase]) -> li
     return [(cases[args.case], args.profile)]
 
 
+def prepare_output_root(
+    raw_output: str, *, prefix: str, forbidden_roots: Sequence[Path]
+) -> Path:
+    """Return a new or empty output directory outside every measured RDO tree."""
+    roots = tuple(root.resolve() for root in forbidden_roots)
+    if raw_output:
+        output_root = Path(raw_output).resolve()
+    else:
+        temp_parent = Path(tempfile.gettempdir()).resolve()
+        for root in roots:
+            try:
+                temp_parent.relative_to(root)
+            except ValueError:
+                continue
+            raise ValueError(
+                f"temporary output parent must be outside measured RDO root {root}: "
+                f"{temp_parent}"
+            )
+        output_root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+
+    for root in roots:
+        try:
+            output_root.relative_to(root)
+        except ValueError:
+            continue
+        raise ValueError(
+            f"output directory must be outside measured RDO root {root}: {output_root}"
+        )
+
+    if output_root.exists():
+        if not output_root.is_dir():
+            raise ValueError(f"output path is not a directory: {output_root}")
+        if any(output_root.iterdir()):
+            raise ValueError(f"output directory must be new or empty: {output_root}")
+    else:
+        output_root.mkdir(parents=True)
+    return output_root
+
+
 def command_run(args: argparse.Namespace) -> int:
     cases = discover_cases()
     matrix = selected_matrix(args, cases)
     rdo_root = Path(args.rdo_root).resolve()
     if not (rdo_root / "scripts" / "dispatch_agent.sh").is_file():
         raise ValueError(f"not an RDO root: {rdo_root}")
-    output_root = (
-        Path(args.output).resolve()
-        if args.output
-        else Path(tempfile.mkdtemp(prefix="rdo-light-bench-results-"))
+    output_root = prepare_output_root(
+        args.output,
+        prefix="rdo-light-bench-results-",
+        forbidden_roots=(rdo_root,),
     )
-    output_root.mkdir(parents=True, exist_ok=True)
     failures = 0
     print(f"results: {output_root}")
     for case, profile in matrix:
@@ -1141,13 +1179,15 @@ def command_ab(args: argparse.Namespace) -> int:
         "baseline": Path(args.baseline_rdo).resolve(),
         "candidate": Path(args.candidate_rdo).resolve(),
     }
+    if roots["baseline"] == roots["candidate"]:
+        raise ValueError("A/B baseline and candidate RDO roots must be distinct")
     for label, root in roots.items():
         if not (root / "scripts" / "dispatch_agent.sh").is_file():
             raise ValueError(f"{label} is not an RDO root: {root}")
-    output_root = (
-        Path(args.output).resolve()
-        if args.output
-        else Path(tempfile.mkdtemp(prefix="rdo-light-bench-ab-"))
+    output_root = prepare_output_root(
+        args.output,
+        prefix="rdo-light-bench-ab-",
+        forbidden_roots=tuple(roots.values()),
     )
     print(f"A/B results: {output_root}")
     failures = 0

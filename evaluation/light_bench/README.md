@@ -93,6 +93,10 @@ python3 evaluation/light_bench/bench.py ab \
   --output /tmp/rdo-light-bench-ab
 ```
 
+Run and A/B output directories must be new or empty and must live outside every
+measured RDO source tree. This prevents benchmark artifacts from changing the
+candidate provenance or stale results from entering a later comparison.
+
 Use separate clean Git worktrees and alternate baseline/candidate order for a
 serious A/B run. Four balanced repetitions are the minimum useful live sample. The
 runner records a dirty-source digest for exploratory runs; do not promote a
