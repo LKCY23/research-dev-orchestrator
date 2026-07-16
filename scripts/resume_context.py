@@ -31,7 +31,13 @@ def workflow_satisfied(records: list[dict[str, Any]], workflow_id: str) -> bool:
 
 def fingerprint_sha(path: Path) -> str:
     payload = load_json(path)
-    digest = payload.get("sha256") if isinstance(payload, dict) else None
+    digest = payload.get("semantic_sha256") if isinstance(payload, dict) else None
+    if not isinstance(digest, str) or not digest:
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        if isinstance(entries, list):
+            digest = canonical_digest(entries)
+    if not isinstance(digest, str) or not digest:
+        digest = payload.get("sha256") if isinstance(payload, dict) else None
     if not isinstance(digest, str) or not digest:
         raise ResumeContextError(f"invalid worktree fingerprint: {path}")
     return digest

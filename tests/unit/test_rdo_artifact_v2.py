@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import rdo
 from artifact_bundle import artifact_binding, file_sha256, load_bundle, load_command_records
 from strategy import DEFAULT_EXECUTION_POLICY
+from supervisor import load_or_create_attempt_deadline
 from task_contract import (
     build_task_inputs_from_readiness,
     evaluate_task_readiness,
@@ -271,12 +272,19 @@ No additional background is needed.
                 "attempt_id": self.attempt_id,
                 "state": "running",
                 "phase": "execution",
+                "backend_id": "claude-code",
                 "task_inputs_ref": "TASK_INPUTS.json",
                 "task_inputs_sha256": task_inputs_sha256,
                 "runtime": {"cwd": str(worktree)},
             },
         )
         self.write_json(attempt / "runtime" / "worktree-before.json", before)
+        load_or_create_attempt_deadline(
+            attempt / "runtime" / "DEADLINE.json",
+            attempt_timeout_seconds=600,
+            finalization_grace_seconds=90,
+            reminder_seconds=60,
+        )
         dispatch_lock = task / ".dispatch-lock"
         dispatch_lock.mkdir()
         (dispatch_lock / "attempt_id").write_text(self.attempt_id + "\n", encoding="utf-8")
@@ -333,6 +341,12 @@ No additional background is needed.
         values.update(overrides)
         with contextlib.redirect_stdout(io.StringIO()):
             return rdo.handoff(argparse.Namespace(**values))
+
+    def begin_finalization(self, fixture: SimpleNamespace) -> int:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return rdo.finalization_action(
+                argparse.Namespace(attempt_dir=str(fixture.attempt))
+            )
 
     def mark_handoff_completed(self, fixture: SimpleNamespace, state: str) -> None:
         status = json.loads((fixture.task / "STATUS.json").read_text(encoding="utf-8"))
@@ -423,7 +437,12 @@ No additional background is needed.
 
     def test_direct_finalize_publishes_verified_self_review_and_digest_closure(self) -> None:
         fixture = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.begin_finalization(fixture))
         self.assertEqual(0, self.check(fixture, "unit"))
+        marker = fixture.attempt / "runtime" / "FINALIZATION.json"
+        snapshot = fixture.attempt / "runtime" / "finalization-worktree.json"
+        self.assertTrue(marker.is_file())
+        self.assertTrue(snapshot.is_file())
         self.assertEqual(0, self.finalize(fixture, "verified"))
 
         bundle = load_bundle(
@@ -447,12 +466,216 @@ No additional background is needed.
             [item["path"] for item in bundle.evidence["required_outputs"]],
         )
         self.assertEqual(
+            [
+                "runtime/finalization-worktree.json",
+                "runtime/FINALIZATION.json",
+                "runtime/DEADLINE.json",
+            ],
+            [item["ref"] for item in bundle.evidence["artifacts"]],
+        )
+        self.assertEqual(
             fixture.source_commit,
             git(fixture.worktree, "rev-parse", "HEAD"),
         )
         self.assertEqual("running", json.loads((fixture.task / "STATUS.json").read_text())["state"])
         with self.assertRaisesRegex(SystemExit, "handoff is already published"):
             self.check(fixture, "unit")
+
+    def test_finalization_snapshot_allows_commit_but_rejects_later_source_edits(self) -> None:
+        commit_only = self.make_fixture(profile="direct")
+        (commit_only.worktree / "change.txt").write_text(
+            "task change before finalization\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(0, self.begin_finalization(commit_only))
+        self.assertEqual(0, self.check(commit_only, "unit"))
+        marker_before = (
+            commit_only.attempt / "runtime" / "FINALIZATION.json"
+        ).read_bytes()
+        git(commit_only.worktree, "add", ".")
+        git(commit_only.worktree, "commit", "-m", "commit frozen finalization tree")
+        self.assertEqual(0, self.finalize(commit_only, "verified"))
+        self.assertEqual(
+            marker_before,
+            (commit_only.attempt / "runtime" / "FINALIZATION.json").read_bytes(),
+        )
+
+        content_drift = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.begin_finalization(content_drift))
+        self.assertEqual(0, self.check(content_drift, "unit"))
+        (content_drift.worktree / "result.txt").write_text(
+            "changed during grace\n",
+            encoding="utf-8",
+        )
+        git(content_drift.worktree, "add", "result.txt")
+        git(content_drift.worktree, "commit", "-m", "illegal grace edit")
+        with self.assertRaisesRegex(SystemExit, "changed after finalization started"):
+            self.finalize(content_drift, "verified")
+        self.assertFalse((content_drift.attempt / "HANDOFF.json").exists())
+
+        mode_drift = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.begin_finalization(mode_drift))
+        self.assertEqual(0, self.check(mode_drift, "unit"))
+        result = mode_drift.worktree / "result.txt"
+        result.chmod(result.stat().st_mode | 0o111)
+        git(mode_drift.worktree, "add", "result.txt")
+        git(mode_drift.worktree, "commit", "-m", "illegal mode edit")
+        with self.assertRaisesRegex(SystemExit, "changed after finalization started"):
+            self.finalize(mode_drift, "verified")
+
+    def test_baseline_check_does_not_freeze_preimplementation_tree(self) -> None:
+        fixture = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.check(fixture, "unit"))
+        self.assertFalse((fixture.attempt / "runtime" / "FINALIZATION.json").exists())
+        (fixture.worktree / "change.txt").write_text(
+            "implementation after baseline check\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(0, self.begin_finalization(fixture))
+        self.assertEqual(0, self.check(fixture, "unit"))
+        git(fixture.worktree, "add", ".")
+        git(fixture.worktree, "commit", "-m", "implementation after baseline")
+        self.assertEqual(0, self.finalize(fixture, "verified"))
+
+    def test_baseline_check_is_not_reused_for_a_different_final_tree(self) -> None:
+        fixture = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.check(fixture, "unit"))
+        (fixture.worktree / "change.txt").write_text(
+            "implementation after baseline check\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(0, self.begin_finalization(fixture))
+        git(fixture.worktree, "add", ".")
+        git(fixture.worktree, "commit", "-m", "unchecked final implementation")
+        with self.assertRaisesRegex(SystemExit, "no exact record"):
+            self.finalize(fixture, "verified")
+
+    def test_symlink_retarget_after_finalization_is_source_drift(self) -> None:
+        fixture = self.make_fixture(profile="direct")
+        (fixture.worktree / "same-a.txt").write_text("same\n", encoding="utf-8")
+        (fixture.worktree / "same-b.txt").write_text("same\n", encoding="utf-8")
+        link = fixture.worktree / "current.txt"
+        link.symlink_to("same-a.txt")
+        self.assertEqual(0, self.begin_finalization(fixture))
+        self.assertEqual(0, self.check(fixture, "unit"))
+        link.unlink()
+        link.symlink_to("same-b.txt")
+        git(fixture.worktree, "add", ".")
+        git(fixture.worktree, "commit", "-m", "illegal symlink retarget")
+        with self.assertRaisesRegex(SystemExit, "changed after finalization started"):
+            self.finalize(fixture, "verified")
+
+    def test_blocked_finalize_binds_deadline_and_finalization_artifacts(self) -> None:
+        fixture = self.make_fixture(profile="direct")
+        self.assertEqual(
+            0,
+            self.finalize(
+                fixture,
+                "blocked",
+                blocker_type="external_dependency",
+                blocking_reason="service is unavailable",
+            ),
+        )
+        bundle = load_bundle(
+            fixture.attempt,
+            expected_task_id=self.task_id,
+            expected_attempt_id=self.attempt_id,
+            expected_requested_state="blocked",
+        )
+        self.assertEqual(
+            [
+                "runtime/finalization-worktree.json",
+                "runtime/FINALIZATION.json",
+                "runtime/DEADLINE.json",
+            ],
+            [item["ref"] for item in bundle.evidence["artifacts"]],
+        )
+
+    def test_blocked_finalize_rejects_source_drift_after_entry(self) -> None:
+        fixture = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.begin_finalization(fixture))
+        (fixture.worktree / "result.txt").write_text(
+            "changed after finalization\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(SystemExit, "changed after finalization started"):
+            self.finalize(
+                fixture,
+                "blocked",
+                blocker_type="needs_coordinator",
+                blocking_reason="cannot finish",
+            )
+
+    def test_full_final_workflow_creates_deadline_bound_marker(self) -> None:
+        from tests.unit.test_strategy import strategy_payload
+
+        fixture = self.make_fixture(profile="full")
+        (fixture.task / "strategy").mkdir()
+        strategy = strategy_payload(self.task_id)
+        strategy["workflows"][0]["executor"]["allowed_paths"] = ["."]
+        submit_strategy(fixture.task, strategy)
+        review = review_strategy(
+            fixture.task,
+            1,
+            decision="approved",
+            reviewer="coordinator",
+        )
+        metadata = json.loads((fixture.attempt / "ATTEMPT.json").read_text())
+        metadata.update(
+            strategy_id=strategy["strategy_id"],
+            strategy_revision=1,
+            strategy_sha256=review["strategy_sha256"],
+        )
+        self.write_json(fixture.attempt / "ATTEMPT.json", metadata)
+        self.write_json(
+            fixture.attempt / "runtime" / "BACKEND_PROFILE.json",
+            {
+                "strategy_id": strategy["strategy_id"],
+                "strategy_revision": 1,
+                "strategy_sha256": review["strategy_sha256"],
+            },
+        )
+        workflow_args = dict(
+            attempt_dir=str(fixture.attempt),
+            workflow_id="WF-implementation",
+            instance_id="WF-implementation-I001",
+            review_evidence=[],
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                0,
+                rdo.workflow_action(
+                    argparse.Namespace(workflow_action="start", **workflow_args)
+                ),
+            )
+        self.assertEqual(0, self.check(fixture, "unit"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                0,
+                rdo.workflow_action(
+                    argparse.Namespace(workflow_action="complete", **workflow_args)
+                ),
+            )
+        marker = json.loads(
+            (fixture.attempt / "runtime" / "FINALIZATION.json").read_text()
+        )
+        deadline = json.loads(
+            (fixture.attempt / "runtime" / "DEADLINE.json").read_text()
+        )
+        self.assertEqual(
+            deadline["execution_deadline_at_epoch"]
+            + deadline["finalization_grace_seconds"],
+            marker["deadline_at_epoch"],
+        )
+        self.assertEqual(0, self.finalize(fixture, "review"))
+
+    def test_repeated_finalization_begin_is_idempotent(self) -> None:
+        fixture = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.begin_finalization(fixture))
+        marker = fixture.attempt / "runtime" / "FINALIZATION.json"
+        original = marker.read_bytes()
+        self.assertEqual(0, self.begin_finalization(fixture))
+        self.assertEqual(original, marker.read_bytes())
 
     def test_finalize_waits_for_inflight_check_before_freezing_evidence(self) -> None:
         coordination = Path(tempfile.mkdtemp())
@@ -747,6 +970,10 @@ No additional background is needed.
         self.assertEqual(
             json.loads(before.read_text())["sha256"],
             json.loads(after.read_text())["sha256"],
+        )
+        self.assertNotEqual(
+            json.loads(before.read_text())["semantic_sha256"],
+            json.loads(after.read_text())["semantic_sha256"],
         )
         self.assertEqual(["result.txt"], rdo._snapshot_changed_paths(before, after))
 

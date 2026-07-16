@@ -130,7 +130,7 @@ resume_fallback_reason: null unless resume deterministically fell back to a full
 resume_context_sha256: digest of derived runtime/RESUME_CONTEXT.json when Full execution materializes resume context
 carried_forward_workflows/remaining_workflows: workflow ID lists compiled by dispatch; empty/absent outside Full execution
 state: created|running|completed|invalid_handoff
-outcome: null while active; startup_failed|execution_failed|timed_out_unfinalized|invalid_handoff|completed when terminal
+outcome: null while active; startup_failed|execution_failed|timed_out_unfinalized|finalization_timed_out|finalization_failed|invalid_handoff|completed when terminal
 phase: planning|execution
 strategy_id/strategy_sha256: required for Full execution; null for planning and Direct/Delegated execution
 backend_profile_sha256: digest of the pure compiled backend profile
@@ -174,7 +174,16 @@ execution_failed
   Startup succeeded, but execution exited without a candidate handoff.
 
 timed_out_unfinalized
-  The supervised attempt deadline expired before a valid finalized handoff.
+  The execution deadline expired before finalization began.
+
+finalization_timed_out
+  Finalization began before the execution deadline, but its independent grace
+  (the interval from the execution deadline to the fixed final deadline)
+  expired before a valid handoff was published.
+
+finalization_failed
+  Finalization began, but the worker exited without a candidate handoff before
+  the grace deadline.
 
 invalid_handoff
   Candidate publication or handoff bytes existed but failed deterministic

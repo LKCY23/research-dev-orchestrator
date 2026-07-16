@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -14,12 +15,23 @@ from pathlib import Path
 from typing import Any
 
 from backend_startup import classify_startup_failure
-from completion import publication_path as expected_publication_path
-from completion import validate_publication
+from completion import (
+    inspect_candidate_source_head,
+    inspect_candidate_source_state,
+    inspect_publication_candidate,
+    publication_path as expected_publication_path,
+    validate_publication,
+    v2_publication_dependency_latest_ctime,
+)
 from protocol import utc_now
 from supervisor import (
+    AttemptDeadline,
     _process_table,
+    attempt_deadline_sha256,
     current_termination_targets,
+    finalization_epoch_from_path,
+    load_or_create_attempt_deadline,
+    reap_process,
     supervision_environment,
     terminate_processes,
 )
@@ -120,6 +132,10 @@ def main() -> int:
     parser.add_argument("--task-dir", default="")
     parser.add_argument("--attempt-id", default="")
     parser.add_argument("--handoff-grace-seconds", type=float, default=0.5)
+    parser.add_argument("--finalization-path", default="")
+    parser.add_argument("--finalization-timeout-seconds", type=float, default=90.0)
+    parser.add_argument("--deadline-path", default="")
+    parser.add_argument("--deadline-reminder-seconds", type=float, default=60.0)
     args = parser.parse_args()
 
     argv = json.loads(args.argv_json)
@@ -134,6 +150,16 @@ def main() -> int:
         raise SystemExit("startup and attempt timeouts must be positive")
     if not math.isfinite(args.handoff_grace_seconds) or args.handoff_grace_seconds < 0:
         raise SystemExit("handoff grace seconds must be finite and non-negative")
+    if (
+        not math.isfinite(args.finalization_timeout_seconds)
+        or args.finalization_timeout_seconds <= 0
+    ):
+        raise SystemExit("finalization timeout seconds must be finite and positive")
+    if (
+        not math.isfinite(args.deadline_reminder_seconds)
+        or args.deadline_reminder_seconds <= 0
+    ):
+        raise SystemExit("deadline reminder seconds must be finite and positive")
 
     monitor_publication = bool(args.publication_path or args.task_dir or args.attempt_id)
     if args.artifact_protocol_version == 2:
@@ -158,9 +184,20 @@ def main() -> int:
         "valid": False,
         "reasons": [],
         "payload": None,
+        "sha256": None,
     }
+    accepted_publication_sha256: str | None = None
+    accepted_publication_epoch: float | None = None
+    accepted_publication_marker_ctime: float | None = None
+    accepted_publication_receipt: dict[str, Any] | None = None
+    late_publication_seen = False
 
     def publication_is_valid() -> bool:
+        nonlocal accepted_publication_epoch
+        nonlocal accepted_publication_marker_ctime
+        nonlocal accepted_publication_receipt
+        nonlocal accepted_publication_sha256
+        nonlocal late_publication_seen
         if publication_path is None or not publication_path.exists():
             if publication_path is not None:
                 publication_state.update(
@@ -169,7 +206,7 @@ def main() -> int:
                     payload=None,
                 )
             return False
-        result = validate_publication(
+        result = inspect_publication_candidate(
             publication_path,
             artifact_protocol_version=args.artifact_protocol_version,
             task_dir=Path(args.task_dir),
@@ -180,7 +217,98 @@ def main() -> int:
             reasons=list(result.reasons),
             payload=result.payload,
         )
-        return result.valid
+        if not result.valid:
+            return False
+        receipt = result.receipt
+        payload = result.payload
+        if not isinstance(receipt, dict) or not isinstance(payload, dict):
+            return False
+        publication_sha256 = receipt.get("sha256")
+        publication_epoch_value = receipt.get("ctime")
+        if not isinstance(publication_sha256, str) or not isinstance(
+            publication_epoch_value,
+            (int, float),
+        ):
+            return False
+        marker_ctime = float(publication_epoch_value)
+        active_deadline_epoch = deadline.active_deadline_epoch()
+        if accepted_publication_receipt is None:
+            if marker_ctime < deadline.attempt_started_epoch - 0.001:
+                publication_state.update(
+                    valid=False,
+                    reasons=["publication marker predates the supervised attempt"],
+                )
+                return False
+            remaining = active_deadline_epoch - time.time()
+            if marker_ctime > active_deadline_epoch + 0.001 or remaining <= 0:
+                late_publication_seen = True
+                publication_state.update(
+                    valid=False,
+                    reasons=["publication was first observed after the active deadline"],
+                )
+                return False
+            source_state = inspect_candidate_source_state(
+                Path(args.cwd),
+                payload,
+                timeout_seconds=max(0.01, min(1.0, remaining)),
+            )
+        else:
+            source_state = inspect_candidate_source_head(
+                Path(args.cwd),
+                payload,
+            )
+        if not source_state.valid:
+            publication_state.update(
+                valid=False,
+                reasons=list(source_state.reasons),
+            )
+            return False
+        observed_at_epoch = time.time()
+        current_receipt = {
+            **receipt,
+            "observed_at_epoch": observed_at_epoch,
+            "source": source_state.receipt or {},
+        }
+        if accepted_publication_receipt is None:
+            if observed_at_epoch > active_deadline_epoch + 1e-6:
+                late_publication_seen = True
+                publication_state.update(
+                    valid=False,
+                    reasons=["publication source proof completed after the active deadline"],
+                )
+                return False
+            accepted_publication_receipt = current_receipt
+            accepted_publication_sha256 = publication_sha256
+            accepted_publication_marker_ctime = marker_ctime
+            accepted_publication_epoch = observed_at_epoch
+        elif any(
+            current_receipt.get(field) != accepted_publication_receipt.get(field)
+            for field in (
+                "sha256",
+                "mtime_ns",
+                "device",
+                "inode",
+                "size",
+            )
+        ) or (
+            (current_receipt.get("source") or {}).get("source_commit")
+            != (accepted_publication_receipt.get("source") or {}).get("source_commit")
+        ):
+            publication_state.update(
+                valid=False,
+                reasons=["accepted publication identity changed during shutdown"],
+                sha256=publication_sha256,
+            )
+            return False
+        publication_state["sha256"] = publication_sha256
+        publication_state["receipt"] = accepted_publication_receipt
+        return True
+
+    def publication_epoch() -> float | None:
+        nonlocal accepted_publication_epoch
+        if accepted_publication_epoch is not None:
+            return accepted_publication_epoch
+        return None
 
     startup_path = Path(args.startup_result)
     supervisor_path = Path(args.supervisor_result)
@@ -205,6 +333,17 @@ def main() -> int:
     env.update(environment)
     env, supervision_token = supervision_environment(env)
     stdin_spec: int = subprocess.DEVNULL if args.prompt_transport == "arg" else subprocess.PIPE
+    deadline_payload = load_or_create_attempt_deadline(
+        Path(args.deadline_path) if args.deadline_path else None,
+        attempt_timeout_seconds=args.timeout_seconds,
+        finalization_grace_seconds=args.finalization_timeout_seconds,
+        reminder_seconds=args.deadline_reminder_seconds,
+    )
+    deadline_sha256 = attempt_deadline_sha256(
+        Path(args.deadline_path) if args.deadline_path else None,
+        deadline_payload,
+    )
+    deadline = AttemptDeadline.from_payload(deadline_payload)
     started_monotonic = time.monotonic()
     started_at = utc_now()
     process = subprocess.Popen(
@@ -216,6 +355,19 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    atomic_json(state_path, {
+        "state": "running",
+        "worker_pid": process.pid,
+        "worker_pgid": process.pid,
+        "observed_pids": [process.pid],
+        "observed_pgids": [process.pid],
+        "deadline_seconds": args.timeout_seconds,
+        "startup_state": "process_started",
+        "publication_requested": False,
+        "supervision_token": supervision_token,
+        "deadline_sha256": deadline_sha256,
+        "deadline": deadline.state(),
+    })
     startup: dict[str, Any] = {
         "mode": "machine",
         "state": "process_started",
@@ -260,16 +412,26 @@ def main() -> int:
     termination_pids = {process.pid}
     termination_pgids = {process.pid}
     timed_out = False
+    timeout_phase: str | None = None
     startup_failed = False
     budget_exceeded = False
     worker_progress_observed = args.custom_command
     publication_requested = False
+    publication_was_accepted = False
     publication_deadline: float | None = None
     last_state_write = 0.0
+    cleanup_observation: dict[str, Any] = {"verified": True, "reason": None}
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
     with transcript_path.open("wb") as transcript:
         while process.poll() is None:
-            for key, _ in selector.select(timeout=0.1):
+            select_timeout = max(
+                0.0,
+                min(
+                    0.1,
+                    deadline.active_deadline_monotonic() - time.monotonic(),
+                ),
+            )
+            for key, _ in selector.select(timeout=select_timeout):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -327,7 +489,7 @@ def main() -> int:
                 current, current_pgids = current_termination_targets(
                     process.pid,
                     table,
-                    supervision_token,
+                    None,
                 )
                 observed_pids.update(current)
                 observed_pgids.update(current_pgids)
@@ -336,6 +498,17 @@ def main() -> int:
             except (OSError, subprocess.SubprocessError):
                 pass
             elapsed = time.monotonic() - started_monotonic
+            finalization_epoch = (
+                finalization_epoch_from_path(
+                    Path(args.finalization_path),
+                    attempt_id=args.attempt_id,
+                    expected_grace_seconds=args.finalization_timeout_seconds,
+                    require_bound_snapshot=args.artifact_protocol_version == 2,
+                )
+                if args.finalization_path
+                else None
+            )
+            deadline.observe(finalization_epoch, enforce_timeout=False)
             if elapsed - last_state_write >= 0.5:
                 atomic_json(state_path, {
                     "state": "running",
@@ -346,6 +519,9 @@ def main() -> int:
                     "deadline_seconds": args.timeout_seconds,
                     "startup_state": startup["state"],
                     "publication_requested": publication_requested,
+                    "supervision_token": supervision_token,
+                    "deadline_sha256": deadline_sha256,
+                    "deadline": deadline.state(),
                 })
                 last_state_write = elapsed
             if startup["state"] != "worker_started" and elapsed >= args.startup_timeout_seconds:
@@ -367,38 +543,133 @@ def main() -> int:
             if usage.check_clock():
                 budget_exceeded = True
                 break
-            if publication_is_valid() and startup["state"] == "worker_started":
+            publication_valid = publication_is_valid()
+            if args.finalization_path:
+                finalization_epoch = finalization_epoch_from_path(
+                    Path(args.finalization_path),
+                    attempt_id=args.attempt_id,
+                    expected_grace_seconds=args.finalization_timeout_seconds,
+                    require_bound_snapshot=args.artifact_protocol_version == 2,
+                )
+                deadline.observe(finalization_epoch, enforce_timeout=False)
+            published_epoch = publication_epoch()
+            publication_before_deadline = bool(
+                published_epoch is not None
+                and published_epoch >= deadline.attempt_started_epoch - 0.001
+                and published_epoch <= deadline.active_deadline_epoch() + 1e-6
+            )
+            if (
+                publication_valid
+                and startup["state"] == "worker_started"
+                and (
+                    publication_before_deadline
+                    or published_epoch is None and not deadline.expired()
+                )
+            ):
                 if not publication_requested:
                     publication_requested = True
-                    publication_deadline = time.monotonic() + args.handoff_grace_seconds
+                    publication_was_accepted = True
+                    publication_deadline = (
+                        time.monotonic() + args.handoff_grace_seconds
+                    )
                 if publication_deadline is not None and time.monotonic() >= publication_deadline:
                     break
             elif publication_requested:
                 # A mutation during the grace interval revokes the stop signal.
                 publication_requested = False
                 publication_deadline = None
-            if elapsed >= args.timeout_seconds:
+            timeout_phase = deadline.observe(
+                finalization_epoch,
+                enforce_timeout=not publication_requested,
+            )
+            if timeout_phase is not None:
                 timed_out = True
                 break
 
         # Catch a marker published immediately before a natural worker exit and
         # revalidate after any grace-period output has been flushed.
-        stopped_after_publication = publication_requested
+        if buffer:
+            evidence = startup_event(args.backend, buffer)
+            progress = worker_progress_event(args.backend, buffer)
+            if evidence and startup["state"] != "worker_started":
+                startup["state"] = "worker_started"
+                startup["worker_started_at"] = utc_now()
+                startup["startup_evidence"] = {
+                    "decoder": args.backend,
+                    "event": evidence,
+                }
+                atomic_json(startup_path, startup)
+            if progress and not worker_progress_observed:
+                worker_progress_observed = True
+                startup["worker_progress_at"] = utc_now()
+                startup["worker_progress_evidence"] = {
+                    "decoder": args.backend,
+                    "event": progress,
+                }
+                atomic_json(startup_path, startup)
+        if args.finalization_path:
+            deadline.observe(
+                finalization_epoch_from_path(
+                    Path(args.finalization_path),
+                    attempt_id=args.attempt_id,
+                    expected_grace_seconds=args.finalization_timeout_seconds,
+                    require_bound_snapshot=args.artifact_protocol_version == 2,
+                ),
+                enforce_timeout=process.poll() is None
+                and not publication_requested
+                and not startup_failed
+                and not budget_exceeded,
+            )
+        timeout_phase = timeout_phase or deadline.timeout_phase
+        timed_out = timed_out or timeout_phase is not None
+        stopped_after_publication = publication_was_accepted
         final_publication_valid = publication_is_valid()
+        if args.finalization_path:
+            deadline.observe(
+                finalization_epoch_from_path(
+                    Path(args.finalization_path),
+                    attempt_id=args.attempt_id,
+                    expected_grace_seconds=args.finalization_timeout_seconds,
+                    require_bound_snapshot=args.artifact_protocol_version == 2,
+                ),
+                enforce_timeout=False,
+            )
+        final_published_epoch = publication_epoch()
+        late_publication = late_publication_seen or bool(
+            final_publication_valid
+            and final_published_epoch is not None
+            and final_published_epoch > deadline.active_deadline_epoch() + 1e-6
+        )
+        if (
+            final_publication_valid
+            and not publication_was_accepted
+            and final_published_epoch is not None
+            and final_published_epoch >= deadline.attempt_started_epoch - 0.001
+            and final_published_epoch <= deadline.active_deadline_epoch() + 1e-6
+        ):
+            publication_was_accepted = True
+        if late_publication:
+            timeout_phase = deadline.phase
+            deadline.timeout_phase = timeout_phase
+            timed_out = True
         publication_requested = bool(
             final_publication_valid
             and startup["state"] == "worker_started"
+            and publication_was_accepted
             and not timed_out
             and not startup_failed
             and not budget_exceeded
         )
         publication_invalidated = stopped_after_publication and not final_publication_valid
+        publication_unaccepted = bool(
+            final_publication_valid and not publication_requested
+        )
         try:
             table = _process_table()
             current, current_pgids = current_termination_targets(
                 process.pid,
                 table,
-                supervision_token,
+                None,
             )
             observed_pids.update(current)
             observed_pgids.update(current_pgids)
@@ -414,13 +685,26 @@ def main() -> int:
             or publication_requested
             or publication_invalidated
         ):
-            survivors = terminate_processes(termination_pgids, termination_pids)
-            process.wait()
+            survivors = terminate_processes(
+                termination_pgids,
+                termination_pids,
+                root_pid=process.pid,
+                supervision_token=supervision_token,
+                observed_pids=observed_pids,
+                observed_pgids=observed_pgids,
+                cleanup_observation=cleanup_observation,
+            )
+            reap_process(process)
         else:
-            exit_code_now = int(process.wait())
+            exit_code_now = reap_process(process)
             survivors = terminate_processes(
                 termination_pgids,
                 termination_pids - {process.pid},
+                root_pid=process.pid,
+                supervision_token=supervision_token,
+                observed_pids=observed_pids,
+                observed_pgids=observed_pgids,
+                cleanup_observation=cleanup_observation,
             )
             if buffer:
                 evidence = startup_event(args.backend, buffer)
@@ -464,8 +748,91 @@ def main() -> int:
                     startup["failure_detected_after_start_event"] = True
                 atomic_json(startup_path, startup)
 
+    final_source_receipt: dict[str, Any] | None = None
+    if publication_requested:
+        candidate_stable = publication_is_valid()
+        candidate_payload = publication_state.get("payload")
+        final_source = (
+            inspect_candidate_source_state(
+                Path(args.cwd),
+                candidate_payload,
+            )
+            if isinstance(candidate_payload, dict)
+            else None
+        )
+        if final_source is None or not final_source.valid:
+            candidate_stable = False
+            publication_state.update(
+                valid=False,
+                reasons=(
+                    list(final_source.reasons)
+                    if final_source is not None
+                    else ["publication source payload is missing"]
+                ),
+            )
+        else:
+            final_source_receipt = dict(final_source.receipt or {})
+        full_publication = (
+            validate_publication(
+                publication_path,
+                artifact_protocol_version=args.artifact_protocol_version,
+                task_dir=Path(args.task_dir),
+                attempt_id=args.attempt_id,
+            )
+            if candidate_stable and publication_path is not None
+            else None
+        )
+        if full_publication is not None:
+            publication_state.update(
+                valid=full_publication.valid,
+                reasons=list(full_publication.reasons),
+                payload=full_publication.payload,
+            )
+            if (
+                full_publication.valid
+                and args.artifact_protocol_version == 2
+                and accepted_publication_marker_ctime is not None
+            ):
+                try:
+                    latest_dependency = v2_publication_dependency_latest_ctime(
+                        Path(args.task_dir),
+                        args.attempt_id,
+                    )
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    full_publication = type(full_publication)(
+                        False,
+                        (f"publication temporal closure is invalid: {exc}",),
+                        full_publication.payload,
+                    )
+                else:
+                    if (
+                        latest_dependency
+                        > accepted_publication_marker_ctime + 0.001
+                        or latest_dependency
+                        > deadline.active_deadline_epoch() + 0.001
+                    ):
+                        full_publication = type(full_publication)(
+                            False,
+                            (
+                                "publication dependencies were materialized "
+                                "after the accepted marker/deadline",
+                            ),
+                            full_publication.payload,
+                        )
+                publication_state.update(
+                    valid=full_publication.valid,
+                    reasons=list(full_publication.reasons),
+                    payload=full_publication.payload,
+                )
+        if full_publication is None or not full_publication.valid:
+            publication_requested = False
+            publication_invalidated = True
+            publication_unaccepted = False
+
     exit_code = (
-        0
+        126
+        if survivors or not cleanup_observation["verified"]
+        else 0
         if publication_requested
         else 124
         if timed_out
@@ -474,7 +841,9 @@ def main() -> int:
         else int(process.returncode)
     )
     state = (
-        "handoff_ready"
+        "cleanup_failed"
+        if survivors or not cleanup_observation["verified"]
+        else "handoff_ready"
         if publication_requested
         else "publication_invalid"
         if publication_invalidated
@@ -493,24 +862,46 @@ def main() -> int:
         "observed_pids": sorted(observed_pids),
         "observed_pgids": sorted(observed_pgids),
         "surviving_pids": list(survivors),
+        "cleanup_verified": cleanup_observation["verified"],
+        "cleanup_failure_reason": cleanup_observation["reason"],
         "exit_code": exit_code,
         "startup_state": startup["state"],
         "artifact_protocol_version": args.artifact_protocol_version,
         "publication_requested": publication_requested,
         "publication_invalidated": publication_invalidated,
+        "publication_unaccepted": publication_unaccepted,
+        "late_publication": late_publication,
+        "accepted_publication_sha256": accepted_publication_sha256,
+        "accepted_publication_receipt": accepted_publication_receipt,
+        "final_source": final_source_receipt,
         "completion_requested": publication_requested,
+        "timeout_phase": timeout_phase,
+        "finalization_started": deadline.finalization_started_epoch is not None,
+        "finalization_timed_out": timeout_phase == "finalization",
         "publication": publication_state if monitor_publication else None,
+        "supervision_token": supervision_token,
+        "deadline": deadline.state(),
+        "deadline_sha256": deadline_sha256,
+        "active_deadline_at_epoch": deadline.active_deadline_epoch(),
         "usage": usage.summary(),
     })
     atomic_json(supervisor_path, {
         "exit_code": exit_code,
         "timed_out": timed_out,
+        "timeout_phase": timeout_phase,
         "startup_failed": startup_failed,
         "budget_exceeded": budget_exceeded,
         "artifact_protocol_version": args.artifact_protocol_version,
         "publication_requested": publication_requested,
         "publication_invalidated": publication_invalidated,
+        "publication_unaccepted": publication_unaccepted,
+        "late_publication": late_publication,
+        "accepted_publication_sha256": accepted_publication_sha256,
+        "accepted_publication_receipt": accepted_publication_receipt,
+        "final_source": final_source_receipt,
         "completion_requested": publication_requested,
+        "finalization_started": deadline.finalization_started_epoch is not None,
+        "finalization_timed_out": timeout_phase == "finalization",
         "publication": publication_state if monitor_publication else None,
         "handoff_ready": (
             publication_state
@@ -526,6 +917,14 @@ def main() -> int:
         "observed_pids": sorted(observed_pids),
         "observed_pgids": sorted(observed_pgids),
         "surviving_pids": list(survivors),
+        "cleanup_verified": cleanup_observation["verified"],
+        "cleanup_failure_reason": cleanup_observation["reason"],
+        "supervision_token": supervision_token,
+        "deadline": deadline.state(),
+        "deadline_sha256": deadline_sha256,
+        "attempt_started_at_epoch": deadline.attempt_started_epoch,
+        "execution_deadline_at_epoch": deadline.execution_deadline_epoch,
+        "active_deadline_at_epoch": deadline.active_deadline_epoch(),
         "strategy_id": args.strategy_id or None,
         "strategy_sha256": args.strategy_sha256 or None,
         "backend_session_id": observed_session_id or None,
@@ -536,3 +935,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    attempt_deadline_sha256,

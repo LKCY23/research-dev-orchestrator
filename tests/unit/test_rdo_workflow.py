@@ -88,6 +88,37 @@ class WorkflowCompletionGateTests(unittest.TestCase):
             )
             self.assertIn("one or more acceptance commands failed or timed out", reasons)
 
+    def test_workflow_and_exec_are_rejected_after_finalization_starts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = root / "task"
+            attempt = task / "attempts" / "A001"
+            runtime = attempt / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "FINALIZATION.json").write_text(
+                json.dumps({"stage": "finalizing"}) + "\n",
+                encoding="utf-8",
+            )
+            strategy = self.strategy()
+            with patch(
+                "rdo.active_execution_attempt",
+                return_value=(attempt, task, strategy),
+            ), patch("rdo.event"):
+                with self.assertRaisesRegex(SystemExit, "forbidden after finalization"):
+                    rdo.workflow_action(self.args("start", attempt))
+                with self.assertRaisesRegex(SystemExit, "forbidden after finalization"):
+                    rdo._execute_command_locked(
+                        argparse.Namespace(
+                            attempt_dir=str(attempt),
+                            acceptance=False,
+                            workflow_id="WF-acceptance",
+                            instance_id="WF-acceptance-I001",
+                            timeout=1,
+                            cwd="",
+                            command=["--", "true"],
+                        )
+                    )
+
     def test_independent_review_requires_observed_distinct_reviewers(self):
         with tempfile.TemporaryDirectory() as temporary:
             attempt = Path(temporary) / "A001"

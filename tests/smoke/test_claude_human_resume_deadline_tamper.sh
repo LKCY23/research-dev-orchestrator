@@ -9,7 +9,8 @@ repo="$(setup_smoke_repo)"
 cd "${repo}"
 fake_bin="${repo}/fake-bin"
 fake_home="${repo}/fake-claude-home"
-session_id="33333333-3333-3333-3333-333333333333"
+fallback_sentinel="${repo}/fallback-ran"
+session_id="44444444-4444-4444-4444-444444444444"
 mkdir -p "${fake_bin}" "${fake_home}/projects/project"
 printf '{}\n' > "${fake_home}/projects/project/${session_id}.jsonl"
 
@@ -29,37 +30,52 @@ if [[ " $* " == *" --help "* ]]; then
   exit 0
 fi
 if [[ "$*" == *" --resume "* ]]; then
-  echo "No conversation found with session ID: 33333333-3333-3333-3333-333333333333"
+  prompt="${!#}"
+  attempt_dir="$(printf '%s\n' "${prompt}" | awk -F': ' '/^- ATTEMPT_DIR:/ {print $2}')"
+  python3 - "${attempt_dir}/runtime/DEADLINE.json" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["started_at_epoch"] += 300
+payload["execution_deadline_at_epoch"] += 300
+for source, target in (
+    ("started_at_epoch", "started_at"),
+    ("execution_deadline_at_epoch", "execution_deadline_at"),
+):
+    payload[target] = (
+        datetime.fromtimestamp(payload[source], timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+  echo "No conversation found with session ID: 44444444-4444-4444-4444-444444444444"
   exit 1
 fi
-[[ " $* " == *" --session-id 33333333-3333-3333-3333-333333333333 "* ]]
-prompt="${!#}"
-attempt_dir="$(printf '%s\n' "${prompt}" | awk -F': ' '/^- ATTEMPT_DIR:/ {print $2}')"
-python3 "${RDO_ROOT}/scripts/rdo.py" check \
-  --attempt-dir "${attempt_dir}" \
-  --check-id smoke >/dev/null
-python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
-  --attempt-dir "${attempt_dir}" \
-  --state review \
-  --summary "human resume fallback completed" >/dev/null
+touch "${FALLBACK_SENTINEL}"
+exit 1
 SH
 freeze_worker_rdo_root "${fake_bin}/claude"
 chmod +x "${fake_bin}/claude"
 
 python3 "${RDO_ROOT}/scripts/init_run.py" \
-  --run-id human-fallback-run \
+  --run-id deadline-tamper-run \
   --project-slug smoke \
   --objective smoke \
   --target-branch main >/dev/null
 python3 "${RDO_ROOT}/scripts/create_task.py" \
-  --run-id human-fallback-run \
-  --task-id T001-human-fallback \
+  --run-id deadline-tamper-run \
+  --task-id T001-deadline-tamper \
   --goal fallback \
   --profile delegated \
   --allowed-paths file.txt >/dev/null
-complete_task_contract human-fallback-run T001-human-fallback fallback
+complete_task_contract deadline-tamper-run T001-deadline-tamper fallback
 
-task="${repo}/.agent-collab/runs/human-fallback-run/tasks/T001-human-fallback"
+task="${repo}/.agent-collab/runs/deadline-tamper-run/tasks/T001-deadline-tamper"
 python3 - "${task}" "${session_id}" <<'PY'
 import json
 import sys
@@ -96,13 +112,20 @@ status["state_history"] = [
 status_path.write_text(json.dumps(status, indent=2) + "\n")
 PY
 
+set +e
 PATH="${fake_bin}:${PATH}" \
 CLAUDE_CONFIG_DIR="${fake_home}" \
+FALLBACK_SENTINEL="${fallback_sentinel}" \
 RDO_RUNTIME_BACKEND=tmux \
 RDO_IO_MODE=human \
 RDO_TMUX_WAIT_TIMEOUT_SECONDS=15 \
   "${RDO_ROOT}/scripts/dispatch_agent.sh" \
-  human-fallback-run T001-human-fallback >/dev/null
+  deadline-tamper-run T001-deadline-tamper >/dev/null 2>&1
+dispatch_code="$?"
+set -e
+
+[[ "${dispatch_code}" -ne 0 ]]
+test ! -e "${fallback_sentinel}"
 
 python3 - "${task}" <<'PY'
 import hashlib
@@ -111,27 +134,13 @@ import sys
 from pathlib import Path
 
 task = Path(sys.argv[1])
-status = json.loads((task / "STATUS.json").read_text())
+status = json.loads((task / "STATUS.json").read_text(encoding="utf-8"))
 attempt_dir = task / "attempts" / status["current_attempt_id"]
-attempt = json.loads((attempt_dir / "ATTEMPT.json").read_text())
-assert status["state"] == "review", status
-assert attempt["worker_id"] == "W-stable-human", attempt
-assert attempt["requested_execution_mode"] == "resume", attempt
-assert attempt["execution_mode"] == "start", attempt
-assert attempt["resume_fallback_reason"] == "runtime_session_not_found", attempt
-assert attempt["resume_fallback"]["source"] == "runtime", attempt
-assert attempt["outcome"] == "completed", attempt
-assert (attempt_dir / "runtime" / "RESUME_STARTUP_FAILURE.json").exists()
-first_supervisor = json.loads(
-    (attempt_dir / "runtime" / "RESUME_SUPERVISOR_FAILURE.json").read_text()
-)
-final_supervisor = json.loads((attempt_dir / "supervisor-result.json").read_text())
-deadline = json.loads((attempt_dir / "runtime" / "DEADLINE.json").read_text())
-deadline_raw = (attempt_dir / "runtime" / "DEADLINE.json").read_bytes()
-deadline_sha256 = hashlib.sha256(deadline_raw).hexdigest()
-expected = deadline["execution_deadline_at_epoch"]
-assert first_supervisor["execution_deadline_at_epoch"] == expected
-assert final_supervisor["execution_deadline_at_epoch"] == expected
-assert first_supervisor["deadline_sha256"] == deadline_sha256
-assert final_supervisor["deadline_sha256"] == deadline_sha256
+result = json.loads((attempt_dir / "supervisor-result.json").read_text(encoding="utf-8"))
+current_digest = hashlib.sha256(
+    (attempt_dir / "runtime" / "DEADLINE.json").read_bytes()
+).hexdigest()
+assert result["deadline_sha256"] != current_digest, (result, current_digest)
+assert not (attempt_dir / "runtime" / "RESUME_SUPERVISOR_FAILURE.json").exists()
+assert status["state"] == "blocked", status
 PY

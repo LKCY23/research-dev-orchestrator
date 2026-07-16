@@ -72,7 +72,7 @@ late_code="$?"
 set -e
 [[ "${late_code}" == "4" ]]
 python3 - "${late_repo}/.agent-collab/runs/direct-late-run/tasks/T002-direct-late" <<'PY'
-import json, sys
+import json, subprocess, sys
 from pathlib import Path
 
 task = Path(sys.argv[1])
@@ -83,7 +83,16 @@ attempt = json.loads(
 attempt_dir = task / "attempts" / status["current_attempt_id"]
 handoff = json.loads((attempt_dir / "HANDOFF.json").read_text())
 assert status["state"] == "blocked", status
-assert "HEAD changed after handoff finalization" in status["blocking_reason"]
+current_head = subprocess.check_output(
+    ["git", "rev-parse", "HEAD"],
+    cwd=attempt["runtime"]["cwd"],
+    text=True,
+).strip()
+assert current_head != handoff["source_commit"]
+assert (
+    "HEAD changed after handoff finalization" in status["blocking_reason"]
+    or "source_commit" in status["blocking_reason"]
+), status
 assert attempt["state"] == "invalid_handoff"
 assert attempt["handoff_valid"] is False
 assert "verified_commit" not in attempt

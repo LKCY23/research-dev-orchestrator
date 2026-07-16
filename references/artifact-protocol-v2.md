@@ -168,8 +168,11 @@ attempts/<attempt-id>/
 | --- | --- | --- |
 | `ATTEMPT.json` | Canonical attempt identity/runtime metadata; input binding is only a `TASK_INPUTS.json` ref and digest | Dispatcher creates it; protocol code advances attempt metadata |
 | `TASK_INPUTS.json` | Derived immutable snapshot of canonical task inputs and resolved commits | Dispatcher publishes it before launch |
-| `runtime/COMMANDS.ndjson` | Append-only raw supervised-command facts | `rdo check` appends records before finalization |
+| `runtime/COMMANDS.ndjson` | Append-only raw supervised-command facts, including before/after semantic source digests | `rdo check` appends records before or during finalization |
 | `runtime/ARTIFACT_LOCK` | Internal process lock; not evidence | Shared by supervised command writers and held exclusively by finalization so no command can append after publication |
+| `runtime/DEADLINE.json` | Create-once attempt execution deadline shared by backend resume fallback | Supervisor creates it before worker launch |
+| `runtime/finalization-worktree.json` | Create-once full semantic source snapshot at finalize-only entry | RDO publishes it before the finalization marker |
+| `runtime/FINALIZATION.json` | Create-once phase marker binding entry time, grace, task inputs, fixed final deadline, and source snapshot | RDO publishes it after the profile's source-freeze gate passes |
 | `runtime/transcript.log` | Raw worker/supervisor log | Supervisor appends while the worker runs; it is not selected into the frozen evidence package before worker exit |
 | `runtime/worktree-*.json` | Raw before/after worktree facts | Dispatcher/supervisor capture them at their defined boundaries |
 | `EVIDENCE.json` | Frozen, structured index selecting raw facts for review; never a second command log | Finalizer derives and publishes it once |
@@ -325,6 +328,8 @@ The marker shape is:
   "schema_version": 2,
   "artifact_protocol_version": 2,
   "publication": "handoff_ready",
+  "published_at": "2026-07-16T12:00:00.123Z",
+  "published_at_epoch": 1784203200.123,
   "task_id": "T001-contracts",
   "attempt_id": "A001-worker-ab12cd",
   "attempt_ref": "ATTEMPT.json",
@@ -348,11 +353,24 @@ package. Recovery may finish publication only when existing candidate bytes
 match the recomputed bindings; otherwise it reports the conflict without
 overwriting evidence.
 
+`published_at` and `published_at_epoch` are worker-supplied audit metadata, not
+deadline proof. The supervisor performs a bounded same-descriptor marker read,
+rejects concurrent mutation, records its own observation receipt and matching
+Git source state, and requires that first observation to finish before the
+active deadline. After the process tree is quiescent it validates the complete
+bundle and creation-time closure of every bound dependency. For
+`strategy_review`, that closure includes the canonical strategy revision
+outside the attempt directory.
+
 `HANDOFF_READY.json` is not task completion, approval, or an FSM transition.
 The supervisor accepts only the marker located under the active attempt and
 only after validating every bound digest, attempt ID, requested state, and
 source commit. A stale or foreign marker cannot finish another attempt. The
 dispatcher then applies the existing profile-specific transition separately.
+That transition requires a readable, coherent supervisor result binding the
+accepted marker identity, immutable deadline digest, source receipt, cleanup
+proof, and zero supervisor exit; a worker cannot self-declare those facts by
+calling the handoff validator.
 
 Post-process validation is anchored to dispatcher-captured expectations rather
 than values first derived from worker-mutable files: task/profile/phase/branch/

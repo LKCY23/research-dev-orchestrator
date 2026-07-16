@@ -191,11 +191,13 @@ def retained_cleanup_lock_reasons(
         "startup_failed",
         "execution_failed",
         "timed_out_unfinalized",
+        "finalization_timed_out",
+        "finalization_failed",
         "invalid_handoff",
     }:
         reasons.append("ATTEMPT.outcome must be a terminal failure")
-    if runtime.get("backend") != "tmux":
-        reasons.append("ATTEMPT.runtime.backend must be tmux")
+    if runtime.get("backend") not in {"tmux", "plain"}:
+        reasons.append("ATTEMPT.runtime.backend must be a supervised backend")
     if status.get("blocker_type") != expected_blocker:
         reasons.append(f"STATUS.blocker_type must be {expected_blocker}")
     if not dispatch_lock.is_dir():
@@ -516,6 +518,8 @@ def validate_attempt(
                 expected_blockers = {
                     "startup_failed": {"environment", "needs_user"},
                     "timed_out_unfinalized": {"budget"},
+                    "finalization_timed_out": {"budget"},
+                    "finalization_failed": {"needs_coordinator"},
                     "execution_failed": {"needs_coordinator", "environment", "budget"},
                     "invalid_handoff": {"needs_coordinator"},
                     None: {"needs_coordinator"},

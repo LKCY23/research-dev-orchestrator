@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -411,6 +414,27 @@ def validate_command_record(
         raise IntegrityError(f"{label}.elapsed_seconds must be non-negative")
     _require_non_empty_string(record, "started_at", label)
     _require_non_empty_string(record, "finished_at", label)
+    for field in (
+        "started_at_epoch",
+        "finished_at_epoch",
+        "finalization_started_at_epoch",
+    ):
+        if field in record and (
+            not _number(record[field]) or not math.isfinite(float(record[field]))
+        ):
+            raise IntegrityError(f"{label}.{field} must be finite")
+    for field in (
+        "source_before_entries_sha256",
+        "source_after_entries_sha256",
+        "source_snapshot_entries_sha256",
+    ):
+        if field in record:
+            _require_sha256(record[field], f"{label}.{field}")
+    if "source_unchanged" in record and not isinstance(
+        record["source_unchanged"],
+        bool,
+    ):
+        raise IntegrityError(f"{label}.source_unchanged must be boolean")
 
     survivors = record.get("surviving_processes")
     if not isinstance(survivors, list):
@@ -424,6 +448,19 @@ def validate_command_record(
                 continue
         raise IntegrityError(
             f"{label}.surviving_processes entries must be positive pids or objects with pid"
+        )
+    if "cleanup_verified" in record and not isinstance(
+        record["cleanup_verified"],
+        bool,
+    ):
+        raise IntegrityError(f"{label}.cleanup_verified must be boolean")
+    if (
+        "cleanup_failure_reason" in record
+        and record["cleanup_failure_reason"] is not None
+        and not isinstance(record["cleanup_failure_reason"], str)
+    ):
+        raise IntegrityError(
+            f"{label}.cleanup_failure_reason must be a string or null"
         )
 
     for prefix in ("stdout", "stderr"):
@@ -660,7 +697,20 @@ def build_evidence(
             "stderr_ref": raw["stderr_ref"],
             "stderr_sha256": raw["stderr_sha256"],
         }
-        for optional in ("workflow_id", "instance_id", "finished_at"):
+        for optional in (
+            "workflow_id",
+            "instance_id",
+            "finished_at",
+            "started_at_epoch",
+            "finished_at_epoch",
+            "finalization_started_at_epoch",
+            "source_before_entries_sha256",
+            "source_after_entries_sha256",
+            "source_snapshot_entries_sha256",
+            "source_unchanged",
+            "cleanup_verified",
+            "cleanup_failure_reason",
+        ):
             if optional in raw:
                 index[optional] = raw[optional]
         indexed_commands.append(index)
@@ -789,13 +839,25 @@ def build_ready(
     source_commit: str | None,
     handoff_sha256: str,
     evidence_sha256: str,
+    published_at_epoch: float | None = None,
 ) -> dict[str, Any]:
     """Build the final internal publication marker."""
 
+    if published_at_epoch is None:
+        published_at_epoch = time.time()
+    if not math.isfinite(published_at_epoch) or published_at_epoch <= 0:
+        raise IntegrityError("published_at_epoch must be finite and positive")
+    published_at = (
+        datetime.fromtimestamp(published_at_epoch, timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
     return {
         "schema_version": ARTIFACT_PROTOCOL_VERSION,
         "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
         "publication": "handoff_ready",
+        "published_at": published_at,
+        "published_at_epoch": published_at_epoch,
         "task_id": binding.task_id,
         "attempt_id": binding.attempt_id,
         "attempt_ref": ATTEMPT_REF,
@@ -869,12 +931,25 @@ def publish_bundle(
     )
     handoff_sha256 = publish_json_once(attempt_dir / HANDOFF_REF, handoff)
 
+    ready_path = attempt_dir / READY_REF
+    published_at_epoch: float | None = None
+    if ready_path.is_file() and not ready_path.is_symlink():
+        try:
+            existing_ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            existing_ready = None
+        if isinstance(existing_ready, dict) and isinstance(
+            existing_ready.get("published_at_epoch"),
+            (int, float),
+        ):
+            published_at_epoch = float(existing_ready["published_at_epoch"])
     ready = build_ready(
         binding=binding,
         requested_state=requested_state,
         source_commit=source_commit,
         handoff_sha256=handoff_sha256,
         evidence_sha256=evidence_sha256,
+        published_at_epoch=published_at_epoch,
     )
     publish_json_once(attempt_dir / READY_REF, ready)
     return load_bundle(
@@ -1087,6 +1162,7 @@ def load_bundle(
     )
     evidence = _load_json_ref(attempt_dir, EVIDENCE_REF, "EVIDENCE.json")
     handoff = _load_json_ref(attempt_dir, HANDOFF_REF, "HANDOFF.json")
+    ready_path = safe_ref(attempt_dir, READY_REF)
     ready = _load_json_ref(attempt_dir, READY_REF, "HANDOFF_READY.json")
     _validate_evidence(attempt_dir, evidence, binding)
     _validate_handoff(handoff, binding)
@@ -1102,6 +1178,32 @@ def load_bundle(
     _require_v2(ready, "HANDOFF_READY.json")
     if ready.get("publication") != "handoff_ready":
         raise IntegrityError("HANDOFF_READY.json publication must be 'handoff_ready'")
+    published_at_epoch = ready.get("published_at_epoch")
+    published_at = ready.get("published_at")
+    if (
+        not _number(published_at_epoch)
+        or not math.isfinite(float(published_at_epoch))
+        or float(published_at_epoch) <= 0
+        or not isinstance(published_at, str)
+    ):
+        raise IntegrityError("HANDOFF_READY.json publication timestamp is invalid")
+    try:
+        parsed_published_at = datetime.fromisoformat(
+            published_at.replace("Z", "+00:00")
+        ).timestamp()
+    except ValueError as exc:
+        raise IntegrityError(
+            "HANDOFF_READY.json published_at is invalid"
+        ) from exc
+    if not math.isclose(
+        parsed_published_at,
+        float(published_at_epoch),
+        rel_tol=0,
+        abs_tol=0.0015,
+    ):
+        raise IntegrityError(
+            "HANDOFF_READY.json published_at does not match published_at_epoch"
+        )
     if ready.get("task_id") != binding.task_id or ready.get("attempt_id") != binding.attempt_id:
         raise IntegrityError("HANDOFF_READY.json identity does not match ATTEMPT.json")
     expected_refs = {

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import stat
 import subprocess
 from pathlib import Path
@@ -24,9 +25,13 @@ def fingerprint(root: Path) -> dict[str, object]:
         path = root / relative
         kind = "symlink" if path.is_symlink() else "file"
         try:
-            content = path.read_bytes()
             raw_mode = path.lstat().st_mode
             mode = f"{stat.S_IFMT(raw_mode) | stat.S_IMODE(raw_mode):06o}"
+            content = (
+                os.readlink(path).encode("utf-8", errors="surrogateescape")
+                if kind == "symlink"
+                else path.read_bytes()
+            )
         except FileNotFoundError:
             content = b"<missing>"
             kind = "missing"
@@ -37,7 +42,20 @@ def fingerprint(root: Path) -> dict[str, object]:
         digest.update(encoded_path)
         digest.update(bytes.fromhex(file_digest))
         entries.append({"path": relative, "kind": kind, "mode": mode, "sha256": file_digest})
-    return {"sha256": digest.hexdigest(), "file_count": len(entries), "entries": entries}
+    semantic = hashlib.sha256(
+        json.dumps(
+            entries,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "sha256": digest.hexdigest(),
+        "semantic_sha256": semantic,
+        "file_count": len(entries),
+        "entries": entries,
+    }
 
 
 def main() -> int:

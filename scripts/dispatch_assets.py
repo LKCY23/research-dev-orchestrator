@@ -205,14 +205,16 @@ def render_worker_prompt(
                 f"- For an independent review workflow, each declared native reviewer writes a non-empty artifact under {attempt_dir / 'runtime' / 'reviews'}; complete it with one --review-evidence REVIEWER_ID=ARTIFACT_PATH per reviewer. Reviewer IDs must match observed backend agent instances.",
                 f"- Use python3 {Path(__file__).resolve().parent / 'rdo.py'} exec --attempt-dir {attempt_dir} --workflow-id <id> --instance-id <id> --timeout <seconds> -- <command> for non-acceptance workflow commands.",
                 f"- Execute every required acceptance command exactly through: python3 {Path(__file__).resolve().parent / 'rdo.py'} check --attempt-dir {attempt_dir} --check-id <id> [--workflow-id <id> --instance-id <id>].",
+                "- Finish every implementation and remediation change before completing the last required workflow; that completion freezes the source tree for finalize-only closeout.",
                 "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 f"- After every required workflow and acceptance check completes, finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize {'--attempt-dir ' + str(attempt_dir) if artifact_v2 else '--task-dir ' + str(task_dir)} --state review --summary <summary>.",
                 "- A new workflow kind, larger budget, wider permission, or exhaustive search requires a strategy revision and checkpoint.",
             ])
         elif profile == "direct":
             phase_rules.extend([
-                "- Implement the task, inspect the complete diff, and fix every self-review finding.",
+                "- Implement the task, run ordinary tests, inspect the complete diff, and fix every self-review finding.",
                 f"- Execute every required acceptance command exactly through: python3 {Path(__file__).resolve().parent / 'rdo.py'} check --attempt-dir {attempt_dir} --check-id <id>.",
+                f"- Once the source is final, or a deadline reminder requires closeout, freeze it once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalization begin --attempt-dir {attempt_dir}. After this point a failed check requires a new attempt; do not edit production files.",
                 "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 "- You own the final review. The coordinator will enforce only mechanical merge gates.",
                 f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize {'--attempt-dir ' + str(attempt_dir) if artifact_v2 else '--task-dir ' + str(task_dir)} --state verified --self-review-passed --summary <summary>.",
@@ -220,8 +222,9 @@ def render_worker_prompt(
             ])
         else:
             phase_rules.extend([
-                "- Implement the task and self-review the diff before handoff.",
+                "- Implement the task, run ordinary tests, and self-review the diff before handoff.",
                 f"- Execute every required acceptance command exactly through: python3 {Path(__file__).resolve().parent / 'rdo.py'} check --attempt-dir {attempt_dir} --check-id <id>.",
+                f"- Once the source is final, or a deadline reminder requires closeout, freeze it once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalization begin --attempt-dir {attempt_dir}. After this point a failed check requires a new attempt; do not edit production files.",
                 "- Commit all task worktree changes on the assigned task branch before final handoff; the worktree must be clean.",
                 "- The coordinator owns the independent code review and merge decision.",
                 f"- Finish once with: python3 {Path(__file__).resolve().parent / 'rdo.py'} finalize {'--attempt-dir ' + str(attempt_dir) if artifact_v2 else '--task-dir ' + str(task_dir)} --state review --summary <summary>.",

@@ -4,12 +4,14 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from artifact_bundle import publish_bundle
 from completion import write_completion
-from supervisor import pid_alive
+from supervisor import load_or_create_attempt_deadline, pid_alive
 from task_contract import TASK_INPUT_FILENAMES, build_task_inputs_payload
 
 
@@ -22,7 +24,12 @@ class InteractiveAttemptSupervisorTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
-    def make_v2_publication(self, root: Path) -> tuple[Path, Path]:
+    def make_v2_publication(
+        self,
+        root: Path,
+        *,
+        timeout: float = 2,
+    ) -> tuple[Path, Path]:
         task = root / "tasks" / "T002"
         attempt = task / "attempts" / "A001"
         (attempt / "runtime").mkdir(parents=True)
@@ -58,6 +65,12 @@ class InteractiveAttemptSupervisorTests(unittest.TestCase):
                 "task_inputs_sha256": digest,
             },
         )
+        load_or_create_attempt_deadline(
+            attempt / "runtime" / "DEADLINE.json",
+            attempt_timeout_seconds=timeout,
+            finalization_grace_seconds=90,
+            reminder_seconds=0.1,
+        )
         publish_bundle(
             attempt,
             requested_state="blocked",
@@ -85,16 +98,18 @@ class InteractiveAttemptSupervisorTests(unittest.TestCase):
         shell_command: str,
         *,
         protocol_version: int = 2,
+        timeout: float = 2,
+        handoff_grace: float = 0.05,
     ) -> list[str]:
         return [
             sys.executable,
             str(SUPERVISOR),
             "--timeout-seconds",
-            "2",
+            str(timeout),
             "--grace-seconds",
             "0.05",
             "--handoff-grace-seconds",
-            "0.05",
+            str(handoff_grace),
             "--result",
             str(attempt / "supervisor-result.json"),
             "--cwd",
@@ -107,6 +122,10 @@ class InteractiveAttemptSupervisorTests(unittest.TestCase):
             str(task),
             "--attempt-id",
             "A001",
+            "--deadline-path",
+            str(attempt / "runtime" / "DEADLINE.json"),
+            "--deadline-reminder-seconds",
+            "0.1",
         ]
 
     def test_valid_v2_ready_stops_interactive_worker_and_cleans_descendants(self):
@@ -126,6 +145,41 @@ class InteractiveAttemptSupervisorTests(unittest.TestCase):
             self.assertFalse(payload["publication_invalidated"])
             self.assertEqual([], payload["surviving_pids"])
             self.assertFalse(any(pid_alive(pid) for pid in payload["observed_pids"]))
+
+    def test_ready_replacement_during_shutdown_invalidates_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root)
+            marker = attempt / "runtime" / "HANDOFF_READY.json"
+            worker = (
+                "import os,pathlib,time; "
+                f"p=pathlib.Path({str(marker)!r}); "
+                "time.sleep(.2); "
+                "q=p.with_name('replacement-ready.json'); "
+                "q.write_bytes(p.read_bytes()); os.replace(q,p)"
+            )
+            result = subprocess.run(
+                self.command(
+                    root,
+                    task,
+                    attempt,
+                    f"{shlex.quote(sys.executable)} -c {shlex.quote(worker)}",
+                    handoff_grace=0.5,
+                ),
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertEqual(125, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertFalse(payload["publication_requested"])
+            self.assertTrue(payload["publication_invalidated"])
+            self.assertTrue(
+                any(
+                    "identity changed" in reason
+                    for reason in payload["handoff_ready"]["reasons"]
+                )
+            )
 
     def test_stale_v2_ready_does_not_stop_interactive_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -151,6 +205,31 @@ class InteractiveAttemptSupervisorTests(unittest.TestCase):
                 any("current task attempt" in reason for reason in payload["handoff_ready"]["reasons"])
             )
 
+    def test_v2_marker_first_observed_after_deadline_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root, timeout=0.2)
+            marker_path = attempt / "runtime" / "HANDOFF_READY.json"
+            self.assertTrue(marker_path.is_file())
+            time.sleep(0.25)
+            result = subprocess.run(
+                self.command(
+                    root,
+                    task,
+                    attempt,
+                    "sleep 30 & wait",
+                    timeout=0.2,
+                ),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(124, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertTrue(payload["timed_out"])
+            self.assertFalse(payload["publication_requested"])
+            self.assertTrue(payload["late_publication"])
+
     def test_interactive_supervisor_still_accepts_legacy_completion(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -173,6 +252,12 @@ class InteractiveAttemptSupervisorTests(unittest.TestCase):
             self.write_json(
                 task / "HANDOFF.json",
                 {"requested_state": "strategy_review", "strategy_sha256": "abc"},
+            )
+            load_or_create_attempt_deadline(
+                attempt / "runtime" / "DEADLINE.json",
+                attempt_timeout_seconds=2,
+                finalization_grace_seconds=90,
+                reminder_seconds=0.1,
             )
             write_completion(
                 task,

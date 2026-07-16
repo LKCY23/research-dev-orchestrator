@@ -33,7 +33,18 @@ class ResumeContextTests(unittest.TestCase):
             }) + "\n",
             encoding="utf-8",
         )
-        fingerprint = {"sha256": "same-worktree", "file_count": 1, "entries": []}
+        fingerprint = {
+            "sha256": "same-worktree",
+            "file_count": 1,
+            "entries": [
+                {
+                    "path": "file.txt",
+                    "kind": "file",
+                    "mode": "100644",
+                    "sha256": "a" * 64,
+                }
+            ],
+        }
         write_json(source / "runtime" / "worktree-after.json", fingerprint)
         before = current / "runtime" / "worktree-before.json"
         write_json(before, fingerprint)
@@ -87,7 +98,35 @@ class ResumeContextTests(unittest.TestCase):
     def test_changed_worktree_invalidates_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
             task, current, strategy, before = self.make_fixture(Path(temporary))
-            write_json(before, {"sha256": "changed", "file_count": 1, "entries": []})
+            write_json(
+                before,
+                {
+                    "sha256": "changed",
+                    "file_count": 1,
+                    "entries": [
+                        {
+                            "path": "file.txt",
+                            "kind": "file",
+                            "mode": "100644",
+                            "sha256": "b" * 64,
+                        }
+                    ],
+                },
+            )
+            with self.assertRaisesRegex(ResumeContextError, "no longer matches"):
+                build_resume_context(
+                    task_dir=task,
+                    attempt_dir=current,
+                    strategy_path=strategy,
+                    current_worktree_before=before,
+                )
+
+    def test_mode_only_change_invalidates_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task, current, strategy, before = self.make_fixture(Path(temporary))
+            payload = json.loads(before.read_text())
+            payload["entries"][0]["mode"] = "100755"
+            write_json(before, payload)
             with self.assertRaisesRegex(ResumeContextError, "no longer matches"):
                 build_resume_context(
                     task_dir=task,

@@ -1,12 +1,16 @@
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from artifact_bundle import publish_bundle
+import completion
 from completion import (
     handoff_ready_path,
+    inspect_publication_candidate,
     publication_path,
     validate_completion,
     validate_publication,
@@ -218,6 +222,64 @@ class CompletionTests(unittest.TestCase):
             )
             self.assertFalse(result.valid)
             self.assertTrue(any("evidence_sha256" in reason for reason in result.reasons))
+
+    def test_candidate_reads_one_open_marker_when_path_is_replaced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task, attempt = self.make_v2_task(Path(temporary))
+            marker = attempt / "runtime" / "HANDOFF_READY.json"
+            original_payload = json.loads(marker.read_text(encoding="utf-8"))
+            replacement_payload = dict(original_payload, task_id="replacement")
+            replacement = marker.with_name("replacement.json")
+            self.write_json(replacement, replacement_payload)
+            real_open = os.open
+            replaced = False
+
+            def open_and_replace(path, flags, *args, **kwargs):
+                nonlocal replaced
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if Path(path) == marker and not replaced:
+                    replaced = True
+                    os.replace(replacement, marker)
+                return descriptor
+
+            with mock.patch.object(completion.os, "open", side_effect=open_and_replace):
+                result = inspect_publication_candidate(
+                    marker,
+                    artifact_protocol_version=2,
+                    task_dir=task,
+                    attempt_id="A001",
+                )
+            self.assertTrue(result.valid, result.reasons)
+            self.assertEqual("T002", result.payload["task_id"])
+            self.assertNotEqual(
+                result.receipt["inode"],
+                marker.stat(follow_symlinks=False).st_ino,
+            )
+
+    def test_candidate_rejects_same_inode_rewrite_during_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task, attempt = self.make_v2_task(Path(temporary))
+            marker = attempt / "runtime" / "HANDOFF_READY.json"
+            original_read = os.read
+            rewritten = False
+
+            def read_and_rewrite(descriptor, size):
+                nonlocal rewritten
+                chunk = original_read(descriptor, size)
+                if chunk and not rewritten:
+                    rewritten = True
+                    marker.write_bytes(marker.read_bytes())
+                return chunk
+
+            with mock.patch.object(completion.os, "read", side_effect=read_and_rewrite):
+                result = inspect_publication_candidate(
+                    marker,
+                    artifact_protocol_version=2,
+                    task_dir=task,
+                    attempt_id="A001",
+                )
+            self.assertFalse(result.valid)
+            self.assertIn("changed while", result.reasons[0])
 
     def test_v2_publication_for_a_stale_attempt_is_not_a_stop_signal(self):
         with tempfile.TemporaryDirectory() as temporary:

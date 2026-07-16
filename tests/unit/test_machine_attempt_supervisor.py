@@ -7,6 +7,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from artifact_bundle import publish_bundle
@@ -16,7 +17,7 @@ from machine_attempt_supervisor import (
     startup_event,
     worker_progress_event,
 )
-from supervisor import pid_alive
+from supervisor import load_or_create_attempt_deadline, pid_alive
 from task_contract import TASK_INPUT_FILENAMES, build_task_inputs_payload
 
 
@@ -29,7 +30,13 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
-    def make_v2_publication(self, root: Path, attempt_id: str = "A001") -> tuple[Path, Path]:
+    def make_v2_publication(
+        self,
+        root: Path,
+        attempt_id: str = "A001",
+        *,
+        timeout: float = 2,
+    ) -> tuple[Path, Path]:
         task = root / "tasks" / "T002"
         attempt = task / "attempts" / attempt_id
         (attempt / "runtime").mkdir(parents=True)
@@ -63,6 +70,12 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
                 "task_inputs_sha256": digest,
             },
         )
+        load_or_create_attempt_deadline(
+            attempt / "runtime" / "DEADLINE.json",
+            attempt_timeout_seconds=timeout,
+            finalization_grace_seconds=90,
+            reminder_seconds=0.1,
+        )
         publish_bundle(
             attempt,
             requested_state="blocked",
@@ -91,6 +104,7 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
         *,
         protocol_version: int = 2,
         timeout: float = 2,
+        handoff_grace: float = 0.05,
     ) -> list[str]:
         prompt = root / "prompt.md"
         prompt.write_text("work\n", encoding="utf-8")
@@ -138,7 +152,11 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             "--attempt-id",
             attempt.name,
             "--handoff-grace-seconds",
-            "0.05",
+            str(handoff_grace),
+            "--deadline-path",
+            str(attempt / "runtime" / "DEADLINE.json"),
+            "--deadline-reminder-seconds",
+            "0.1",
         ]
 
     def test_backend_session_id_decoders(self):
@@ -250,6 +268,61 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
         self.assertEqual(observed, {"argv_prompt": "", "stdin": prompt})
         self.assertEqual(startup["state"], "worker_started")
 
+    def test_machine_persists_process_identity_immediately_after_spawn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prompt = root / "prompt.md"
+            prompt.write_text("work\n", encoding="utf-8")
+            state = root / "state.json"
+            command = [
+                sys.executable,
+                str(SUPERVISOR),
+                "--backend",
+                "claude-code",
+                "--argv-json",
+                json.dumps([sys.executable, "-c", "import time; time.sleep(.8)"]),
+                "--cwd",
+                str(root),
+                "--prompt-path",
+                str(prompt),
+                "--prompt-transport",
+                "arg",
+                "--startup-timeout-seconds",
+                "1",
+                "--timeout-seconds",
+                "2",
+                "--startup-result",
+                str(root / "STARTUP.json"),
+                "--supervisor-result",
+                str(root / "result.json"),
+                "--supervisor-state",
+                str(state),
+                "--transcript",
+                str(root / "transcript.log"),
+                "--custom-command",
+            ]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 0.4
+            payload = None
+            while time.monotonic() < deadline:
+                if state.is_file():
+                    payload = json.loads(state.read_text(encoding="utf-8"))
+                    if payload.get("worker_pid"):
+                        break
+                time.sleep(0.01)
+            self.assertIsNotNone(payload)
+            self.assertIsInstance(payload.get("worker_pid"), int)
+            self.assertEqual(payload["worker_pid"], payload["worker_pgid"])
+            self.assertTrue(payload.get("supervision_token"))
+            self.assertTrue(payload.get("deadline_sha256"))
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(0, process.returncode, stderr or stdout)
+
     def test_exit_without_startup_event_fails_startup(self):
         _, result, _, startup = self.run_supervisor(transport="arg", event=None)
         self.assertEqual(result.returncode, 125)
@@ -336,7 +409,7 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
                 command,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
             )
             self.assertEqual(125, result.returncode, result.stderr)
             startup = json.loads((root / "STARTUP.json").read_text())
@@ -415,7 +488,7 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
                 command,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
             )
             self.assertEqual(1, result.returncode, result.stderr)
             startup = json.loads((root / "STARTUP.json").read_text())
@@ -491,6 +564,238 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             self.assertGreaterEqual(len(payload["observed_pids"]), 2)
             self.assertEqual([], payload["surviving_pids"])
 
+    def test_machine_worker_gets_independent_finalization_grace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prompt = root / "prompt.md"
+            prompt.write_text("work\n")
+            marker = root / "FINALIZATION.json"
+            worker = root / "worker.py"
+            worker.write_text(
+                textwrap.dedent(
+                    f"""
+                    import json
+                    import pathlib
+                    import time
+
+                    time.sleep(0.15)
+                    pathlib.Path({str(marker)!r}).write_text(json.dumps({{
+                        "schema_version": 1,
+                        "stage": "finalizing",
+                        "started_at_epoch": time.time(),
+                        "deadline_seconds": 0.35
+                    }}))
+                    time.sleep(0.18)
+                    """
+                )
+            )
+            command = [
+                sys.executable,
+                str(SUPERVISOR),
+                "--backend",
+                "claude-code",
+                "--argv-json",
+                json.dumps([sys.executable, str(worker)]),
+                "--cwd",
+                str(root),
+                "--prompt-path",
+                str(prompt),
+                "--prompt-transport",
+                "arg",
+                "--startup-timeout-seconds",
+                "1",
+                "--timeout-seconds",
+                "0.2",
+                "--startup-result",
+                str(root / "STARTUP.json"),
+                "--supervisor-result",
+                str(root / "result.json"),
+                "--supervisor-state",
+                str(root / "state.json"),
+                "--transcript",
+                str(root / "transcript.log"),
+                "--custom-command",
+                "--finalization-path",
+                str(marker),
+                "--finalization-timeout-seconds",
+                "0.35",
+                "--deadline-path",
+                str(root / "DEADLINE.json"),
+                "--deadline-reminder-seconds",
+                "0.1",
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads((root / "result.json").read_text())
+            self.assertFalse(payload["timed_out"])
+            self.assertTrue(payload["finalization_started"])
+            self.assertIsNone(payload["timeout_phase"])
+            self.assertGreater(payload["elapsed_seconds"], 0.2)
+
+    def test_machine_publication_grace_may_cross_attempt_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root, timeout=0.5)
+            command = self.publication_command(
+                root,
+                task,
+                attempt,
+                ["/bin/sh", "-c", "sleep 30 & wait"],
+                timeout=0.5,
+                handoff_grace=0.65,
+            )
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertTrue(payload["publication_requested"])
+            self.assertFalse(payload["timed_out"])
+            self.assertGreater(payload["elapsed_seconds"], 0.5)
+
+    def test_machine_rejects_marker_first_observed_after_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root, timeout=0.2)
+            marker_path = attempt / "runtime" / "HANDOFF_READY.json"
+            self.assertTrue(marker_path.is_file())
+            time.sleep(0.25)
+            command = self.publication_command(
+                root,
+                task,
+                attempt,
+                ["/bin/sh", "-c", "sleep 30 & wait"],
+                timeout=0.2,
+            )
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(124, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertTrue(payload["timed_out"])
+            self.assertFalse(payload["publication_requested"])
+            self.assertTrue(payload["late_publication"])
+
+    def test_machine_rejects_predeadline_marker_first_observed_after_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root, timeout=0.2)
+            time.sleep(0.25)
+            command = self.publication_command(
+                root,
+                task,
+                attempt,
+                ["/bin/sh", "-c", "sleep 30 & wait"],
+                timeout=0.2,
+                handoff_grace=0,
+            )
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(124, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertFalse(payload["publication_requested"])
+            self.assertTrue(payload["timed_out"])
+            self.assertTrue(payload["late_publication"])
+
+    def test_machine_natural_exit_near_deadline_is_not_timed_out(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("work\n")
+            command = [
+                sys.executable,
+                str(SUPERVISOR),
+                "--backend",
+                "claude-code",
+                "--argv-json",
+                json.dumps(["/bin/sleep", "0.12"]),
+                "--cwd",
+                str(root),
+                "--prompt-path",
+                str(root / "prompt.md"),
+                "--prompt-transport",
+                "arg",
+                "--startup-timeout-seconds",
+                "1",
+                "--timeout-seconds",
+                "0.2",
+                "--startup-result",
+                str(root / "STARTUP.json"),
+                "--supervisor-result",
+                str(root / "result.json"),
+                "--supervisor-state",
+                str(root / "state.json"),
+                "--transcript",
+                str(root / "transcript.log"),
+                "--custom-command",
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads((root / "result.json").read_text())
+            self.assertFalse(payload["timed_out"])
+            self.assertIsNone(payload["timeout_phase"])
+
+    def test_machine_small_deadline_overrun_is_timed_out(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "prompt.md").write_text("work\n")
+            command = [
+                sys.executable,
+                str(SUPERVISOR),
+                "--backend",
+                "claude-code",
+                "--argv-json",
+                json.dumps(["/bin/sleep", "0.26"]),
+                "--cwd",
+                str(root),
+                "--prompt-path",
+                str(root / "prompt.md"),
+                "--prompt-transport",
+                "arg",
+                "--startup-timeout-seconds",
+                "1",
+                "--timeout-seconds",
+                "0.2",
+                "--startup-result",
+                str(root / "STARTUP.json"),
+                "--supervisor-result",
+                str(root / "result.json"),
+                "--supervisor-state",
+                str(root / "state.json"),
+                "--transcript",
+                str(root / "transcript.log"),
+                "--custom-command",
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(124, result.returncode, result.stderr)
+            payload = json.loads((root / "result.json").read_text())
+            self.assertTrue(payload["timed_out"])
+            self.assertEqual("execution", payload["timeout_phase"])
+
     def test_valid_v2_ready_stops_machine_worker_and_cleans_descendants(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -511,6 +816,45 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             state = json.loads((attempt / "runtime" / "supervisor.json").read_text())
             self.assertEqual("handoff_ready", state["state"])
 
+    def test_ready_replacement_during_shutdown_invalidates_machine_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root)
+            marker = attempt / "runtime" / "HANDOFF_READY.json"
+            worker = [
+                sys.executable,
+                "-c",
+                (
+                    "import os,pathlib,time; "
+                    f"p=pathlib.Path({str(marker)!r}); "
+                    "time.sleep(.2); "
+                    "q=p.with_name('replacement-ready.json'); "
+                    "q.write_bytes(p.read_bytes()); os.replace(q,p)"
+                ),
+            ]
+            result = subprocess.run(
+                self.publication_command(
+                    root,
+                    task,
+                    attempt,
+                    worker,
+                    handoff_grace=0.5,
+                ),
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertEqual(125, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertFalse(payload["publication_requested"])
+            self.assertTrue(payload["publication_invalidated"])
+            self.assertTrue(
+                any(
+                    "identity changed" in reason
+                    for reason in payload["handoff_ready"]["reasons"]
+                )
+            )
+
     def test_invalid_v2_ready_does_not_stop_machine_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -528,11 +872,12 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             ]
             command = self.publication_command(root, task, attempt, worker)
             result = subprocess.run(command, capture_output=True, text=True, timeout=8)
-            self.assertEqual(0, result.returncode, result.stderr)
-            self.assertTrue(sentinel.exists())
+            self.assertEqual(125, result.returncode, result.stderr)
+            self.assertFalse(sentinel.exists())
             payload = json.loads((attempt / "supervisor-result.json").read_text())
             self.assertFalse(payload["publication_requested"])
             self.assertFalse(payload["handoff_ready"]["valid"])
+            self.assertTrue(payload["publication_invalidated"])
             self.assertTrue(
                 any("evidence_sha256" in reason for reason in payload["handoff_ready"]["reasons"])
             )
@@ -578,7 +923,7 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             payload = json.loads((attempt / "supervisor-result.json").read_text())
             self.assertFalse(payload["publication_requested"])
             self.assertTrue(
-                any("exact full Git object id" in reason for reason in payload["handoff_ready"]["reasons"])
+                any("source_commit" in reason for reason in payload["handoff_ready"]["reasons"])
             )
 
     def test_machine_supervisor_still_accepts_legacy_completion(self):
@@ -603,6 +948,12 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             self.write_json(
                 task / "HANDOFF.json",
                 {"requested_state": "strategy_review", "strategy_sha256": "abc"},
+            )
+            load_or_create_attempt_deadline(
+                attempt / "runtime" / "DEADLINE.json",
+                attempt_timeout_seconds=2,
+                finalization_grace_seconds=90,
+                reminder_seconds=0.1,
             )
             write_completion(
                 task,

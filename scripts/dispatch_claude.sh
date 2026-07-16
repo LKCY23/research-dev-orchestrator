@@ -31,6 +31,7 @@ STATUS_UPDATED=0
 DISPATCH_LOCK_ACQUIRED=0
 KEEP_DISPATCH_LOCK_ON_EXIT=0
 PROCESS_CLEANUP_FAILED=0
+SUPERVISOR_CLEANUP_FAILED=0
 TMUX_WORKER_LAUNCHED=0
 
 sanitize_name() {
@@ -242,14 +243,16 @@ on_exit() {
   local code="$?"
   local reconcile_code=0
   local cleanup_code=0
-  if [[ "${code}" -eq 0 ]]; then
+  if [[ "${code}" -eq 0 && \
+        "${PROCESS_CLEANUP_FAILED}" != "1" && \
+        "${SUPERVISOR_CLEANUP_FAILED}" != "1" ]]; then
     release_dispatch_lock
     return 0
   fi
-  if [[ "${RDO_RUNTIME_BACKEND:-}" == "tmux" && \
-        "${TMUX_WORKER_LAUNCHED}" == "1" && \
-        ( -z "${EXIT_CODE_FILE:-}" || ! -f "${EXIT_CODE_FILE}" || \
-          "${PROCESS_CLEANUP_FAILED}" == "1" ) ]]; then
+  if [[ "${PROCESS_CLEANUP_FAILED}" == "1" || \
+        ( "${RDO_RUNTIME_BACKEND:-}" == "tmux" && \
+          "${TMUX_WORKER_LAUNCHED}" == "1" && \
+          ( -z "${EXIT_CODE_FILE:-}" || ! -f "${EXIT_CODE_FILE}" ) ) ]]; then
     set +e
     cleanup_attempt_processes
     cleanup_code=$?
@@ -284,7 +287,9 @@ on_exit() {
       --task-id "${TASK_ID}" >/dev/null
     reconcile_code=$?
     set -e
-    if [[ "${reconcile_code}" -ne 0 || "${PROCESS_CLEANUP_FAILED}" == "1" ]]; then
+    if [[ "${reconcile_code}" -ne 0 || \
+          "${PROCESS_CLEANUP_FAILED}" == "1" || \
+          "${SUPERVISOR_CLEANUP_FAILED}" == "1" ]]; then
       KEEP_DISPATCH_LOCK_ON_EXIT=1
     else
       KEEP_DISPATCH_LOCK_ON_EXIT=0
@@ -344,6 +349,8 @@ eval "${CONFIG_ENV}"
 : "${RDO_TMUX_SESSION_PREFIX:=${CONFIG_RDO_TMUX_SESSION_PREFIX}}"
 : "${RDO_TMUX_KEEP_SESSION:=${CONFIG_RDO_TMUX_KEEP_SESSION}}"
 : "${RDO_TMUX_WAIT_TIMEOUT_SECONDS:=${CONFIG_RDO_TMUX_WAIT_TIMEOUT_SECONDS}}"
+: "${RDO_FINALIZATION_GRACE_SECONDS:=90}"
+: "${RDO_DEADLINE_REMINDER_SECONDS:=60}"
 : "${RDO_ATTEMPT_PHASE:=auto}"
 
 STATUS_STATE="$(python3 - "${STATUS_PATH}" <<'PY'
@@ -499,6 +506,20 @@ if ! [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "${RDO_STARTUP_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "RDO_STARTUP_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if ! python3 - "${RDO_FINALIZATION_GRACE_SECONDS}" "${RDO_DEADLINE_REMINDER_SECONDS}" <<'PY'
+import math
+import sys
+
+try:
+    values = [float(item) for item in sys.argv[1:]]
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if all(math.isfinite(item) and item > 0 for item in values) else 1)
+PY
+then
+  echo "RDO finalization grace and deadline reminder must be positive finite seconds" >&2
   exit 2
 fi
 
@@ -795,6 +816,73 @@ fi
 
 ORIGINAL_WORKER_COMMAND="${RDO_WORKER_COMMAND}"
 SUPERVISOR_RESULT="${ATTEMPT_DIR}/supervisor-result.json"
+DEADLINE_PATH="${ATTEMPT_DIR}/runtime/DEADLINE.json"
+deadline_allows_resume_fallback() {
+  python3 - "${DEADLINE_PATH}" <<'PY'
+import json
+import sys
+import time
+
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+    deadline = float(payload["execution_deadline_at_epoch"])
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if time.time() < deadline else 1)
+PY
+}
+supervisor_allows_resume_fallback() {
+  python3 - "${SUPERVISOR_RESULT}" "${DEADLINE_PATH}" "${RDO_RUNTIME_BACKEND}" "${EXIT_CODE:-}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+try:
+    result_path = Path(sys.argv[1])
+    deadline_path = Path(sys.argv[2])
+    if result_path.is_symlink() or deadline_path.is_symlink():
+        raise ValueError("unsafe supervisor/deadline path")
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    deadline_raw = deadline_path.read_bytes()
+    deadline = json.loads(deadline_raw)
+except (OSError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+survivors = payload.get("surviving_pids")
+clean = (
+    payload.get("cleanup_verified") is True
+    and isinstance(survivors, list)
+    and survivors == []
+    and payload.get("timed_out") is False
+    and payload.get("publication_requested") is False
+    and isinstance(payload.get("deadline_sha256"), str)
+    and hashlib.sha256(deadline_raw).hexdigest()
+    == payload.get("deadline_sha256")
+    and payload.get("execution_deadline_at_epoch")
+    == deadline.get("execution_deadline_at_epoch")
+)
+if sys.argv[3] == "plain":
+    clean = (
+        clean
+        and type(payload.get("exit_code")) is int
+        and payload.get("exit_code") == 125
+        and payload.get("startup_failed") is True
+    )
+else:
+    try:
+        expected_exit = int(sys.argv[4])
+    except ValueError:
+        clean = False
+    else:
+        clean = (
+            clean
+            and expected_exit != 0
+            and type(payload.get("exit_code")) is int
+            and payload.get("exit_code") == expected_exit
+        )
+raise SystemExit(0 if clean else 1)
+PY
+}
 if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "2" ]]; then
   HANDOFF_PUBLICATION_PATH="${ATTEMPT_DIR}/runtime/HANDOFF_READY.json"
   TRANSCRIPT_PATH="${ATTEMPT_DIR}/runtime/transcript.log"
@@ -816,7 +904,9 @@ if [[ "${RDO_RUNTIME_BACKEND}" == "plain" ]]; then
     "${ATTEMPT_DIR}/runtime/SESSION.json" "${RDO_BACKEND_SESSION_ID}" \
     "${REGISTERED_BACKEND_COMMAND}" "${BACKEND_PROFILE_PATH}" \
     "${TASK_ARTIFACT_PROTOCOL_VERSION}" "${HANDOFF_PUBLICATION_PATH}" \
-    "${TASK_DIR}" "${ATTEMPT_ID}" <<'PY'
+    "${TASK_DIR}" "${ATTEMPT_ID}" "${ATTEMPT_DIR}/runtime/FINALIZATION.json" \
+    "${DEADLINE_PATH}" "${RDO_FINALIZATION_GRACE_SECONDS}" \
+    "${RDO_DEADLINE_REMINDER_SECONDS}" <<'PY'
 import shlex, sys
 (
     script, backend, argv_json, environment_json, cwd, prompt_path,
@@ -824,6 +914,7 @@ import shlex, sys
     supervisor_result, supervisor_state, transcript, strategy_id,
     strategy_sha256, session_result, existing_session_id, registered, backend_profile,
     artifact_protocol_version, publication_path, task_dir, attempt_id,
+    finalization_path, deadline_path, finalization_grace, deadline_reminder,
 ) = sys.argv[1:]
 parts = [
     sys.executable, script, "--backend", backend,
@@ -842,6 +933,10 @@ parts = [
     "--publication-path", publication_path,
     "--task-dir", task_dir,
     "--attempt-id", attempt_id,
+    "--finalization-path", finalization_path,
+    "--finalization-timeout-seconds", finalization_grace,
+    "--deadline-path", deadline_path,
+    "--deadline-reminder-seconds", deadline_reminder,
 ]
 if registered == "0":
     parts.append("--custom-command")
@@ -849,9 +944,9 @@ print(" ".join(shlex.quote(part) for part in parts))
 PY
 )"
 else
-  RDO_WORKER_COMMAND="$(python3 - "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${ORIGINAL_WORKER_COMMAND}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" "${TASK_ARTIFACT_PROTOCOL_VERSION}" "${HANDOFF_PUBLICATION_PATH}" "${TASK_DIR}" "${ATTEMPT_ID}" "${ATTEMPT_DIR}/runtime/FINALIZATION.json" <<'PY'
+  RDO_WORKER_COMMAND="$(python3 - "${SCRIPT_DIR}/supervise_attempt.py" "${ATTEMPT_TIMEOUT_SECONDS}" "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${ORIGINAL_WORKER_COMMAND}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" "${TASK_ARTIFACT_PROTOCOL_VERSION}" "${HANDOFF_PUBLICATION_PATH}" "${TASK_DIR}" "${ATTEMPT_ID}" "${ATTEMPT_DIR}/runtime/FINALIZATION.json" "${DEADLINE_PATH}" "${RDO_FINALIZATION_GRACE_SECONDS}" "${RDO_DEADLINE_REMINDER_SECONDS}" <<'PY'
 import shlex, sys
-script, timeout, result, cwd, command, strategy_id, strategy_sha256, artifact_protocol_version, publication_path, task_dir, attempt_id, finalization_path = sys.argv[1:]
+script, timeout, result, cwd, command, strategy_id, strategy_sha256, artifact_protocol_version, publication_path, task_dir, attempt_id, finalization_path, deadline_path, finalization_grace, deadline_reminder = sys.argv[1:]
 print(" ".join([
     shlex.quote(sys.executable), shlex.quote(script),
     "--timeout-seconds", shlex.quote(timeout),
@@ -864,7 +959,9 @@ print(" ".join([
     "--task-dir", shlex.quote(task_dir),
     "--attempt-id", shlex.quote(attempt_id),
     "--finalization-path", shlex.quote(finalization_path),
-    "--finalization-timeout-seconds", "90",
+    "--finalization-timeout-seconds", shlex.quote(finalization_grace),
+    "--deadline-path", shlex.quote(deadline_path),
+    "--deadline-reminder-seconds", shlex.quote(deadline_reminder),
     "--shell-command", shlex.quote(command),
 ]))
 PY
@@ -959,7 +1056,10 @@ failure = payload.get("failure") if isinstance(payload, dict) else None
 print("1" if isinstance(failure, dict) and failure.get("recoverable_resume_failure") is True else "0")
 PY
 )"
-      if [[ "${RUNTIME_FALLBACK}" == "1" ]]; then
+      if [[ "${RUNTIME_FALLBACK}" == "1" ]] && \
+         [[ "${EXIT_CODE}" -eq 125 ]] && \
+         deadline_allows_resume_fallback && \
+         supervisor_allows_resume_fallback; then
         cp "${ATTEMPT_DIR}/runtime/STARTUP.json" \
           "${ATTEMPT_DIR}/runtime/RESUME_STARTUP_FAILURE.json"
         [[ ! -f "${SUPERVISOR_RESULT}" ]] || cp "${SUPERVISOR_RESULT}" \
@@ -994,7 +1094,10 @@ PY
           "${TRANSCRIPT_PATH}" "${STRATEGY_ID}" "${STRATEGY_SHA256}" \
           "${ATTEMPT_DIR}/runtime/SESSION.json" "${FALLBACK_SESSION_ID}" \
           "${BACKEND_PROFILE_PATH}" "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
-          "${HANDOFF_PUBLICATION_PATH}" "${TASK_DIR}" "${ATTEMPT_ID}" <<'PY'
+          "${HANDOFF_PUBLICATION_PATH}" "${TASK_DIR}" "${ATTEMPT_ID}" \
+          "${ATTEMPT_DIR}/runtime/FINALIZATION.json" "${DEADLINE_PATH}" \
+          "${RDO_FINALIZATION_GRACE_SECONDS}" \
+          "${RDO_DEADLINE_REMINDER_SECONDS}" <<'PY'
 import shlex
 import sys
 
@@ -1004,6 +1107,7 @@ import sys
     supervisor_result, supervisor_state, transcript, strategy_id,
     strategy_sha256, session_result, existing_session_id, backend_profile,
     artifact_protocol_version, publication_path, task_dir, attempt_id,
+    finalization_path, deadline_path, finalization_grace, deadline_reminder,
 ) = sys.argv[1:]
 parts = [
     sys.executable, script, "--backend", backend,
@@ -1022,6 +1126,10 @@ parts = [
     "--publication-path", publication_path,
     "--task-dir", task_dir,
     "--attempt-id", attempt_id,
+    "--finalization-path", finalization_path,
+    "--finalization-timeout-seconds", finalization_grace,
+    "--deadline-path", deadline_path,
+    "--deadline-reminder-seconds", deadline_reminder,
 ]
 print(" ".join(shlex.quote(part) for part in parts))
 PY
@@ -1064,7 +1172,9 @@ failure = payload.get("failure") if isinstance(payload, dict) else None
 print("1" if isinstance(failure, dict) and failure.get("recoverable_resume_failure") is True else "0")
 PY
 )"
-      if [[ "${RUNTIME_FALLBACK}" == "1" ]]; then
+      if [[ "${RUNTIME_FALLBACK}" == "1" ]] && \
+         deadline_allows_resume_fallback && \
+         supervisor_allows_resume_fallback; then
         cp "${ATTEMPT_DIR}/runtime/STARTUP.json" \
           "${ATTEMPT_DIR}/runtime/RESUME_STARTUP_FAILURE.json"
         [[ ! -f "${SUPERVISOR_RESULT}" ]] || cp "${SUPERVISOR_RESULT}" \
@@ -1096,11 +1206,13 @@ PY
           "${SUPERVISOR_RESULT}" "${WORKTREE_PATH}" "${FALLBACK_ORIGINAL_COMMAND}" \
           "${STRATEGY_ID}" "${STRATEGY_SHA256}" "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
           "${HANDOFF_PUBLICATION_PATH}" "${TASK_DIR}" "${ATTEMPT_ID}" \
-          "${ATTEMPT_DIR}/runtime/FINALIZATION.json" <<'PY'
+          "${ATTEMPT_DIR}/runtime/FINALIZATION.json" "${DEADLINE_PATH}" \
+          "${RDO_FINALIZATION_GRACE_SECONDS}" \
+          "${RDO_DEADLINE_REMINDER_SECONDS}" <<'PY'
 import shlex
 import sys
 
-script, timeout, result, cwd, command, strategy_id, strategy_sha256, artifact_protocol_version, publication_path, task_dir, attempt_id, finalization_path = sys.argv[1:]
+script, timeout, result, cwd, command, strategy_id, strategy_sha256, artifact_protocol_version, publication_path, task_dir, attempt_id, finalization_path, deadline_path, finalization_grace, deadline_reminder = sys.argv[1:]
 print(" ".join([
     shlex.quote(sys.executable), shlex.quote(script),
     "--timeout-seconds", shlex.quote(timeout),
@@ -1113,7 +1225,9 @@ print(" ".join([
     "--task-dir", shlex.quote(task_dir),
     "--attempt-id", shlex.quote(attempt_id),
     "--finalization-path", shlex.quote(finalization_path),
-    "--finalization-timeout-seconds", "90",
+    "--finalization-timeout-seconds", shlex.quote(finalization_grace),
+    "--deadline-path", shlex.quote(deadline_path),
+    "--deadline-reminder-seconds", shlex.quote(deadline_reminder),
     "--shell-command", shlex.quote(command),
 ]))
 PY
@@ -1216,10 +1330,49 @@ fi
 
 if [[ -f "${SUPERVISOR_RESULT}" ]] && python3 - "${SUPERVISOR_RESULT}" <<'PY'
 import json, sys
-raise SystemExit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("timed_out") else 1)
+try:
+    payload = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if payload.get("timed_out") is True else 1)
 PY
 then
   append_event "attempt_timed_out"
+fi
+
+set +e
+python3 - "${SUPERVISOR_RESULT}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+try:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("missing or unsafe supervisor result")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError, json.JSONDecodeError):
+    raise SystemExit(2)
+survivors = payload.get("surviving_pids")
+healthy = (
+    payload.get("cleanup_verified") is True
+    and isinstance(survivors, list)
+    and survivors == []
+)
+raise SystemExit(0 if healthy else 3)
+PY
+SUPERVISOR_HEALTH_CODE=$?
+set -e
+if [[ "${SUPERVISOR_HEALTH_CODE}" -ne 0 ]]; then
+  PROCESS_CLEANUP_FAILED=1
+  SUPERVISOR_CLEANUP_FAILED=1
+  set +e
+  cleanup_attempt_processes
+  CLEANUP_RETRY_CODE=$?
+  set -e
+  if [[ "${CLEANUP_RETRY_CODE}" -eq 0 ]]; then
+    PROCESS_CLEANUP_FAILED=0
+  fi
 fi
 
 set +e

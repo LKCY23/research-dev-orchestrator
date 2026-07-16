@@ -114,4 +114,5 @@ python3 "${RDO_ROOT}/scripts/protocol_cli.py" validate-handoff \
   --attempt-id "${attempt_id}" \
   --task-dir "${task}" \
   --attempt-path "${task}/attempts/${attempt_id}/ATTEMPT.json" \
+  --supervisor-result "${task}/attempts/${attempt_id}/supervisor-result.json" \
   --exit-code-raw 0

@@ -149,6 +149,8 @@ class ArtifactBundleTests(unittest.TestCase):
                 bundle.task_inputs_binding.attempt_binding_sha256,
                 bundle.ready["attempt_binding_sha256"],
             )
+            self.assertIsInstance(bundle.ready["published_at_epoch"], float)
+            self.assertTrue(bundle.ready["published_at"].endswith("Z"))
 
             approval = artifact_binding(bundle)
             loaded = validate_artifact_binding(
@@ -259,6 +261,16 @@ class ArtifactBundleTests(unittest.TestCase):
             del marker["evidence_sha256"]
             self.write_json(marker_path, marker)
             with self.assertRaisesRegex(IntegrityError, "evidence_sha256"):
+                load_bundle(attempt)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = self.make_attempt(Path(temporary))
+            self.publish(attempt)
+            marker_path = attempt / "runtime" / "HANDOFF_READY.json"
+            marker = json.loads(marker_path.read_text())
+            marker["published_at_epoch"] += 10
+            self.write_json(marker_path, marker)
+            with self.assertRaisesRegex(IntegrityError, "published_at"):
                 load_bundle(attempt)
 
         with tempfile.TemporaryDirectory() as temporary:

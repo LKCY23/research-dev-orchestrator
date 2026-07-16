@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -46,7 +47,7 @@ from task_contract import (
     validate_task_inputs_payload,
     write_task_inputs_immutable,
 )
-from supervisor import terminate_processes
+from supervisor import terminate_processes, validate_attempt_deadline_payload
 from validation import (
     HandoffValidationResult,
     parse_exit_code,
@@ -859,6 +860,108 @@ def _v2_log_binding_valid(attempt_dir: Path, record: Mapping[str, Any], prefix: 
         return False
 
 
+def _v2_finalization_binding(
+    attempt_dir: Path,
+    bundle: Any,
+) -> tuple[list[str], str | None, float | None]:
+    """Independently validate the immutable source/deadline freeze."""
+
+    from strategy import canonical_digest
+
+    reasons: list[str] = []
+    required_refs = {
+        "runtime/finalization-worktree.json",
+        "runtime/FINALIZATION.json",
+        "runtime/DEADLINE.json",
+    }
+    artifacts = bundle.evidence.get("artifacts")
+    artifact_refs = {
+        item.get("ref")
+        for item in artifacts
+        if isinstance(item, dict) and isinstance(item.get("ref"), str)
+    } if isinstance(artifacts, list) else set()
+    missing = sorted(required_refs - artifact_refs)
+    if missing:
+        reasons.append(
+            f"EVIDENCE.json is missing finalization artifacts: {missing}"
+        )
+        return reasons, None, None
+    try:
+        snapshot_path = safe_ref(
+            attempt_dir,
+            "runtime/finalization-worktree.json",
+        )
+        marker_path = safe_ref(attempt_dir, "runtime/FINALIZATION.json")
+        deadline_path = safe_ref(attempt_dir, "runtime/DEADLINE.json")
+        snapshot = load_json(snapshot_path)
+        marker = load_json(marker_path)
+        deadline = validate_attempt_deadline_payload(load_json(deadline_path))
+    except (ArtifactBundleError, OSError, ValueError, json.JSONDecodeError) as exc:
+        return [f"finalization artifacts are invalid: {exc}"], None, None
+    binding = bundle.task_inputs_binding
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("schema_version") != 2
+        or snapshot.get("task_id") != binding.task_id
+        or snapshot.get("attempt_id") != binding.attempt_id
+        or not isinstance(snapshot.get("entries"), list)
+        or snapshot.get("entries_sha256")
+        != canonical_digest(snapshot.get("entries"))
+    ):
+        reasons.append("finalization source snapshot is invalid")
+        frozen_entries_sha256 = None
+    else:
+        frozen_entries_sha256 = str(snapshot["entries_sha256"])
+    expected_marker = {
+        "schema_version": 2,
+        "artifact_protocol_version": 2,
+        "stage": "finalizing",
+        "task_id": binding.task_id,
+        "attempt_id": binding.attempt_id,
+        "task_inputs_sha256": binding.task_inputs_sha256,
+        "source_snapshot_ref": "runtime/finalization-worktree.json",
+        "deadline_ref": "runtime/DEADLINE.json",
+    }
+    if not isinstance(marker, dict) or any(
+        marker.get(key) != value for key, value in expected_marker.items()
+    ):
+        reasons.append("FINALIZATION.json does not match the active attempt")
+        marker_started = None
+    else:
+        marker_started = marker.get("started_at_epoch")
+        if not isinstance(marker_started, (int, float)) or isinstance(
+            marker_started,
+            bool,
+        ):
+            reasons.append("FINALIZATION.json started_at_epoch is invalid")
+            marker_started = None
+        if marker.get("source_snapshot_sha256") != file_sha256(snapshot_path):
+            reasons.append("FINALIZATION.json source snapshot digest is invalid")
+        if marker.get("deadline_sha256") != file_sha256(deadline_path):
+            reasons.append("FINALIZATION.json deadline digest is invalid")
+        grace = marker.get("grace_seconds")
+        marker_deadline = marker.get("deadline_at_epoch")
+        if (
+            not isinstance(grace, (int, float))
+            or isinstance(grace, bool)
+            or not isinstance(marker_deadline, (int, float))
+            or isinstance(marker_deadline, bool)
+            or float(grace) != float(deadline["finalization_grace_seconds"])
+            or abs(
+                float(marker_deadline)
+                - (
+                    float(deadline["execution_deadline_at_epoch"])
+                    + float(deadline["finalization_grace_seconds"])
+                )
+            )
+            > 1e-6
+        ):
+            reasons.append("FINALIZATION.json deadline arithmetic is invalid")
+    return reasons, frozen_entries_sha256, (
+        float(marker_started) if marker_started is not None else None
+    )
+
+
 def _v2_acceptance_reasons(
     task_dir: Path,
     attempt_dir: Path,
@@ -871,6 +974,10 @@ def _v2_acceptance_reasons(
     """Independently enforce frozen checks/outputs after bundle publication."""
 
     reasons: list[str] = []
+    finalization_reasons, frozen_entries_sha256, marker_started = (
+        _v2_finalization_binding(attempt_dir, bundle)
+    )
+    reasons.extend(finalization_reasons)
     try:
         contract = _v2_frozen_acceptance(task_dir, bundle)
         records = load_command_records(attempt_dir, required=False)
@@ -917,6 +1024,24 @@ def _v2_acceptance_reasons(
                 and record.get("exit_code") == 0
                 and record.get("timed_out") is False
                 and record.get("surviving_processes") == []
+                and record.get("cleanup_verified", True) is True
+                and frozen_entries_sha256 is not None
+                and record.get("source_before_entries_sha256")
+                == frozen_entries_sha256
+                and record.get("source_after_entries_sha256")
+                == frozen_entries_sha256
+                and record.get("source_unchanged") is True
+                and (
+                    "finalization_started_at_epoch" not in record
+                    or marker_started is not None
+                    and record.get("finalization_started_at_epoch")
+                    == marker_started
+                )
+                and (
+                    "source_snapshot_entries_sha256" not in record
+                    or record.get("source_snapshot_entries_sha256")
+                    == frozen_entries_sha256
+                )
                 and _v2_log_binding_valid(attempt_dir, record, "stdout")
                 and _v2_log_binding_valid(attempt_dir, record, "stderr")
             ):
@@ -1284,6 +1409,15 @@ def _validate_v2_handoff(
             )
         elif bundle is not None and phase == "execution":
             reasons.extend(_v2_execution_strategy_reasons(bundle, worktree))
+        if bundle is not None:
+            reasons.extend(
+                _initial_strategy_review_reasons(
+                    task_dir=task_dir,
+                    task_id=str(status.get("task_id") or ""),
+                    attempt_id=attempt_id,
+                    bundle=bundle,
+                )
+            )
     elif requested_state in {"verified", "review"}:
         if phase != "execution":
             reasons.append(f"{requested_state} handoff requires an execution attempt")
@@ -1317,6 +1451,11 @@ def _validate_v2_handoff(
     elif requested_state == "blocked":
         if phase not in {"planning", "execution"}:
             reasons.append("blocked handoff requires an active planning or execution attempt")
+        if bundle is not None:
+            finalization_reasons, _frozen_sha, _marker_started = (
+                _v2_finalization_binding(attempt_dir, bundle)
+            )
+            reasons.extend(finalization_reasons)
         if phase == "planning" and bundle is not None:
             reasons.extend(
                 _v2_planning_worktree_reasons(
@@ -1731,6 +1870,42 @@ def _completed_strategy_review_reasons(
     return reasons
 
 
+def _initial_strategy_review_reasons(
+    *,
+    task_dir: Path,
+    task_id: str,
+    attempt_id: str,
+    bundle: Any,
+) -> list[str]:
+    """Reuse provenance validation without requiring the post-publication event."""
+
+    try:
+        submission = load_json(
+            bundle.attempt_dir / "runtime" / "STRATEGY_SUBMISSION.json"
+        )
+    except Exception:
+        submission = {}
+    synthetic_event = {
+        "event": "strategy_submitted",
+        "actor": "worker",
+        "task_id": task_id,
+        "revision": submission.get("strategy_revision"),
+        "strategy_id": submission.get("strategy_id"),
+        "strategy_sha256": submission.get("strategy_sha256"),
+    }
+    return [
+        reason.replace("completed replay ", "strategy review ", 1)
+        for reason in _completed_strategy_review_reasons(
+            task_dir=task_dir,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            bundle=bundle,
+            records=[synthetic_event],
+            require_coordinator_review=False,
+        )
+    ]
+
+
 def _completed_replay_event_reasons(
     *,
     status: Mapping[str, Any],
@@ -2011,8 +2186,28 @@ def _failed_attempt_outcome(
         "tui_startup_failed",
     }:
         return "startup_failed"
-    if isinstance(supervisor, Mapping) and supervisor.get("timed_out") is True:
-        return "timed_out_unfinalized"
+    if isinstance(supervisor, Mapping):
+        if (
+            supervisor.get("finalization_timed_out") is True
+            or supervisor.get("timeout_phase") == "finalization"
+        ):
+            return "finalization_timed_out"
+        if supervisor.get("timed_out") is True:
+            deadline_state = supervisor.get("deadline")
+            if (
+                supervisor.get("finalization_started") is True
+                or isinstance(deadline_state, Mapping)
+                and deadline_state.get("phase") == "finalization"
+                or (
+                    task_dir
+                    / "attempts"
+                    / attempt_id
+                    / "runtime"
+                    / "FINALIZATION.json"
+                ).is_file()
+            ):
+                return "finalization_timed_out"
+            return "timed_out_unfinalized"
     attempt_dir = task_dir / "attempts" / attempt_id
     attempt_metadata = _optional_json(str(attempt_dir / "ATTEMPT.json")) or {}
     publication = supervisor.get("publication") if isinstance(supervisor, Mapping) else None
@@ -2032,7 +2227,14 @@ def _failed_attempt_outcome(
         and supervisor.get("publication_invalidated") is True
     ) or isinstance(publication, Mapping) and publication.get("payload") is not None:
         has_candidate = True
-    if has_candidate or exit_code is None or exit_code == 0:
+    if has_candidate or exit_code is None:
+        return "invalid_handoff"
+    if (
+        isinstance(supervisor, Mapping)
+        and supervisor.get("finalization_started") is True
+    ) or (attempt_dir / "runtime" / "FINALIZATION.json").exists():
+        return "finalization_failed"
+    if exit_code == 0:
         return "invalid_handoff"
     return "execution_failed"
 
@@ -2059,6 +2261,18 @@ def _failure_status_fields(
             "budget",
             "attempt timed out without a valid finalized handoff",
         )
+    if outcome == "finalization_timed_out":
+        return (
+            "Worker finalization grace expired",
+            "budget",
+            "worker entered finalization but did not publish a valid handoff within grace",
+        )
+    if outcome == "finalization_failed":
+        return (
+            "Worker exited during finalization",
+            "needs_coordinator",
+            "worker entered finalization but exited before publishing a valid handoff",
+        )
     if outcome == "execution_failed":
         return (
             "Worker execution failed",
@@ -2070,6 +2284,186 @@ def _failure_status_fields(
         "needs_coordinator",
         "invalid worker handoff",
     )
+
+
+def _v2_supervisor_receipt_reasons(
+    supervisor: Mapping[str, Any] | None,
+    *,
+    attempt_path: Path,
+) -> list[str]:
+    """Validate the coordinator-owned proof that publication beat the deadline."""
+
+    if not isinstance(supervisor, Mapping):
+        return ["v2 dispatch requires a readable supervisor result"]
+    reasons: list[str] = []
+
+    def require_bool(name: str, expected: bool) -> None:
+        value = supervisor.get(name)
+        if type(value) is not bool or value is not expected:
+            reasons.append(f"v2 handoff supervisor {name} must be {expected}")
+
+    require_bool("publication_requested", True)
+    require_bool("completion_requested", True)
+    require_bool("timed_out", False)
+    require_bool("cleanup_verified", True)
+    require_bool("late_publication", False)
+    require_bool("publication_unaccepted", False)
+    require_bool("publication_invalidated", False)
+    require_bool("finalization_timed_out", False)
+    exit_code = supervisor.get("exit_code")
+    if type(exit_code) is not int or exit_code != 0:
+        reasons.append("v2 handoff supervisor exit_code must be integer 0")
+    survivors = supervisor.get("surviving_pids")
+    if not isinstance(survivors, list) or survivors:
+        reasons.append("v2 handoff supervisor surviving_pids must be an empty array")
+    if supervisor.get("timeout_phase") is not None:
+        reasons.append("v2 handoff supervisor timeout_phase must be null")
+    if supervisor.get("artifact_protocol_version") != 2:
+        reasons.append("v2 handoff supervisor artifact_protocol_version must be 2")
+
+    attempt_dir = attempt_path.parent
+    ready_path = attempt_dir / "runtime" / "HANDOFF_READY.json"
+    deadline_path = attempt_dir / "runtime" / "DEADLINE.json"
+    accepted_digest = supervisor.get("accepted_publication_sha256")
+    receipt = supervisor.get("accepted_publication_receipt")
+    try:
+        ready = load_json(ready_path)
+        ready_metadata = ready_path.stat(follow_symlinks=False)
+    except Exception as exc:
+        reasons.append(f"v2 handoff publication identity is unreadable: {exc}")
+        ready = None
+        ready_metadata = None
+    if (
+        not isinstance(accepted_digest, str)
+        or ready_path.is_symlink()
+        or not ready_path.is_file()
+        or file_sha256(ready_path) != accepted_digest
+    ):
+        reasons.append("v2 handoff supervisor publication digest is missing or changed")
+    if not isinstance(receipt, Mapping):
+        reasons.append("v2 handoff supervisor accepted publication receipt is missing")
+    elif ready_metadata is not None:
+        expected_identity = {
+            "sha256": accepted_digest,
+            "mtime_ns": int(ready_metadata.st_mtime_ns),
+            "device": int(ready_metadata.st_dev),
+            "inode": int(ready_metadata.st_ino),
+            "size": int(ready_metadata.st_size),
+        }
+        for field, expected in expected_identity.items():
+            if receipt.get(field) != expected:
+                reasons.append(
+                    f"v2 handoff supervisor publication receipt {field} is invalid"
+                )
+        receipt_ctime_ns = receipt.get("ctime_ns")
+        if (
+            type(receipt_ctime_ns) is not int
+            or receipt_ctime_ns <= 0
+            or int(ready_metadata.st_ctime_ns) < receipt_ctime_ns
+        ):
+            reasons.append(
+                "v2 handoff supervisor publication receipt ctime_ns is invalid"
+            )
+        source = receipt.get("source")
+        final_source = supervisor.get("final_source")
+        requested_state = ready.get("requested_state") if isinstance(ready, dict) else None
+        source_commit = ready.get("source_commit") if isinstance(ready, dict) else None
+        if source_commit is not None:
+            if (
+                not isinstance(source, Mapping)
+                or source.get("source_commit") != source_commit
+            ):
+                reasons.append(
+                    "v2 handoff supervisor receipt does not bind Git HEAD"
+                )
+            if (
+                not isinstance(final_source, Mapping)
+                or final_source.get("source_commit") != source_commit
+                or (
+                    requested_state != "blocked"
+                    and final_source.get("worktree_clean") is not True
+                )
+            ):
+                reasons.append(
+                    "v2 handoff supervisor final source state is invalid"
+                )
+        elif requested_state in {"verified", "review"}:
+            reasons.append(
+                "v2 final-state publication is missing its source_commit"
+            )
+
+    try:
+        deadline = validate_attempt_deadline_payload(load_json(deadline_path))
+    except Exception as exc:
+        reasons.append(f"v2 handoff deadline is unreadable: {exc}")
+        deadline = None
+    deadline_digest = supervisor.get("deadline_sha256")
+    if (
+        not isinstance(deadline_digest, str)
+        or deadline_path.is_symlink()
+        or not deadline_path.is_file()
+        or file_sha256(deadline_path) != deadline_digest
+    ):
+        reasons.append("v2 handoff supervisor deadline digest is missing or changed")
+    if isinstance(deadline, dict):
+        started = float(deadline["started_at_epoch"])
+        execution = float(deadline["execution_deadline_at_epoch"])
+        grace = float(deadline["finalization_grace_seconds"])
+        requested_state = ready.get("requested_state") if isinstance(ready, dict) else None
+        if requested_state == "strategy_review":
+            require_bool("finalization_started", False)
+            active = execution
+        else:
+            require_bool("finalization_started", True)
+            active = execution + grace
+        for field, expected in (
+            ("attempt_started_at_epoch", started),
+            ("execution_deadline_at_epoch", execution),
+            ("active_deadline_at_epoch", active),
+        ):
+            value = supervisor.get(field)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or not math.isclose(float(value), expected, rel_tol=0, abs_tol=1e-6)
+            ):
+                reasons.append(f"v2 handoff supervisor {field} is invalid")
+        if isinstance(receipt, Mapping):
+            observed = receipt.get("observed_at_epoch")
+            marker_ctime = receipt.get("ctime")
+            if (
+                not isinstance(observed, (int, float))
+                or isinstance(observed, bool)
+                or not math.isfinite(float(observed))
+                or float(observed) < started - 0.001
+                or float(observed) > active + 1e-6
+            ):
+                reasons.append(
+                    "v2 handoff supervisor observation is outside the active deadline"
+                )
+            if (
+                not isinstance(marker_ctime, (int, float))
+                or isinstance(marker_ctime, bool)
+                or not math.isfinite(float(marker_ctime))
+                or float(marker_ctime) < started - 0.001
+                or float(marker_ctime) > active + 0.001
+                or (
+                    isinstance(observed, (int, float))
+                    and not isinstance(observed, bool)
+                    and float(marker_ctime) > float(observed) + 0.001
+                )
+            ):
+                reasons.append(
+                    "v2 handoff publication marker is outside the active deadline"
+                )
+    publication = supervisor.get("publication")
+    if (
+        not isinstance(publication, Mapping)
+        or publication.get("valid") is not True
+    ):
+        reasons.append("v2 handoff supervisor did not fully validate publication")
+    return reasons
 
 
 def cmd_validate_handoff(args: argparse.Namespace) -> int:
@@ -2093,6 +2487,7 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
         and initial_attempt.get("handoff_valid") is True
     )
     expected_version = getattr(args, "expected_artifact_protocol_version", None)
+    supervisor_reasons: list[str] = []
     expected_dispatch = {
         "task_id": getattr(args, "expected_task_id", "") or None,
         "artifact_protocol_version": expected_version,
@@ -2142,6 +2537,14 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
             reasons=[str(exc)],
         )
     else:
+        supervisor_reasons = (
+            _v2_supervisor_receipt_reasons(
+                supervisor_payload,
+                attempt_path=attempt_path,
+            )
+            if version == 2
+            else []
+        )
         if allow_completed_attempt and isinstance(status, dict):
             replay_phase = expected_dispatch.get("phase") or initial_attempt.get("phase")
             active_state = "planning" if replay_phase == "planning" else "running"
@@ -2161,6 +2564,11 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
                 if replay_reasons:
                     print("completed_dispatch_replay_rejected", file=sys.stderr)
                     for reason in replay_reasons:
+                        print(f"- {reason}", file=sys.stderr)
+                    return 4
+                if supervisor_reasons:
+                    print("completed_dispatch_replay_rejected", file=sys.stderr)
+                    for reason in supervisor_reasons:
                         print(f"- {reason}", file=sys.stderr)
                     return 4
                 return 0
@@ -2183,6 +2591,71 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
             handoff_state=None,
             exit_code=result.exit_code,
             reasons=[status_error, *result.reasons],
+        )
+    surviving_pids = (
+        supervisor_payload.get("surviving_pids")
+        if isinstance(supervisor_payload, dict)
+        else None
+    )
+    cleanup_verified = (
+        supervisor_payload.get("cleanup_verified")
+        if isinstance(supervisor_payload, dict)
+        else None
+    )
+    cleanup_failure: dict[str, Any] | None = None
+    supervisor_result_arg = str(getattr(args, "supervisor_result", "") or "")
+    if version == 2 and supervisor_result_arg and not isinstance(
+        supervisor_payload,
+        dict,
+    ):
+        cleanup_failure = {
+            "terminated": False,
+            "cleanup_verified": False,
+            "surviving_pids": [],
+            "reason": "supervisor_result_missing_or_unreadable",
+        }
+    if isinstance(surviving_pids, list) and surviving_pids:
+        cleanup_failure = {
+            "terminated": False,
+            "cleanup_verified": cleanup_verified is not False,
+            "surviving_pids": surviving_pids,
+            "reason": "surviving_worker_descendants",
+        }
+    elif cleanup_verified is False:
+        cleanup_failure = {
+            "terminated": False,
+            "cleanup_verified": False,
+            "surviving_pids": [],
+            "reason": str(
+                supervisor_payload.get("cleanup_failure_reason")
+                or "process cleanup could not be verified"
+            ),
+        }
+    if cleanup_failure is not None:
+        result = HandoffValidationResult(
+            valid=False,
+            handoff_state=result.handoff_state,
+            exit_code=result.exit_code,
+            reasons=[
+                *result.reasons,
+                (
+                    f"supervisor left surviving worker descendants: {surviving_pids}"
+                    if surviving_pids
+                    else "supervisor could not verify complete worker process cleanup"
+                ),
+            ],
+            request=result.request,
+        )
+    if supervisor_reasons:
+        result = HandoffValidationResult(
+            valid=False,
+            handoff_state=result.handoff_state,
+            exit_code=result.exit_code,
+            reasons=[
+                *result.reasons,
+                *supervisor_reasons,
+            ],
+            request=result.request,
         )
 
     verified_commit = None
@@ -2331,6 +2804,8 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
         attempt["handoff_state"] = None
         if startup_failure is not None:
             attempt["startup_failure"] = startup_failure
+        if cleanup_failure is not None:
+            attempt["cleanup_failure"] = cleanup_failure
         write_attempt_state(attempt_path, attempt)
         try:
             summary, blocker_type, blocking_reason = _failure_status_fields(
@@ -2339,6 +2814,23 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
             )
             if outcome == "invalid_handoff" and result.reasons:
                 blocking_reason += ": " + "; ".join(result.reasons[:3])
+            if cleanup_failure is not None:
+                if cleanup_failure["surviving_pids"]:
+                    summary = "Worker process cleanup failed"
+                    blocker_type = "irrecoverable"
+                    blocking_reason = (
+                        "Supervisor could not terminate worker descendants "
+                        f"{cleanup_failure['surviving_pids']}; the dispatch lock "
+                        "must be retained for coordinator recovery."
+                    )
+                else:
+                    summary = "Worker process cleanup could not be verified"
+                    blocker_type = "environment"
+                    blocking_reason = (
+                        "Supervisor could not verify complete process cleanup "
+                        f"({cleanup_failure['reason']}); the dispatch lock must "
+                        "be retained for coordinator recovery."
+                    )
             apply_dispatch_terminal_transition(
                 Path(args.status_path),
                 target_state="blocked",
@@ -2507,6 +2999,12 @@ def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
 
     if attempt.get("state") == "invalid_handoff":
         outcome = str(attempt.get("outcome") or "invalid_handoff")
+        if isinstance(supervisor, dict) and (
+            supervisor.get("finalization_timed_out") is True
+            or supervisor.get("timeout_phase") == "finalization"
+        ):
+            outcome = "finalization_timed_out"
+            attempt["outcome"] = outcome
         startup_failure = (
             attempt.get("startup_failure")
             if isinstance(attempt.get("startup_failure"), dict)
@@ -2636,11 +3134,30 @@ def cmd_terminate_attempt_processes(args: argparse.Namespace) -> int:
         for value in state.get("observed_pgids", [])
         if isinstance(value, int) and value > 1
     }
-    survivors = terminate_processes(pgids, pids)
+    root_pid = state.get("worker_pid")
+    supervision_token = state.get("supervision_token")
+    cleanup_observation: dict[str, Any] = {"verified": True, "reason": None}
+    survivors = terminate_processes(
+        pgids,
+        pids,
+        root_pid=(
+            int(root_pid)
+            if isinstance(root_pid, int) and not isinstance(root_pid, bool)
+            else None
+        ),
+        supervision_token=(
+            supervision_token if isinstance(supervision_token, str) else None
+        ),
+        observed_pids=pids,
+        observed_pgids=pgids,
+        cleanup_observation=cleanup_observation,
+    )
     print(
         json.dumps(
             {
-                "terminated": True,
+                "terminated": bool(cleanup_observation["verified"] and not survivors),
+                "cleanup_verified": cleanup_observation["verified"],
+                "reason": cleanup_observation["reason"],
                 "observed_pids": sorted(pids),
                 "observed_pgids": sorted(pgids),
                 "surviving_pids": list(survivors),
@@ -2648,7 +3165,7 @@ def cmd_terminate_attempt_processes(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
-    return 0 if not survivors else 2
+    return 0 if cleanup_observation["verified"] and not survivors else 2
 
 
 def cmd_write_dispatch_diagnostics(args: argparse.Namespace) -> int:

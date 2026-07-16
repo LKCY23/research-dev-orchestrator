@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -24,7 +25,8 @@ from artifact_bundle import (  # noqa: E402
     publish_bundle,
 )
 from protocol_cli import cmd_validate_handoff  # noqa: E402
-from strategy import review_strategy, submit_strategy  # noqa: E402
+from strategy import canonical_digest, review_strategy, submit_strategy  # noqa: E402
+from supervisor import load_or_create_attempt_deadline  # noqa: E402
 from worktree_fingerprint import fingerprint  # noqa: E402
 
 
@@ -319,6 +321,157 @@ class ProtocolCliV2Tests(unittest.TestCase):
             "plain",
         )
         return attempt
+
+    @staticmethod
+    def sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def source_entries(self) -> list[dict[str, object]]:
+        return [
+            {
+                "path": item["path"],
+                "kind": item["kind"],
+                "mode": item["mode"],
+                "sha256": item["sha256"],
+            }
+            for item in fingerprint(self.root)["entries"]
+            if item.get("kind") != "missing"
+        ]
+
+    def prepare_finalization(
+        self,
+        attempt: Path,
+        *,
+        task_inputs_sha256: str,
+    ) -> tuple[str, float]:
+        runtime = attempt / "runtime"
+        deadline_path = runtime / "DEADLINE.json"
+        deadline = load_or_create_attempt_deadline(
+            deadline_path,
+            attempt_timeout_seconds=120,
+            finalization_grace_seconds=90,
+            reminder_seconds=30,
+        )
+        entries = self.source_entries()
+        snapshot_path = runtime / "finalization-worktree.json"
+        self.write_json(
+            snapshot_path,
+            {
+                "schema_version": 2,
+                "artifact_protocol_version": 2,
+                "task_id": "T001",
+                "attempt_id": attempt.name,
+                "entries_sha256": canonical_digest(entries),
+                "file_count": len(entries),
+                "entries": entries,
+            },
+        )
+        started_at_epoch = time.time()
+        marker_path = runtime / "FINALIZATION.json"
+        self.write_json(
+            marker_path,
+            {
+                "schema_version": 2,
+                "artifact_protocol_version": 2,
+                "stage": "finalizing",
+                "task_id": "T001",
+                "attempt_id": attempt.name,
+                "task_inputs_sha256": task_inputs_sha256,
+                "started_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(started_at_epoch),
+                ),
+                "started_at_epoch": started_at_epoch,
+                "grace_seconds": deadline["finalization_grace_seconds"],
+                "deadline_at_epoch": (
+                    deadline["execution_deadline_at_epoch"]
+                    + deadline["finalization_grace_seconds"]
+                ),
+                "source_snapshot_ref": "runtime/finalization-worktree.json",
+                "source_snapshot_sha256": self.sha256(snapshot_path),
+                "deadline_ref": "runtime/DEADLINE.json",
+                "deadline_sha256": self.sha256(deadline_path),
+            },
+        )
+        return canonical_digest(entries), started_at_epoch
+
+    def write_supervisor_receipt(
+        self,
+        attempt: Path,
+        *,
+        finalization_started: bool,
+    ) -> Path:
+        ready_path = attempt / "runtime" / "HANDOFF_READY.json"
+        deadline_path = attempt / "runtime" / "DEADLINE.json"
+        ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        deadline = json.loads(deadline_path.read_text(encoding="utf-8"))
+        metadata = ready_path.stat(follow_symlinks=False)
+        source_commit = ready.get("source_commit")
+        active_deadline = deadline["execution_deadline_at_epoch"] + (
+            deadline["finalization_grace_seconds"] if finalization_started else 0
+        )
+        supervisor_path = attempt / "supervisor-result.json"
+        self.write_json(
+            supervisor_path,
+            {
+                "exit_code": 0,
+                "timed_out": False,
+                "timeout_phase": None,
+                "artifact_protocol_version": 2,
+                "publication_requested": True,
+                "completion_requested": True,
+                "publication_invalidated": False,
+                "publication_unaccepted": False,
+                "late_publication": False,
+                "accepted_publication_sha256": self.sha256(ready_path),
+                "accepted_publication_receipt": {
+                    "sha256": self.sha256(ready_path),
+                    "ctime": metadata.st_ctime,
+                    "ctime_ns": metadata.st_ctime_ns,
+                    "mtime_ns": metadata.st_mtime_ns,
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "size": metadata.st_size,
+                    "observed_at_epoch": time.time(),
+                    "source": {"source_commit": source_commit},
+                },
+                "final_source": {
+                    "source_commit": source_commit,
+                    "worktree_clean": True,
+                },
+                "finalization_started": finalization_started,
+                "finalization_timed_out": False,
+                "publication": {"valid": True, "reasons": []},
+                "surviving_pids": [],
+                "cleanup_verified": True,
+                "cleanup_failure_reason": None,
+                "deadline_sha256": self.sha256(deadline_path),
+                "attempt_started_at_epoch": deadline["started_at_epoch"],
+                "execution_deadline_at_epoch": deadline[
+                    "execution_deadline_at_epoch"
+                ],
+                "active_deadline_at_epoch": active_deadline,
+            },
+        )
+        return supervisor_path
+
+    def validation_args(
+        self,
+        attempt: Path,
+        **overrides: object,
+    ) -> argparse.Namespace:
+        values: dict[str, object] = {
+            "attempt_path": str(attempt / "ATTEMPT.json"),
+            "task_dir": str(self.task_dir),
+            "status_path": str(self.task_dir / "STATUS.json"),
+            "attempt_id": attempt.name,
+            "exit_code_raw": "0",
+            "startup_path": "",
+            "supervisor_result": str(attempt / "supervisor-result.json"),
+            "worktree": str(self.root),
+        }
+        values.update(overrides)
+        return argparse.Namespace(**values)
 
     def test_readiness_failure_is_read_only(self) -> None:
         (self.task_dir / "CONTEXT.md").write_text(
@@ -770,6 +923,12 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
         self.write_json(runtime / "worktree-before.json", fingerprint(self.root))
         self.write_json(runtime / "worktree-after.json", fingerprint(self.root))
         (runtime / "transcript.log").write_text("worker transcript\n", encoding="utf-8")
+        frozen_entries_sha256, finalization_started_at_epoch = (
+            self.prepare_finalization(
+                attempt,
+                task_inputs_sha256=frozen["sha256"],
+            )
+        )
         command_record_ids: list[str] = []
         if include_record:
             inputs = json.loads((attempt / "TASK_INPUTS.json").read_text())
@@ -802,6 +961,11 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
                 "stdout_sha256": hashlib.sha256(stdout_path.read_bytes()).hexdigest(),
                 "stderr_ref": stderr_path.relative_to(attempt).as_posix(),
                 "stderr_sha256": hashlib.sha256(stderr_path.read_bytes()).hexdigest(),
+                "source_before_entries_sha256": frozen_entries_sha256,
+                "source_after_entries_sha256": frozen_entries_sha256,
+                "source_unchanged": True,
+                "finalization_started_at_epoch": finalization_started_at_epoch,
+                "source_snapshot_entries_sha256": frozen_entries_sha256,
             }
             record.update(record_overrides or {})
             record["record_sha256"] = command_record_sha256(record)
@@ -828,6 +992,11 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
                 "before": "runtime/worktree-before.json",
                 "after": "runtime/worktree-after.json",
             },
+            artifact_refs=(
+                "runtime/finalization-worktree.json",
+                "runtime/FINALIZATION.json",
+                "runtime/DEADLINE.json",
+            ),
             log_refs=(
                 [
                     "runtime/transcript.log",
@@ -845,24 +1014,84 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
             expected_task_id="T001",
             expected_attempt_id=attempt_id,
         )
+        self.write_supervisor_receipt(
+            attempt,
+            finalization_started=True,
+        )
         return attempt
 
     def test_direct_bundle_without_required_command_record_is_rejected(self) -> None:
         attempt = self._publish_verified("A001", self.base, include_record=False)
-        result = cmd_validate_handoff(
-            argparse.Namespace(
-                attempt_path=str(attempt / "ATTEMPT.json"),
-                task_dir=str(self.task_dir),
-                status_path=str(self.task_dir / "STATUS.json"),
-                attempt_id="A001",
-                exit_code_raw="0",
-                startup_path="",
-                worktree=str(self.root),
-            )
-        )
+        result = cmd_validate_handoff(self.validation_args(attempt))
         self.assertEqual(result, 4)
         status = json.loads((self.task_dir / "STATUS.json").read_text())
         self.assertIn("required check", status["blocking_reason"])
+
+    def test_v2_handoff_requires_supervisor_publication_acceptance(self) -> None:
+        attempt = self._publish_verified("A001", self.base)
+        supervisor = attempt / "supervisor-result.json"
+        self.write_json(
+            supervisor,
+            {
+                "exit_code": 0,
+                "timed_out": False,
+                "publication_requested": False,
+                "publication_unaccepted": True,
+                "surviving_pids": [],
+                "cleanup_verified": True,
+            },
+        )
+        result = cmd_validate_handoff(
+            self.validation_args(attempt, supervisor_result=str(supervisor))
+        )
+        self.assertEqual(4, result)
+        status = json.loads((self.task_dir / "STATUS.json").read_text())
+        self.assertIn(
+            "publication_requested must be True",
+            status["blocking_reason"],
+        )
+
+    def test_completed_replay_requires_existing_supervisor_receipt(self) -> None:
+        attempt = self._publish_verified("A001", self.base)
+        args = self.validation_args(attempt)
+        self.assertEqual(0, cmd_validate_handoff(args))
+
+        (attempt / "supervisor-result.json").unlink()
+
+        self.assertEqual(4, cmd_validate_handoff(args))
+        self.assertEqual(
+            "verified",
+            json.loads((self.task_dir / "STATUS.json").read_text())["state"],
+        )
+
+    def test_completed_replay_rejects_corrupt_supervisor_receipt(self) -> None:
+        attempt = self._publish_verified("A001", self.base)
+        args = self.validation_args(attempt)
+        self.assertEqual(0, cmd_validate_handoff(args))
+
+        (attempt / "supervisor-result.json").write_text("{", encoding="utf-8")
+
+        self.assertEqual(4, cmd_validate_handoff(args))
+        self.assertEqual(
+            "verified",
+            json.loads((self.task_dir / "STATUS.json").read_text())["state"],
+        )
+
+    def test_v2_supervisor_receipt_boolean_fields_are_strictly_typed(self) -> None:
+        attempt = self._publish_verified("A001", self.base)
+        supervisor_path = attempt / "supervisor-result.json"
+        supervisor = json.loads(supervisor_path.read_text(encoding="utf-8"))
+        supervisor["publication_requested"] = 1
+        supervisor["timed_out"] = 0
+        self.write_json(supervisor_path, supervisor)
+
+        self.assertEqual(4, cmd_validate_handoff(self.validation_args(attempt)))
+        status = json.loads((self.task_dir / "STATUS.json").read_text())
+        self.assertIn(
+            "publication_requested must be True",
+            status["blocking_reason"],
+        )
+        self.assertIn("timed_out must be False", status["blocking_reason"])
 
     def test_bundle_with_nonmatching_structured_record_is_rejected(self) -> None:
         attempt = self._publish_verified(
@@ -870,17 +1099,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
             self.base,
             record_overrides={"argv": ["false"]},
         )
-        result = cmd_validate_handoff(
-            argparse.Namespace(
-                attempt_path=str(attempt / "ATTEMPT.json"),
-                task_dir=str(self.task_dir),
-                status_path=str(self.task_dir / "STATUS.json"),
-                attempt_id="A001",
-                exit_code_raw="0",
-                startup_path="",
-                worktree=str(self.root),
-            )
-        )
+        result = cmd_validate_handoff(self.validation_args(attempt))
         self.assertEqual(result, 4)
         status = json.loads((self.task_dir / "STATUS.json").read_text())
         self.assertIn("no exact successful record", status["blocking_reason"])
@@ -891,17 +1110,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
             ACCEPTANCE.replace("The file remains readable", "The file remains unchanged"),
             encoding="utf-8",
         )
-        result = cmd_validate_handoff(
-            argparse.Namespace(
-                attempt_path=str(attempt / "ATTEMPT.json"),
-                task_dir=str(self.task_dir),
-                status_path=str(self.task_dir / "STATUS.json"),
-                attempt_id="A001",
-                exit_code_raw="0",
-                startup_path="",
-                worktree=str(self.root),
-            )
-        )
+        result = cmd_validate_handoff(self.validation_args(attempt))
         self.assertEqual(result, 4)
         status = json.loads((self.task_dir / "STATUS.json").read_text())
         self.assertIn("contract drifted after dispatch", status["blocking_reason"])
@@ -909,17 +1118,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
     def test_missing_required_output_invalidates_published_bundle(self) -> None:
         attempt = self._publish_verified("A001", self.base)
         (self.root / "file.txt").unlink()
-        result = cmd_validate_handoff(
-            argparse.Namespace(
-                attempt_path=str(attempt / "ATTEMPT.json"),
-                task_dir=str(self.task_dir),
-                status_path=str(self.task_dir / "STATUS.json"),
-                attempt_id="A001",
-                exit_code_raw="0",
-                startup_path="",
-                worktree=str(self.root),
-            )
-        )
+        result = cmd_validate_handoff(self.validation_args(attempt))
         self.assertEqual(result, 4)
         status = json.loads((self.task_dir / "STATUS.json").read_text())
         self.assertIn("required outputs are missing", status["blocking_reason"])
@@ -929,17 +1128,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
         (self.root / "file.txt").chmod(0o755)
         run("git", "add", "file.txt", cwd=self.root)
         run("git", "commit", "-m", "late mode change", cwd=self.root)
-        result = cmd_validate_handoff(
-            argparse.Namespace(
-                attempt_path=str(attempt / "ATTEMPT.json"),
-                task_dir=str(self.task_dir),
-                status_path=str(self.task_dir / "STATUS.json"),
-                attempt_id="A001",
-                exit_code_raw="0",
-                startup_path="",
-                worktree=str(self.root),
-            )
-        )
+        result = cmd_validate_handoff(self.validation_args(attempt))
         self.assertEqual(result, 4)
         metadata = json.loads((attempt / "ATTEMPT.json").read_text())
         self.assertEqual(metadata["state"], "invalid_handoff")
@@ -959,32 +1148,14 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
         )
         self.write_json(attempt / "ATTEMPT.json", metadata)
 
-        result = cmd_validate_handoff(
-            argparse.Namespace(
-                attempt_path=str(attempt / "ATTEMPT.json"),
-                task_dir=str(self.task_dir),
-                status_path=str(self.task_dir / "STATUS.json"),
-                attempt_id="A001",
-                exit_code_raw="0",
-                startup_path="",
-                worktree=str(self.root),
-            )
-        )
+        result = cmd_validate_handoff(self.validation_args(attempt))
         self.assertEqual(0, result)
         status = json.loads((self.task_dir / "STATUS.json").read_text())
         self.assertEqual("verified", status["state"])
 
     def test_completed_fast_path_revalidates_bundle_before_returning_success(self) -> None:
         attempt = self._publish_verified("A001", self.base)
-        args = argparse.Namespace(
-            attempt_path=str(attempt / "ATTEMPT.json"),
-            task_dir=str(self.task_dir),
-            status_path=str(self.task_dir / "STATUS.json"),
-            attempt_id="A001",
-            exit_code_raw="0",
-            startup_path="",
-            worktree=str(self.root),
-        )
+        args = self.validation_args(attempt)
         self.assertEqual(0, cmd_validate_handoff(args))
         evidence_path = attempt / "EVIDENCE.json"
         evidence = json.loads(evidence_path.read_text())
@@ -997,15 +1168,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
 
     def test_completed_replay_requires_frozen_commit_fields_and_valid_lifecycle(self) -> None:
         attempt = self._publish_verified("A001", self.base)
-        args = argparse.Namespace(
-            attempt_path=str(attempt / "ATTEMPT.json"),
-            task_dir=str(self.task_dir),
-            status_path=str(self.task_dir / "STATUS.json"),
-            attempt_id="A001",
-            exit_code_raw="0",
-            startup_path="",
-            worktree=str(self.root),
-        )
+        args = self.validation_args(attempt)
         self.assertEqual(0, cmd_validate_handoff(args))
         original = json.loads((attempt / "ATTEMPT.json").read_text())
 
@@ -1022,15 +1185,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
 
     def test_completed_replay_does_not_downgrade_downstream_coordinator_state(self) -> None:
         attempt = self._publish_verified("A001", self.base)
-        args = argparse.Namespace(
-            attempt_path=str(attempt / "ATTEMPT.json"),
-            task_dir=str(self.task_dir),
-            status_path=str(self.task_dir / "STATUS.json"),
-            attempt_id="A001",
-            exit_code_raw="0",
-            startup_path="",
-            worktree=str(self.root),
-        )
+        args = self.validation_args(attempt)
         self.assertEqual(0, cmd_validate_handoff(args))
         status = json.loads((self.task_dir / "STATUS.json").read_text())
         status["previous_state"] = "verified"
@@ -1102,17 +1257,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
         )
         self.write_json(self.task_dir / "STATUS.json", status)
 
-        result = cmd_validate_handoff(
-            argparse.Namespace(
-                attempt_path=str(attempt / "ATTEMPT.json"),
-                task_dir=str(self.task_dir),
-                status_path=str(self.task_dir / "STATUS.json"),
-                attempt_id="A001",
-                exit_code_raw="0",
-                startup_path="",
-                worktree=str(self.root),
-            )
-        )
+        result = cmd_validate_handoff(self.validation_args(attempt))
 
         self.assertEqual(4, result)
         self.assertEqual(
@@ -1187,6 +1332,12 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
         self.write_json(attempt / "ATTEMPT.json", metadata)
         self.write_json(attempt / "runtime" / "worktree-before.json", fingerprint(self.root))
         self.write_json(attempt / "runtime" / "worktree-after.json", fingerprint(self.root))
+        load_or_create_attempt_deadline(
+            attempt / "runtime" / "DEADLINE.json",
+            attempt_timeout_seconds=120,
+            finalization_grace_seconds=90,
+            reminder_seconds=30,
+        )
 
         strategy = strategy_payload("T001")
         strategy["workflows"][0]["executor"]["allowed_paths"] = ["file.txt"]
@@ -1223,6 +1374,16 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
             artifact_refs=("runtime/STRATEGY_SUBMISSION.json",),
             expected_task_id="T001",
             expected_attempt_id="A001",
+        )
+        supervisor_path = self.write_supervisor_receipt(
+            attempt,
+            finalization_started=False,
+        )
+        supervisor = json.loads(supervisor_path.read_text(encoding="utf-8"))
+        self.assertFalse(supervisor["finalization_started"])
+        self.assertEqual(
+            supervisor["execution_deadline_at_epoch"],
+            supervisor["active_deadline_at_epoch"],
         )
         status = json.loads((self.task_dir / "STATUS.json").read_text())
         status.update(
@@ -1261,15 +1422,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
             json.dumps(submitted_event, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        args = argparse.Namespace(
-            attempt_path=str(attempt / "ATTEMPT.json"),
-            task_dir=str(self.task_dir),
-            status_path=str(self.task_dir / "STATUS.json"),
-            attempt_id="A001",
-            exit_code_raw="0",
-            startup_path="",
-            worktree=str(self.root),
-        )
+        args = self.validation_args(attempt)
         self.assertEqual(0, cmd_validate_handoff(args))
 
         drifted_strategy = json.loads(strategy_path.read_text())
@@ -1326,14 +1479,8 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
     def test_completed_replay_rejects_dispatch_identity_drift(self) -> None:
         attempt = self._publish_verified("A001", self.base)
         metadata = json.loads((attempt / "ATTEMPT.json").read_text())
-        args = argparse.Namespace(
-            attempt_path=str(attempt / "ATTEMPT.json"),
-            task_dir=str(self.task_dir),
-            status_path=str(self.task_dir / "STATUS.json"),
-            attempt_id="A001",
-            exit_code_raw="0",
-            startup_path="",
-            worktree=str(self.root),
+        args = self.validation_args(
+            attempt,
             expected_profile="direct",
             expected_task_id="T001",
             expected_artifact_protocol_version=2,

@@ -141,7 +141,10 @@ result permits one runtime fallback. For Codex, `thread.started` alone is
 session-allocation evidence, not model progress; a deterministic
 `session_not_found` rejection before the first non-error model/tool item may
 still use that one fallback. No fallback is allowed after
-`worker_progress_evidence` exists.
+`worker_progress_evidence` exists. Runtime fallback additionally requires the
+first supervisor to prove complete descendant cleanup and requires the current
+`DEADLINE.json` digest to equal the bytes loaded before that first process was
+spawned; fallback reuses that file and cannot restart the attempt clock.
 
 For `plain + machine`, the adapter returns structured `argv`, environment, and
 one prompt transport. With `arg`, the prompt appears only in `argv` and stdin is
@@ -262,6 +265,11 @@ move STATUS to blocked with blocker_type=budget
 write diagnostics
 release .dispatch-lock after reconciliation
 ```
+
+An attempt that already entered the create-once finalization phase uses
+`finalization_timed_out` instead. A natural exit from that phase without a
+candidate handoff uses `finalization_failed`; neither may leave `STATUS` in
+`running`.
 
 Timeout diagnostics should record:
 

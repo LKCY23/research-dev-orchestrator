@@ -274,6 +274,12 @@ class TaskMergeTests(unittest.TestCase):
             json.loads((attempt / "runtime" / "worktree-after.json").read_text())["sha256"],
             fingerprint(self.task_worktree)["sha256"],
         )
+        self.assertNotEqual(
+            json.loads((attempt / "runtime" / "worktree-after.json").read_text())[
+                "semantic_sha256"
+            ],
+            fingerprint(self.task_worktree)["semantic_sha256"],
+        )
         with self.assertRaisesRegex(SystemExit, "HEAD changed after verified handoff"):
             self.merge()
 

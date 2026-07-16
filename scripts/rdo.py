@@ -11,6 +11,8 @@ import shlex
 import subprocess
 import sys
 import hashlib
+import math
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -55,7 +57,11 @@ from strategy import (
     review_strategy,
     submit_strategy,
 )
-from supervisor import run_supervised, terminate_processes
+from supervisor import (
+    run_supervised,
+    terminate_processes,
+    validate_attempt_deadline_payload,
+)
 from task_contract import (
     TASK_INPUT_FILENAMES,
     TaskContractError,
@@ -64,6 +70,12 @@ from task_contract import (
     validate_task_inputs_payload,
 )
 from worktree_fingerprint import fingerprint
+
+
+FINALIZATION_REF = "runtime/FINALIZATION.json"
+FINALIZATION_SNAPSHOT_REF = "runtime/finalization-worktree.json"
+ATTEMPT_DEADLINE_REF = "runtime/DEADLINE.json"
+DEFAULT_FINALIZATION_GRACE_SECONDS = 90.0
 
 
 @contextmanager
@@ -290,6 +302,7 @@ def _check_command_locked(args: argparse.Namespace) -> int:
         args.attempt_dir,
         allow_ready=False,
     )
+    _emit_deadline_notice(attempt)
     if metadata.get("phase") != "execution" or status.get("state") != "running":
         raise SystemExit("rdo check requires the current running execution attempt")
     if bool(getattr(args, "workflow_id", "")) != bool(getattr(args, "instance_id", "")):
@@ -317,12 +330,31 @@ def _check_command_locked(args: argparse.Namespace) -> int:
         raise SystemExit(f"unknown required acceptance check id: {args.check_id!r}")
 
     worktree = _worktree_for_attempt(metadata)
+    finalization_marker: dict[str, Any] | None = None
+    frozen_entries_sha256: str | None = None
+    if (attempt / FINALIZATION_REF).exists():
+        finalization_marker = _validate_finalization_marker(
+            attempt,
+            task_id=binding.task_id,
+            attempt_id=binding.attempt_id,
+            task_inputs_sha256=binding.task_inputs_sha256,
+        )
+        _validate_finalization_source_unchanged(
+            attempt,
+            worktree,
+            finalization_marker,
+        )
+        snapshot = load_json(attempt / FINALIZATION_SNAPSHOT_REF)
+        frozen_entries_sha256 = str(snapshot["entries_sha256"])
+    source_before = _semantic_worktree_entries(worktree)
+    source_before_sha256 = canonical_digest(source_before)
     cwd = _command_cwd(worktree, definition["cwd"])
     record_id = f"C-{uuid.uuid4().hex}"
     command_dir = attempt / "runtime" / "commands"
     command_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = command_dir / f"{record_id}.stdout.log"
     stderr_path = command_dir / f"{record_id}.stderr.log"
+    started_at_epoch = time.time()
     started_at = utc_now()
     try:
         with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
@@ -338,6 +370,8 @@ def _check_command_locked(args: argparse.Namespace) -> int:
         timed_out = result.timed_out
         elapsed_seconds = result.elapsed_seconds
         survivors = list(result.surviving_pids)
+        cleanup_verified = result.cleanup_verified
+        cleanup_failure_reason = result.cleanup_failure_reason
     except OSError as exc:
         stderr_path.write_text(f"command could not start: {exc}\n", encoding="utf-8")
         stdout_path.touch(exist_ok=True)
@@ -345,7 +379,26 @@ def _check_command_locked(args: argparse.Namespace) -> int:
         timed_out = False
         elapsed_seconds = 0.0
         survivors = []
+        cleanup_verified = True
+        cleanup_failure_reason = None
 
+    source_after = _semantic_worktree_entries(worktree)
+    source_after_sha256 = canonical_digest(source_after)
+    source_unchanged = source_before == source_after
+    if finalization_marker is not None:
+        source_unchanged = bool(
+            source_unchanged
+            and source_before_sha256 == frozen_entries_sha256
+            and source_after_sha256 == frozen_entries_sha256
+        )
+        if not source_unchanged:
+            with stderr_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    "source tree changed while a finalize-only acceptance check ran\n"
+                )
+            exit_code = 126
+
+    finished_at_epoch = time.time()
     record: dict[str, Any] = {
         "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
         "schema_version": ARTIFACT_PROTOCOL_VERSION,
@@ -360,16 +413,28 @@ def _check_command_locked(args: argparse.Namespace) -> int:
         "cwd": definition["cwd"],
         "timeout_seconds": definition["timeout_seconds"],
         "started_at": started_at,
+        "started_at_epoch": started_at_epoch,
         "finished_at": utc_now(),
+        "finished_at_epoch": finished_at_epoch,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "elapsed_seconds": elapsed_seconds,
         "surviving_processes": survivors,
+        "cleanup_verified": cleanup_verified,
+        "cleanup_failure_reason": cleanup_failure_reason,
         "stdout_ref": stdout_path.relative_to(attempt).as_posix(),
         "stdout_sha256": file_sha256(stdout_path),
         "stderr_ref": stderr_path.relative_to(attempt).as_posix(),
         "stderr_sha256": file_sha256(stderr_path),
+        "source_before_entries_sha256": source_before_sha256,
+        "source_after_entries_sha256": source_after_sha256,
+        "source_unchanged": source_unchanged,
     }
+    if finalization_marker is not None:
+        record["finalization_started_at_epoch"] = finalization_marker[
+            "started_at_epoch"
+        ]
+        record["source_snapshot_entries_sha256"] = frozen_entries_sha256
     if getattr(args, "workflow_id", ""):
         record["workflow_id"] = args.workflow_id
     if getattr(args, "instance_id", ""):
@@ -1570,6 +1635,8 @@ def select_required_check_records(
     attempt: Path,
     contract: dict[str, Any],
     binding: Any,
+    *,
+    expected_source_entries_sha256: str | None = None,
 ) -> tuple[list[Any], list[str]]:
     """Select one exact successful record for every frozen required check."""
 
@@ -1578,6 +1645,26 @@ def select_required_check_records(
     except ArtifactBundleError as exc:
         return [], [f"structured command log is invalid: {exc}"]
     acceptance_sha256 = binding.task_inputs["inputs"]["acceptance"]["sha256"]
+    marker_path = attempt / FINALIZATION_REF
+    marker: dict[str, Any] | None = None
+    if not marker_path.exists() and expected_source_entries_sha256 is None:
+        return [], [
+            "required acceptance checks are not bound to the final source tree"
+        ]
+    if marker_path.exists():
+        try:
+            marker = _validate_finalization_marker(
+                attempt,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                task_inputs_sha256=binding.task_inputs_sha256,
+            )
+            snapshot = load_json(attempt / FINALIZATION_SNAPSHOT_REF)
+            frozen_entries_sha256 = snapshot["entries_sha256"]
+        except (OSError, ValueError, SystemExit) as exc:
+            return [], [f"finalization source binding is invalid: {exc}"]
+    else:
+        frozen_entries_sha256 = expected_source_entries_sha256
     selected: list[Any] = []
     reasons: list[str] = []
     for definition in contract.get("required_commands", []):
@@ -1595,6 +1682,22 @@ def select_required_check_records(
                 and payload.get("argv") == definition["argv"]
                 and payload.get("cwd") == definition["cwd"]
                 and payload.get("timeout_seconds") == definition["timeout_seconds"]
+                and payload.get("source_before_entries_sha256")
+                == frozen_entries_sha256
+                and payload.get("source_after_entries_sha256")
+                == frozen_entries_sha256
+                and payload.get("source_unchanged") is True
+                and (
+                    "finalization_started_at_epoch" not in payload
+                    or marker is not None
+                    and payload.get("finalization_started_at_epoch")
+                    == marker["started_at_epoch"]
+                )
+                and (
+                    "source_snapshot_entries_sha256" not in payload
+                    or payload.get("source_snapshot_entries_sha256")
+                    == frozen_entries_sha256
+                )
             ):
                 matches.append(record)
         passing = [
@@ -1603,6 +1706,7 @@ def select_required_check_records(
             if record.payload.get("exit_code") == 0
             and record.payload.get("timed_out") is False
             and record.payload.get("surviving_processes") == []
+            and record.payload.get("cleanup_verified", True) is True
             and _record_log_matches(attempt, record.payload, "stdout")
             and _record_log_matches(attempt, record.payload, "stderr")
         ]
@@ -1634,6 +1738,7 @@ def completion_gate_reasons(
     strategy: dict[str, Any],
     *,
     completing_workflow: str | None = None,
+    include_acceptance: bool = True,
 ) -> list[str]:
     """Validate task-level execution gates, optionally before appending completion."""
 
@@ -1651,7 +1756,7 @@ def completion_gate_reasons(
         )
         if missing:
             reasons.append(f"required workflows are incomplete: {missing}")
-    if gate["acceptance_commands_pass"]:
+    if gate["acceptance_commands_pass"] and include_acceptance:
         task = attempt.parent.parent
         status_path = task / "STATUS.json"
         status = load_json(status_path) if status_path.exists() else None
@@ -1753,8 +1858,377 @@ def active_execution_attempt(value: str) -> tuple[Path, Path, dict[str, Any]]:
     return attempt, task, strategy
 
 
+def _semantic_worktree_entries(worktree: Path) -> list[dict[str, Any]]:
+    """Return index-independent source facts for the current worktree."""
+
+    entries: list[dict[str, Any]] = []
+    for item in fingerprint(worktree).get("entries", []):
+        if not isinstance(item, dict) or item.get("kind") == "missing":
+            continue
+        entries.append(
+            {
+                "path": item.get("path"),
+                "kind": item.get("kind"),
+                "mode": item.get("mode"),
+                "sha256": item.get("sha256"),
+            }
+        )
+    return sorted(entries, key=lambda item: str(item.get("path")))
+
+
+def _load_attempt_deadline(attempt: Path) -> tuple[dict[str, Any] | None, str | None]:
+    path = attempt / ATTEMPT_DEADLINE_REF
+    if not path.exists():
+        return None, None
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit("attempt deadline is missing or unsafe")
+    try:
+        payload = load_json(path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"attempt deadline is unreadable: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("attempt deadline must be a JSON object")
+    try:
+        payload = validate_attempt_deadline_payload(payload)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    return payload, file_sha256(path)
+
+
+def _emit_deadline_notice(attempt: Path) -> None:
+    """Emit a compact deterministic reminder on worker-visible command output."""
+
+    try:
+        deadline, _digest = _load_attempt_deadline(attempt)
+    except SystemExit:
+        return
+    if deadline is None:
+        return
+    now = time.time()
+    phase = "execution"
+    active_deadline = float(deadline["execution_deadline_at_epoch"])
+    code = "attempt_deadline_approaching"
+    marker_path = attempt / FINALIZATION_REF
+    if marker_path.is_file() and not marker_path.is_symlink():
+        try:
+            marker = load_json(marker_path)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            marker = None
+        if isinstance(marker, dict) and isinstance(
+            marker.get("deadline_at_epoch"),
+            (int, float),
+        ):
+            phase = "finalization"
+            code = "finalization_grace_active"
+            active_deadline = float(marker["deadline_at_epoch"])
+    remaining = max(0.0, active_deadline - now)
+    if (
+        phase == "execution"
+        and remaining > float(deadline["reminder_seconds"])
+    ):
+        return
+    if (
+        phase == "finalization"
+        and remaining
+        > float(deadline["finalization_grace_seconds"])
+        + float(deadline["reminder_seconds"])
+    ):
+        return
+    notice = {
+        "code": code,
+        "phase": phase,
+        "remaining_seconds": round(remaining, 3),
+        "required_action": (
+            "freeze source and finalize or publish blocked"
+            if phase == "execution"
+            else "only checks, commit, handoff, or finalize are allowed"
+        ),
+    }
+    print(
+        "RDO_DEADLINE_NOTICE "
+        + json.dumps(notice, sort_keys=True, separators=(",", ":")),
+        file=sys.stderr,
+    )
+
+
+def _finalization_snapshot_payload(
+    *,
+    task_id: str,
+    attempt_id: str,
+    worktree: Path,
+) -> dict[str, Any]:
+    entries = _semantic_worktree_entries(worktree)
+    return {
+        "schema_version": 2,
+        "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "entries_sha256": canonical_digest(entries),
+        "file_count": len(entries),
+        "entries": entries,
+    }
+
+
+def _validate_finalization_marker(
+    attempt: Path,
+    *,
+    task_id: str,
+    attempt_id: str,
+    task_inputs_sha256: str,
+) -> dict[str, Any]:
+    marker_path = attempt / FINALIZATION_REF
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise SystemExit("finalization marker is missing or unsafe")
+    try:
+        marker_ctime = float(
+            marker_path.stat(follow_symlinks=False).st_ctime
+        )
+    except OSError as exc:
+        raise SystemExit(f"finalization marker cannot be statted: {exc}") from exc
+    try:
+        marker = load_json(marker_path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"finalization marker is unreadable: {exc}") from exc
+    expected = {
+        "schema_version": 2,
+        "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
+        "stage": "finalizing",
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "task_inputs_sha256": task_inputs_sha256,
+        "source_snapshot_ref": FINALIZATION_SNAPSHOT_REF,
+    }
+    for field, value in expected.items():
+        if marker.get(field) != value:
+            raise SystemExit(f"finalization marker {field} does not match the active attempt")
+    grace = marker.get("grace_seconds")
+    started = marker.get("started_at_epoch")
+    marker_deadline = marker.get("deadline_at_epoch")
+    if (
+        not isinstance(grace, (int, float))
+        or isinstance(grace, bool)
+        or not math.isfinite(float(grace))
+        or float(grace) <= 0
+        or not isinstance(started, (int, float))
+        or isinstance(started, bool)
+        or not math.isfinite(float(started))
+        or not isinstance(marker_deadline, (int, float))
+        or isinstance(marker_deadline, bool)
+        or not math.isfinite(float(marker_deadline))
+    ):
+        raise SystemExit("finalization marker deadline fields are invalid")
+    snapshot_path = attempt / FINALIZATION_SNAPSHOT_REF
+    digest = marker.get("source_snapshot_sha256")
+    if (
+        not isinstance(digest, str)
+        or not snapshot_path.is_file()
+        or snapshot_path.is_symlink()
+        or file_sha256(snapshot_path) != digest
+    ):
+        raise SystemExit("finalization source snapshot binding is invalid")
+    snapshot = load_json(snapshot_path)
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("task_id") != task_id
+        or snapshot.get("attempt_id") != attempt_id
+        or not isinstance(snapshot.get("entries"), list)
+        or snapshot.get("entries_sha256")
+        != canonical_digest(snapshot.get("entries"))
+    ):
+        raise SystemExit("finalization source snapshot is invalid")
+    try:
+        snapshot_ctime = float(
+            snapshot_path.stat(follow_symlinks=False).st_ctime
+        )
+    except OSError as exc:
+        raise SystemExit(
+            f"finalization source snapshot cannot be statted: {exc}"
+        ) from exc
+    deadline_path = attempt / ATTEMPT_DEADLINE_REF
+    if (
+        marker.get("deadline_ref") != ATTEMPT_DEADLINE_REF
+        or not isinstance(marker.get("deadline_sha256"), str)
+        or not deadline_path.is_file()
+        or deadline_path.is_symlink()
+        or file_sha256(deadline_path) != marker.get("deadline_sha256")
+    ):
+        raise SystemExit("finalization deadline binding is invalid")
+    deadline, _deadline_sha256 = _load_attempt_deadline(attempt)
+    if deadline is None:
+        raise SystemExit("finalization deadline is missing")
+    attempt_started = float(deadline["started_at_epoch"])
+    execution_deadline = float(deadline["execution_deadline_at_epoch"])
+    expected_marker_deadline = execution_deadline + float(grace)
+    started_iso = parse_iso(marker.get("started_at"))
+    if (
+        started_iso is None
+        or abs(started_iso.timestamp() - float(started)) > 1.001
+        or abs(float(started) - marker_ctime) > 1.001
+        or marker_ctime < attempt_started - 1.001
+        or snapshot_ctime < attempt_started - 1.001
+        or snapshot_ctime > marker_ctime + 0.001
+        or snapshot_ctime > execution_deadline + 0.001
+        or marker_ctime > execution_deadline + 1e-6
+        or marker_ctime > time.time() + 1.0
+        or not math.isclose(
+            float(marker_deadline),
+            expected_marker_deadline,
+            rel_tol=0,
+            abs_tol=1e-6,
+        )
+    ):
+        raise SystemExit("finalization marker is outside the bound attempt deadline")
+    if time.time() > float(marker_deadline) + 1e-6:
+        raise SystemExit("finalization grace deadline has expired")
+    return marker
+
+
+def _start_finalization_locked(
+    attempt: Path,
+    task: Path,
+    status: dict[str, Any],
+    metadata: dict[str, Any],
+    binding: Any,
+    *,
+    require_deadline: bool,
+    require_completion_gate: bool = True,
+) -> dict[str, Any]:
+    """Atomically freeze the source tree and enter one non-resettable grace."""
+
+    marker_path = attempt / FINALIZATION_REF
+    if marker_path.exists():
+        return _validate_finalization_marker(
+            attempt,
+            task_id=str(status.get("task_id")),
+            attempt_id=attempt.name,
+            task_inputs_sha256=binding.task_inputs_sha256,
+        )
+    expected_state = "planning" if metadata.get("phase") == "planning" else "running"
+    if status.get("state") != expected_state:
+        raise SystemExit("finalization requires the current active attempt")
+    profile = str(status.get("profile") or "full")
+    if profile == "full" and require_completion_gate:
+        strategy = _bound_strategy_for_attempt(task, attempt, metadata)
+        reasons = completion_gate_reasons(
+            attempt,
+            strategy,
+            include_acceptance=False,
+        )
+        if reasons:
+            raise SystemExit("finalization entry gate failed: " + "; ".join(reasons))
+
+    deadline, deadline_sha256 = _load_attempt_deadline(attempt)
+    if require_deadline and deadline is None:
+        raise SystemExit("finalization entry requires runtime/DEADLINE.json")
+    if deadline is not None and time.time() > float(
+        deadline["execution_deadline_at_epoch"]
+    ):
+        raise SystemExit("attempt execution deadline expired before finalization entry")
+    grace_seconds = (
+        float(deadline["finalization_grace_seconds"])
+        if deadline is not None
+        else DEFAULT_FINALIZATION_GRACE_SECONDS
+    )
+    worktree = _worktree_for_attempt(metadata)
+    snapshot = _finalization_snapshot_payload(
+        task_id=str(status.get("task_id")),
+        attempt_id=attempt.name,
+        worktree=worktree,
+    )
+    try:
+        snapshot_sha256 = publish_json_once(
+            attempt / FINALIZATION_SNAPSHOT_REF,
+            snapshot,
+        )
+        started_at_epoch = time.time()
+        if deadline is not None and started_at_epoch > float(
+            deadline["execution_deadline_at_epoch"]
+        ):
+            raise SystemExit(
+                "attempt execution deadline expired while freezing finalization entry"
+            )
+        marker = {
+            "schema_version": 2,
+            "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
+            "stage": "finalizing",
+            "task_id": status.get("task_id"),
+            "attempt_id": attempt.name,
+            "task_inputs_sha256": binding.task_inputs_sha256,
+            "started_at": utc_now(),
+            "started_at_epoch": started_at_epoch,
+            "grace_seconds": grace_seconds,
+            "deadline_at_epoch": (
+                float(deadline["execution_deadline_at_epoch"]) + grace_seconds
+                if deadline is not None
+                else started_at_epoch + grace_seconds
+            ),
+            "source_snapshot_ref": FINALIZATION_SNAPSHOT_REF,
+            "source_snapshot_sha256": snapshot_sha256,
+            "deadline_ref": ATTEMPT_DEADLINE_REF if deadline is not None else None,
+            "deadline_sha256": deadline_sha256,
+            "allowed_actions": [
+                "required rdo check records",
+                "git commit",
+                "handoff",
+                "rdo finalize",
+            ],
+            "forbidden_actions": [
+                "production file edits",
+                "workflow activity",
+                "rdo exec",
+                "implementation expansion",
+            ],
+        }
+        publish_json_once(marker_path, marker)
+    except ArtifactBundleError as exc:
+        raise SystemExit(f"cannot enter finalization: {exc}") from exc
+    return _validate_finalization_marker(
+        attempt,
+        task_id=str(status.get("task_id")),
+        attempt_id=attempt.name,
+        task_inputs_sha256=binding.task_inputs_sha256,
+    )
+
+
+def _validate_finalization_source_unchanged(
+    attempt: Path,
+    worktree: Path,
+    marker: dict[str, Any],
+) -> None:
+    snapshot = load_json(attempt / str(marker["source_snapshot_ref"]))
+    expected = snapshot.get("entries")
+    actual = _semantic_worktree_entries(worktree)
+    if expected != actual:
+        raise SystemExit(
+            "task worktree changed after finalization started; "
+            "start a new attempt for further implementation"
+        )
+
+
+def finalization_action(args: argparse.Namespace) -> int:
+    with attempt_artifact_lock(args.attempt_dir, exclusive=True):
+        attempt, task, status, metadata, binding = _require_attempt_ownership(
+            args.attempt_dir,
+            allow_ready=False,
+        )
+        marker = _start_finalization_locked(
+            attempt,
+            task,
+            status,
+            metadata,
+            binding,
+            require_deadline=True,
+        )
+        _emit_deadline_notice(attempt)
+    print(json.dumps(marker, indent=2))
+    return 0
+
+
 def _workflow_action_locked(args: argparse.Namespace) -> int:
     attempt, task, strategy = active_execution_attempt(args.attempt_dir)
+    _emit_deadline_notice(attempt)
+    if (attempt / FINALIZATION_REF).exists():
+        raise SystemExit("workflow activity is forbidden after finalization starts")
     definitions = {item["workflow_id"]: item for item in strategy["workflows"]}
     if args.workflow_id not in definitions:
         raise SystemExit(f"workflow is not approved: {args.workflow_id}")
@@ -1806,10 +2280,17 @@ def _workflow_action_locked(args: argparse.Namespace) -> int:
         completed_after = completed | {args.workflow_id}
         required = {item["workflow_id"] for item in strategy["workflows"] if item["required"]}
         if required.issubset(completed_after):
+            status_path = task / "STATUS.json"
+            task_status = load_json(status_path) if status_path.exists() else None
+            v2_execution = bool(
+                isinstance(task_status, dict)
+                and task_protocol(task, task_status) == ARTIFACT_PROTOCOL_VERSION
+            )
             reasons = completion_gate_reasons(
                 attempt,
                 strategy,
                 completing_workflow=args.workflow_id,
+                include_acceptance=not v2_execution,
             )
             if reasons:
                 raise SystemExit("workflow completion gate failed: " + "; ".join(reasons))
@@ -1833,16 +2314,40 @@ def _workflow_action_locked(args: argparse.Namespace) -> int:
         completed_after = completed | {args.workflow_id}
         required = {item["workflow_id"] for item in strategy["workflows"] if item["required"]}
         if required.issubset(completed_after):
-            write_json(
-                runtime / "FINALIZATION.json",
-                {
-                    "schema_version": 1,
-                    "stage": "finalizing",
-                    "attempt_id": attempt.name,
-                    "started_at": utc_now(),
-                    "deadline_seconds": 90,
-                },
-            )
+            status_path = task / "STATUS.json"
+            status = load_json(status_path) if status_path.exists() else None
+            if (
+                isinstance(status, dict)
+                and task_protocol(task, status) == ARTIFACT_PROTOCOL_VERSION
+            ):
+                owned_attempt, owned_task, status, metadata, binding = (
+                    _require_attempt_ownership(
+                        attempt,
+                        allow_ready=False,
+                    )
+                )
+                _start_finalization_locked(
+                    owned_attempt,
+                    owned_task,
+                    status,
+                    metadata,
+                    binding,
+                    require_deadline=True,
+                    require_completion_gate=True,
+                )
+            else:
+                marker = runtime / "FINALIZATION.json"
+                if not marker.exists():
+                    write_json(
+                        marker,
+                        {
+                            "schema_version": 1,
+                            "stage": "finalizing",
+                            "attempt_id": attempt.name,
+                            "started_at": utc_now(),
+                            "deadline_seconds": DEFAULT_FINALIZATION_GRACE_SECONDS,
+                        },
+                    )
     event(task, name, "worker", **{key: value for key, value in record.items() if key not in {"at", "event"}})
     print(json.dumps(record))
     if timed_out and definition["on_timeout"] != "continue_without_result":
@@ -2009,6 +2514,7 @@ def _finalize_v2_locked(args: argparse.Namespace) -> int:
         args.attempt_dir,
         allow_ready=True,
     )
+    _emit_deadline_notice(attempt)
     if args.state not in {"verified", "review", "blocked"}:
         raise SystemExit("finalize state must be verified, review, or blocked")
     profile = status.get("profile", "full")
@@ -2037,10 +2543,25 @@ def _finalize_v2_locked(args: argparse.Namespace) -> int:
 
     worktree = _worktree_for_attempt(metadata)
     contract = _validate_frozen_sources(attempt, task, binding)
+    finalization_marker: dict[str, Any] | None = None
     selected: list[Any] = []
     required_output_bindings: list[dict[str, str]] = []
     source_commit: str | None
     if args.state == "blocked":
+        finalization_marker = _start_finalization_locked(
+            attempt,
+            task,
+            status,
+            metadata,
+            binding,
+            require_deadline=True,
+            require_completion_gate=False,
+        )
+        _validate_finalization_source_unchanged(
+            attempt,
+            worktree,
+            finalization_marker,
+        )
         try:
             source_commit = git_output(worktree, "rev-parse", "HEAD")
         except SystemExit:
@@ -2048,6 +2569,79 @@ def _finalize_v2_locked(args: argparse.Namespace) -> int:
     else:
         if status.get("state") != "running":
             raise SystemExit(f"{args.state} finalization requires running state")
+        if not (attempt / FINALIZATION_REF).exists():
+            # Compatibility path: do not freeze an attempt merely because
+            # finalize was called too early.  First prove that the current
+            # clean source tree already has matching acceptance records and
+            # outputs; only then create the immutable marker.
+            require_clean_task_worktree(
+                worktree,
+                str(status.get("branch") or ""),
+            )
+            prospective_commit = git_output(worktree, "rev-parse", "HEAD")
+            prospective_entries_sha256 = canonical_digest(
+                _semantic_worktree_entries(worktree)
+            )
+            _prospective_selected, prospective_reasons = (
+                select_required_check_records(
+                    attempt,
+                    contract,
+                    binding,
+                    expected_source_entries_sha256=prospective_entries_sha256,
+                )
+            )
+            if prospective_reasons:
+                raise SystemExit(
+                    "acceptance gate failed: " + "; ".join(prospective_reasons)
+                )
+            prospective_missing_outputs = _required_outputs_exist(worktree, contract)
+            if prospective_missing_outputs:
+                raise SystemExit(
+                    f"required outputs are missing: {prospective_missing_outputs}"
+                )
+            try:
+                build_required_output_bindings(
+                    worktree,
+                    prospective_commit,
+                    list(contract.get("required_outputs", [])),
+                )
+            except ArtifactBundleError as exc:
+                raise SystemExit(
+                    f"required outputs are not bound to source_commit: {exc}"
+                ) from exc
+            if profile == "full":
+                strategy = _bound_strategy_for_attempt(task, attempt, metadata)
+                workflow_reasons = completion_gate_reasons(
+                    attempt,
+                    strategy,
+                    include_acceptance=False,
+                )
+                if workflow_reasons:
+                    raise SystemExit(
+                        "handoff completion gate failed: "
+                        + "; ".join(workflow_reasons)
+                    )
+            finalization_marker = _start_finalization_locked(
+                attempt,
+                task,
+                status,
+                metadata,
+                binding,
+                require_deadline=True,
+                require_completion_gate=profile == "full",
+            )
+        else:
+            finalization_marker = _validate_finalization_marker(
+                attempt,
+                task_id=str(status.get("task_id")),
+                attempt_id=attempt.name,
+                task_inputs_sha256=binding.task_inputs_sha256,
+            )
+        _validate_finalization_source_unchanged(
+            attempt,
+            worktree,
+            finalization_marker,
+        )
         require_clean_task_worktree(worktree, str(status.get("branch") or ""))
         source_commit = git_output(worktree, "rev-parse", "HEAD")
         selected, reasons = select_required_check_records(attempt, contract, binding)
@@ -2136,6 +2730,12 @@ def _finalize_v2_locked(args: argparse.Namespace) -> int:
         if args.state == "blocked"
         else None
     )
+    if finalization_marker is not None:
+        _validate_finalization_source_unchanged(
+            attempt,
+            worktree,
+            finalization_marker,
+        )
     try:
         bundle = publish_bundle(
             attempt,
@@ -2149,7 +2749,15 @@ def _finalize_v2_locked(args: argparse.Namespace) -> int:
             changed_paths=changed_paths,
             worktree={"before": before_ref, "after": after_ref},
             log_refs=log_refs,
-            artifact_refs=(),
+            artifact_refs=(
+                [
+                    FINALIZATION_SNAPSHOT_REF,
+                    FINALIZATION_REF,
+                    ATTEMPT_DEADLINE_REF,
+                ]
+                if finalization_marker is not None
+                else []
+            ),
             reviewer_evidence=_reviewer_evidence_refs(attempt),
             required_outputs=required_output_bindings,
             expected_task_id=str(status.get("task_id")),
@@ -2297,6 +2905,9 @@ def _execute_command_locked(args: argparse.Namespace) -> int:
                     "use rdo check --check-id"
                 )
     attempt, _task, strategy = active_execution_attempt(args.attempt_dir)
+    _emit_deadline_notice(attempt)
+    if (attempt / FINALIZATION_REF).exists():
+        raise SystemExit("rdo exec is forbidden after finalization starts")
     definitions = {item["workflow_id"]: item for item in strategy["workflows"]}
     definition = definitions.get(args.workflow_id)
     if definition is None:
@@ -2444,6 +3055,8 @@ def build_parser() -> argparse.ArgumentParser:
     workflows = areas.add_parser("workflow").add_subparsers(dest="workflow_action", required=True)
     for name in ("start", "heartbeat", "complete"):
         command = workflows.add_parser(name); command.add_argument("--attempt-dir", required=True); command.add_argument("--workflow-id", required=True); command.add_argument("--instance-id", required=True); command.add_argument("--review-evidence", action="append", default=[]); command.set_defaults(func=workflow_action)
+    finalization = areas.add_parser("finalization").add_subparsers(dest="finalization_action", required=True)
+    command = finalization.add_parser("begin"); command.add_argument("--attempt-dir", required=True); command.set_defaults(func=finalization_action)
     command = areas.add_parser("handoff"); command.add_argument("--task-dir", required=True); command.add_argument("--state", required=True); command.add_argument("--summary", required=True); command.add_argument("--command", action="append", default=[]); command.add_argument("--file", action="append", default=[]); command.add_argument("--limitation", action="append", default=[]); command.add_argument("--self-review-passed", action="store_true"); command.add_argument("--self-review-summary", default=""); command.add_argument("--self-review-finding", action="append", default=[]); command.add_argument("--self-review-fix", action="append", default=[]); command.add_argument("--blocker-type", default=""); command.add_argument("--blocking-reason", default=""); command.set_defaults(func=handoff)
     command = areas.add_parser("finalize"); command.add_argument("--task-dir", default=""); command.add_argument("--attempt-dir", default=""); command.add_argument("--state", required=True); command.add_argument("--summary", default=""); command.add_argument("--summary-file", default=""); command.add_argument("--command", action="append", default=[]); command.add_argument("--file", action="append", default=[]); command.add_argument("--limitation", action="append", default=[]); command.add_argument("--self-review-passed", action="store_true"); command.add_argument("--self-review-summary", default=""); command.add_argument("--self-review-finding", action="append", default=[]); command.add_argument("--self-review-fix", action="append", default=[]); command.add_argument("--blocker-type", default=""); command.add_argument("--blocking-reason", default=""); command.set_defaults(func=handoff, auto_derive=True)
     command = areas.add_parser("check"); command.add_argument("--attempt-dir", required=True); command.add_argument("--check-id", required=True); command.add_argument("--workflow-id", default=""); command.add_argument("--instance-id", default=""); command.set_defaults(func=check_command)

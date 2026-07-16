@@ -83,6 +83,8 @@ invalid_handoff
 startup_failed
 execution_failed
 timed_out_unfinalized
+finalization_timed_out
+finalization_failed
 invalid_handoff
 completed
 ```

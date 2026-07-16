@@ -20,6 +20,7 @@ rdo strategy submit|revise
 rdo workflow start|heartbeat|complete [--review-evidence REVIEWER_ID=ARTIFACT_PATH]
 rdo exec --attempt-dir <path> --workflow-id <id> --instance-id <id> --timeout <seconds> -- <non-acceptance-command>
 rdo check --attempt-dir <path> --check-id <acceptance-id>
+rdo finalization begin --attempt-dir <path>
 rdo finalize --attempt-dir <path> --state verified|review|blocked --summary <text>
 ```
 
@@ -27,6 +28,14 @@ Workers may submit artifacts and runtime events, but may not approve strategy, m
 `rdo check` selects exact `argv`, `cwd`, and timeout from the attempt's frozen
 acceptance contract and appends a structured supervised record. Free text and
 `rdo exec --acceptance` cannot satisfy a v2 acceptance gate.
+
+`rdo finalization begin` explicitly freezes a Direct/Delegated source tree once
+implementation, ordinary testing, and remediation are complete. Required
+checks may have run immediately before entry or may be repeated during
+finalization; RDO accepts them only when their source digests match the frozen
+tree. Full enters automatically after its last required workflow. Repeating
+begin is idempotent and never extends the deadline, which is fixed at the
+original execution deadline plus the configured grace.
 
 `rdo strategy submit|revise` and `rdo finalize` publish the attempt-local
 `HANDOFF_READY.json` only after immutable handoff and evidence artifacts are

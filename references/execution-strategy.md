@@ -135,15 +135,29 @@ the frozen `ACCEPTANCE.md` contract and writes attempt-local structured command
 records. Legacy `rdo exec --acceptance` records cannot satisfy a v2 completion
 gate; exploratory command failures likewise do not become acceptance evidence.
 
-Completion gates are enforced at the earliest deterministic boundary. When completing a workflow would satisfy all required workflows, `rdo workflow complete` validates required workflow completion, acceptance command records, command outcomes, and timeout policy before appending `workflow_completed`. A failed gate leaves the workflow instance active so the worker may add the missing acceptance record and retry completion without consuming another `max_instances` slot.
+Completion gates are enforced at the earliest deterministic boundary. Legacy
+execution validates acceptance records before appending the last
+`workflow_completed`. Artifact Protocol v2 instead validates workflow and
+timeout policy at that boundary, freezes the source, and validates source-bound
+acceptance records at final handoff. A failed workflow gate leaves the instance
+active so the worker may repair it without consuming another `max_instances`
+slot.
 
-After the final required workflow completes, RDO writes attempt-local
-`runtime/FINALIZATION.json`. Required acceptance commands must already have run
-through `rdo check`. The worker then calls `rdo finalize` once; it validates
-those structured records and the clean committed worktree, freezes
-`EVIDENCE.json` and `HANDOFF.json`, and publishes `runtime/HANDOFF_READY.json`
-last. Legacy-v1 retains its historical Markdown/COMPLETION artifacts only on
-the explicit compatibility path.
+Direct/Delegated explicitly enter finalization once implementation,
+ordinary tests, and self-review remediation are complete. Full enters after
+the final required workflow completes; all implementation and remediation must
+therefore precede that completion. RDO freezes the full semantic worktree
+entries and publishes create-once
+`runtime/FINALIZATION.json`; later begin calls cannot reset its deadline.
+The effective final deadline is the original execution deadline plus the
+configured grace. During finalize-only time the worker may record or repeat
+exact required checks, commit the frozen tree, and call `rdo finalize`, but may
+not run workflows, `rdo exec`, or change source bytes, paths, kinds, symlink
+targets, or modes. Check records carry before/after source digests and only
+records matching the frozen snapshot qualify. Finalize binds the entry
+snapshot, deadline, and marker into `EVIDENCE.json`, then publishes `HANDOFF.json` and
+`runtime/HANDOFF_READY.json`. Legacy-v1 retains its historical compatibility
+path.
 
 ## Multiple Workflows
 
