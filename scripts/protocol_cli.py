@@ -47,6 +47,7 @@ from task_contract import (
     validate_task_inputs_payload,
     write_task_inputs_immutable,
 )
+from task_budget import TaskBudgetError, validate_assessment
 from supervisor import terminate_processes, validate_attempt_deadline_payload
 from validation import (
     HandoffValidationResult,
@@ -534,6 +535,34 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
                 "task_inputs_sha256": args.task_inputs_sha256,
             }
         )
+        if bool(args.task_budget_ref) != bool(args.task_budget_sha256):
+            raise SystemExit("v2 ATTEMPT task budget ref and digest must be supplied together")
+        if args.task_budget_ref:
+            if args.task_budget_ref != "runtime/TASK_BUDGET.json":
+                raise SystemExit("v2 ATTEMPT.task_budget_ref must be runtime/TASK_BUDGET.json")
+            budget_path = Path(args.path).parent / args.task_budget_ref
+            try:
+                assessment = validate_assessment(load_json(budget_path))
+                budget_digest = file_sha256(budget_path)
+            except (TaskBudgetError, OSError, ValueError, json.JSONDecodeError) as exc:
+                raise SystemExit(f"cannot bind TASK_BUDGET.json: {exc}") from exc
+            if budget_digest != args.task_budget_sha256:
+                raise SystemExit("ATTEMPT task_budget_sha256 does not match TASK_BUDGET.json")
+            if assessment.get("next_attempt_id") != args.attempt_id:
+                raise SystemExit("TASK_BUDGET.json is bound to another attempt")
+            inputs_payload = load_json(inputs_path)
+            policy_binding = inputs_payload.get("inputs", {}).get("execution_policy", {})
+            if assessment.get("execution_policy_sha256") != policy_binding.get("sha256"):
+                raise SystemExit("TASK_BUDGET.json is not bound to frozen EXECUTION_POLICY.json")
+            if assessment.get("admission", {}).get("allowed") is not True:
+                raise SystemExit("TASK_BUDGET.json does not admit this attempt")
+            payload.update(
+                {
+                    "task_budget_ref": args.task_budget_ref,
+                    "task_budget_sha256": args.task_budget_sha256,
+                    "task_budget_assessment_sha256": assessment["assessment_sha256"],
+                }
+            )
     elif args.artifact_protocol_version != 1:
         raise SystemExit("artifact protocol version must be 1 or 2")
     path = Path(args.path)
@@ -2242,6 +2271,7 @@ def _failed_attempt_outcome(
 def _failure_status_fields(
     outcome: str,
     startup_failure: Mapping[str, Any] | None = None,
+    budget_reason: str | None = None,
 ) -> tuple[str, str, str]:
     if outcome == "startup_failed":
         failure_code = str((startup_failure or {}).get("code") or "worker_startup_failed")
@@ -2274,16 +2304,36 @@ def _failure_status_fields(
             "worker entered finalization but exited before publishing a valid handoff",
         )
     if outcome == "execution_failed":
+        if budget_reason:
+            return (
+                "Worker resource budget exceeded",
+                "budget",
+                budget_reason,
+            )
         return (
             "Worker execution failed",
             "needs_coordinator",
             "worker started but exited without a valid handoff",
+        )
+    if outcome == "invalid_handoff" and budget_reason:
+        return (
+            "Worker task budget evidence is unavailable",
+            "budget",
+            budget_reason,
         )
     return (
         "Invalid worker handoff",
         "needs_coordinator",
         "invalid worker handoff",
     )
+
+
+def _supervisor_budget_reason(supervisor: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(supervisor, Mapping) or supervisor.get("budget_exceeded") is not True:
+        return None
+    usage = supervisor.get("usage")
+    reason = usage.get("budget_exceeded") if isinstance(usage, Mapping) else None
+    return str(reason or "worker exceeded its remaining task resource budget")
 
 
 def _v2_supervisor_receipt_reasons(
@@ -2811,6 +2861,11 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
             summary, blocker_type, blocking_reason = _failure_status_fields(
                 outcome,
                 startup_failure,
+                _supervisor_budget_reason(supervisor_payload)
+                or next(
+                    (reason for reason in result.reasons if reason.startswith("task budget ")),
+                    None,
+                ),
             )
             if outcome == "invalid_handoff" and result.reasons:
                 blocking_reason += ": " + "; ".join(result.reasons[:3])
@@ -3048,6 +3103,7 @@ def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
     summary, blocker_type, blocking_reason = _failure_status_fields(
         outcome,
         startup_failure,
+        _supervisor_budget_reason(supervisor),
     )
     if cleanup_failure is not None:
         surviving_pids = cleanup_failure.get("surviving_pids")
@@ -3297,6 +3353,8 @@ def build_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--artifact-protocol-version", type=int, choices=[1, 2], default=1)
     attempt.add_argument("--task-inputs-ref", default="")
     attempt.add_argument("--task-inputs-sha256", default="")
+    attempt.add_argument("--task-budget-ref", default="")
+    attempt.add_argument("--task-budget-sha256", default="")
     attempt.add_argument("--attempt-id", required=True)
     attempt.add_argument("--task-id", required=True)
     attempt.add_argument("--agent-name", required=True)

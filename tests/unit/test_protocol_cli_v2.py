@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -267,6 +268,33 @@ class ProtocolCliV2Tests(unittest.TestCase):
             *args,
             cwd=self.root,
             check=check,
+        )
+
+    def dry_dispatch(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                str(SCRIPTS / "dispatch_agent.sh"),
+                "R001",
+                "T001",
+                "--worker",
+                "claude-code",
+                "--runtime",
+                "plain",
+                "--io",
+                "machine",
+                "--command",
+                "true",
+            ],
+            cwd=self.root,
+            env={
+                **os.environ,
+                "DISPATCH_DRY_RUN": "1",
+                "RDO_TEST_ALLOW_UNGOVERNED_COMMAND_OVERRIDE": "1",
+            },
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
 
     def freeze(self, attempt_id: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -663,6 +691,72 @@ class ProtocolCliV2Tests(unittest.TestCase):
         self.assertFalse((attempt / "COMPLETION.json").exists())
         self.assertFalse((self.task_dir / "HANDOFF.json").exists())
         self.assertFalse((self.task_dir / "EVIDENCE.md").exists())
+
+    def test_task_attempt_budget_blocks_second_dispatch_before_attempt_creation(self) -> None:
+        policy = dict(POLICY)
+        policy["task_budget"] = {"max_attempts": 1}
+        self.write_json(self.task_dir / "EXECUTION_POLICY.json", policy)
+        first = self.dry_dispatch()
+        self.assertEqual(4, first.returncode, first.stderr)
+        attempts = list((self.task_dir / "attempts").iterdir())
+        self.assertEqual(1, len(attempts))
+        metadata = json.loads((attempts[0] / "ATTEMPT.json").read_text())
+        self.assertEqual("runtime/TASK_BUDGET.json", metadata["task_budget_ref"])
+        # Dry-run intentionally creates no supervisor receipt, so its generic
+        # reconciliation retains the lock. This fixture clears that synthetic
+        # condition before exercising the next real dispatch admission.
+        shutil.rmtree(self.task_dir / ".dispatch-lock")
+
+        second = self.dry_dispatch()
+        self.assertEqual(3, second.returncode, second.stderr)
+        self.assertIn("task_budget_exhausted", second.stderr)
+        self.assertEqual(1, len(list((self.task_dir / "attempts").iterdir())))
+        self.assertFalse((self.task_dir / ".dispatch-lock").exists())
+
+    def test_task_execution_budget_bounds_resumed_attempt_without_shortening_grace(self) -> None:
+        policy = dict(POLICY)
+        policy["task_budget"] = {
+            "max_attempts": 2,
+            "max_execution_seconds": 100,
+        }
+        self.write_json(self.task_dir / "EXECUTION_POLICY.json", policy)
+        first = self.dry_dispatch()
+        self.assertEqual(4, first.returncode, first.stderr)
+        first_attempt = next((self.task_dir / "attempts").iterdir())
+        shutil.rmtree(self.task_dir / ".dispatch-lock")
+        deadline_path = first_attempt / "runtime" / "DEADLINE.json"
+        deadline = load_or_create_attempt_deadline(
+            deadline_path,
+            attempt_timeout_seconds=100,
+            finalization_grace_seconds=90,
+            reminder_seconds=60,
+        )
+        deadline_sha = hashlib.sha256(deadline_path.read_bytes()).hexdigest()
+        self.write_json(
+            first_attempt / "supervisor-result.json",
+            {
+                "exit_code": 1,
+                "deadline_sha256": deadline_sha,
+                "attempt_started_at_epoch": deadline["started_at_epoch"],
+                "execution_deadline_at_epoch": deadline["execution_deadline_at_epoch"],
+                "execution_elapsed_seconds": 40,
+            },
+        )
+
+        second = self.dry_dispatch()
+        self.assertEqual(4, second.returncode, second.stderr)
+        attempts = sorted((self.task_dir / "attempts").iterdir())
+        self.assertEqual(2, len(attempts))
+        second_attempt = attempts[-1]
+        metadata = json.loads((second_attempt / "ATTEMPT.json").read_text())
+        supervisor = metadata["runtime"]["supervisor_command"]
+        budget = json.loads(
+            (second_attempt / "runtime" / "TASK_BUDGET.json").read_text()
+        )
+        self.assertEqual(60.0, budget["remaining"]["execution_seconds"])
+        self.assertEqual(60.0, budget["admission"]["attempt_wall_seconds"])
+        self.assertIn("--timeout-seconds 60.0", supervisor)
+        self.assertIn("--finalization-timeout-seconds 90", supervisor)
 
     def test_full_dispatch_rejects_worker_replacement_of_frozen_approved_strategy(self) -> None:
         from tests.unit.test_strategy import strategy_payload

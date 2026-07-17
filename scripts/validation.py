@@ -27,6 +27,10 @@ from protocol import (
     load_json,
     parse_iso,
 )
+from task_budget import (
+    attempt_budget_binding_reasons,
+    attempt_budget_receipt_reasons,
+)
 
 
 @dataclass(frozen=True)
@@ -429,6 +433,9 @@ def validate_worker_handoff(
         else:
             if policy_digest != attempt.get("read_policy_sha256"):
                 reasons.append("read policy changed during the attempt")
+    if isinstance(attempt, dict):
+        reasons.extend(attempt_budget_binding_reasons(attempt_path.parent, attempt))
+        reasons.extend(attempt_budget_receipt_reasons(attempt_path.parent, attempt))
     violations_path = task_dir / "attempts" / attempt_id / "runtime" / "VIOLATIONS.ndjson"
     if violations_path.exists():
         try:

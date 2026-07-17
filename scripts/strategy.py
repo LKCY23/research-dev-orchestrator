@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from protocol import WORKER_BACKENDS, is_int_not_bool, is_non_empty_string, load_json, utc_now, write_json
+from task_budget import TaskBudgetError, normalize_task_budget
 
 
 class StrategyValidationError(ValueError):
@@ -32,6 +33,7 @@ DEFAULT_EXECUTION_POLICY: dict[str, Any] = {
     "read_paths": ["."],
     "forbidden_paths": [],
     "context_sources": [],
+    "task_budget": None,
 }
 
 WORKFLOW_TIMEOUT_ACTIONS = {"block", "request_revision", "continue_without_result"}
@@ -96,6 +98,12 @@ def validate_execution_policy(policy: Any) -> dict[str, Any]:
         is_non_empty_string(item) for item in context_sources
     ):
         raise StrategyValidationError("context_sources must be a string list")
+    if schema_version == 1 and "task_budget" in policy:
+        raise StrategyValidationError("task_budget is only supported by schema 2 execution policy")
+    try:
+        normalize_task_budget(policy.get("task_budget"))
+    except TaskBudgetError as exc:
+        raise StrategyValidationError(str(exc)) from exc
     return policy
 
 

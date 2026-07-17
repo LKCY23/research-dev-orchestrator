@@ -16,6 +16,7 @@ from config import load_config
 from protocol import load_json
 from read_policy import compile_read_policy
 from strategy import canonical_digest, validate_execution_policy, validate_strategy
+from task_budget import TaskBudgetError, validate_assessment
 
 
 class BackendGovernanceError(ValueError):
@@ -106,6 +107,7 @@ def compile_backend_profile(
     phase: str,
     strategy_path: Path | None = None,
     io_mode: str | None = None,
+    task_budget_assessment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if phase not in {"planning", "execution"}:
         raise BackendGovernanceError("phase must be planning or execution")
@@ -137,6 +139,29 @@ def compile_backend_profile(
                     f"approved strategy backend {strategy['backend_id']!r} does not match dispatch backend {backend_id!r}"
                 )
             strategy_sha256 = canonical_digest(strategy)
+
+    task_budget: dict[str, Any] | None = None
+    if task_budget_assessment is not None:
+        try:
+            task_budget = validate_assessment(task_budget_assessment)
+        except TaskBudgetError as exc:
+            raise BackendGovernanceError(str(exc)) from exc
+        if task_budget.get("admission", {}).get("allowed") is not True:
+            raise BackendGovernanceError("task cumulative budget denies this attempt")
+
+    resource_budget = dict(strategy.get("resource_budget", {}) if strategy else {})
+    task_cost = (
+        task_budget.get("admission", {}).get("max_cost_usd")
+        if task_budget is not None
+        else None
+    )
+    if isinstance(task_cost, (int, float)) and not isinstance(task_cost, bool):
+        current_cost = resource_budget.get("max_cost_usd")
+        resource_budget["max_cost_usd"] = (
+            min(float(current_cost), float(task_cost))
+            if isinstance(current_cost, (int, float)) and not isinstance(current_cost, bool)
+            else float(task_cost)
+        )
 
     global_budget = strategy["global_budget"] if strategy else policy
     agent_limits = {"max_parallel": int(global_budget["max_parallel_subagents"])}
@@ -394,7 +419,7 @@ def compile_backend_profile(
             "broker": {"id": "context-broker-cli", "version": 1},
         },
         "usage_observability": backend.get("usage_observability", {}),
-        "resource_budget": strategy.get("resource_budget", {}) if strategy else {},
+        "resource_budget": resource_budget,
         "governance": governance,
         "controls": controls,
         "native_agent_limits": agent_limits,
@@ -410,6 +435,13 @@ def compile_backend_profile(
             else []
         ),
     }
+    if task_budget is not None:
+        profile["task_budget"] = {
+            "assessment_sha256": task_budget["assessment_sha256"],
+            "limits": task_budget["limits"],
+            "consumed": task_budget["consumed"],
+            "remaining": task_budget["remaining"],
+        }
     profile["profile_sha256"] = canonical_digest(profile)
     if io_mode is not None:
         require_resource_observability(profile, io_mode)

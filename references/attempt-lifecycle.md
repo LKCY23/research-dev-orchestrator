@@ -78,6 +78,9 @@ future dispatch even when the task appears ready for review or triage.
   "task_id": "T001-name",
   "task_inputs_ref": "TASK_INPUTS.json",
   "task_inputs_sha256": "...",
+  "task_budget_ref": "runtime/TASK_BUDGET.json",
+  "task_budget_sha256": "...",
+  "task_budget_assessment_sha256": "...",
   "role": "worker",
   "phase": "execution",
   "strategy_id": "T001-S001",
@@ -157,7 +160,26 @@ runtime.model: optional/null
 runtime.tmux_session: required when runtime.backend = tmux
 runtime.attach_command: required when runtime.backend = tmux
 verified_commit: exact finalize-time Git HEAD for a completed Direct verified attempt; absent otherwise
+task_budget_ref/task_budget_sha256/task_budget_assessment_sha256: required together only when the frozen v2 execution policy enables cumulative task limits
 ```
+
+## Cumulative task admission
+
+Dispatch performs cumulative budget admission after backend preflight and
+while holding `.dispatch-lock`, but before freezing inputs, creating
+`ATTEMPT.json`, or starting a worker. It derives history from existing
+`ATTEMPT.json`, immutable `runtime/DEADLINE.json`, coordinator supervisor
+receipts, and observable usage telemetry. Re-running admission or dispatcher
+reconciliation does not mutate counters and cannot double-charge an attempt.
+
+The next execution timeout is the smaller of its ordinary attempt limit and
+the remaining task execution seconds. The supervisor still starts T1's fixed
+finalization grace at the original execution deadline. Remaining task cost is
+merged into the backend profile as a hard `max_cost_usd` cap; a stricter
+approved attempt-local cap remains stricter. An exhausted limit or missing
+required observation produces a machine-readable `budget` admission blocker
+and no new attempt directory. `rdo status` and `collect_status.py` expose this
+derived diagnosis without adding a cumulative-budget state to the task FSM.
 
 ## Attempt States
 

@@ -40,6 +40,12 @@ from validation import (
     validate_task_profile_binding,
     validate_status_schema,
 )
+from task_budget import (
+    TaskBudgetError,
+    assess_task_budget,
+    attempt_budget_binding_reasons,
+    attempt_budget_receipt_reasons,
+)
 
 
 def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[str], list[str]]:
@@ -285,6 +291,15 @@ def validate_attempt(
         return violations, warnings, None
 
     violations.extend(validate_attempt_schema(attempt, status, str(attempt_id), task_dir.name))
+    violations.extend(
+        f"{task_dir.name}: {reason}"
+        for reason in attempt_budget_binding_reasons(attempt_path.parent, attempt)
+    )
+    if attempt.get("state") == "completed":
+        violations.extend(
+            f"{task_dir.name}: {reason}"
+            for reason in attempt_budget_receipt_reasons(attempt_path.parent, attempt)
+        )
     runtime = attempt.get("runtime")
     if not isinstance(runtime, dict):
         runtime = {}
@@ -999,6 +1014,22 @@ def collect(
             if isinstance(loaded_attempt, dict):
                 attempt = loaded_attempt
 
+        task_budget = None
+        if status_uses_v2(status) and (task_dir / "EXECUTION_POLICY.json").is_file():
+            try:
+                task_budget = assess_task_budget(task_dir)
+            except TaskBudgetError as exc:
+                violations.append(f"{task_dir.name}: task budget evidence is invalid: {exc}")
+                task_budget = {
+                    "enabled": True,
+                    "admission": {
+                        "allowed": False,
+                        "blocker_type": "budget",
+                        "blocking_reason": str(exc),
+                        "reasons": [{"code": "budget_evidence_invalid", "reason": str(exc)}],
+                    },
+                }
+
         tasks.append(
             {
                 "task_id": status.get("task_id", task_dir.name),
@@ -1024,6 +1055,7 @@ def collect(
                     if isinstance(attempt, dict)
                     else None
                 ),
+                **({"task_budget": task_budget} if status_uses_v2(status) else {}),
                 "handoff_index": handoff_index,
                 "artifact_resolution": artifact_resolution,
                 "lock": lock_info,

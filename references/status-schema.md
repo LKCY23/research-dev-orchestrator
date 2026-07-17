@@ -71,6 +71,14 @@ consumers resolve the current attempt and validate its exact
 `runtime/HANDOFF_READY.json` bindings. They never fall back to task-root
 handoff/evidence files.
 
+Optional cumulative task budgets do not add fields to mutable `STATUS.json` or
+new FSM states. `rdo status` and `collect_status.py` derive a `task_budget`
+projection from frozen attempt/deadline/usage evidence. It reports limits,
+consumed, remaining, observation gaps, and an admission object. A denied
+admission uses `blocker_type = budget` in that projection even when the durable
+task state remains `pending`, `blocked`, or `changes_requested`; dispatch is
+the enforcing gate and will not create another attempt.
+
 ## Blocker types
 
 For `blocked`, `blocker_type` is required and must be one of:

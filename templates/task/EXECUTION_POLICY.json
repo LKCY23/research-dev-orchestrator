@@ -17,5 +17,6 @@
     "RDO_TEMPLATE_INCOMPLETE"
   ],
   "forbidden_paths": [],
-  "context_sources": []
+  "context_sources": [],
+  "task_budget": null
 }

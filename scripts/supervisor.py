@@ -42,6 +42,7 @@ class SupervisedResult:
     finalization_started: bool
     finalization_timed_out: bool
     elapsed_seconds: float
+    execution_elapsed_seconds: float
     observed_pids: tuple[int, ...]
     observed_pgids: tuple[int, ...]
     surviving_pids: tuple[int, ...]
@@ -586,6 +587,14 @@ class AttemptDeadline:
             and self.finalization_deadline_epoch is not None
             else self.execution_deadline_epoch
         )
+
+    def execution_elapsed_seconds(self, *, now_epoch: float | None = None) -> float:
+        """Return charged execution time, stopping before finalization grace."""
+
+        stop = self.finalization_started_epoch
+        if stop is None:
+            stop = min(time.time() if now_epoch is None else now_epoch, self.execution_deadline_epoch)
+        return max(0.0, min(stop, self.execution_deadline_epoch) - self.attempt_started_epoch)
 
     def expired(self, *, now_monotonic: float | None = None) -> bool:
         now = time.monotonic() if now_monotonic is None else now_monotonic
@@ -1350,6 +1359,7 @@ def run_supervised(
         finalization_started=deadline.finalization_started_epoch is not None,
         finalization_timed_out=finalization_timed_out,
         elapsed_seconds=round(time.monotonic() - started, 6),
+        execution_elapsed_seconds=round(deadline.execution_elapsed_seconds(), 6),
         observed_pids=tuple(sorted(observed_pids)),
         observed_pgids=tuple(sorted(observed_pgids)),
         surviving_pids=survivors,

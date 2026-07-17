@@ -260,6 +260,7 @@ backend contract
   + shipped backend governance
   + project backend policy
   + task execution policy
+  + optional cumulative task-budget admission snapshot
   + approved strategy
   + allowed one-off launch selections
   -> compiled backend profile
@@ -307,6 +308,14 @@ The profile digest is stored in `ATTEMPT.json`. The actual argv recorded in the
 attempt must reference only attempt-local generated files by absolute path.
 Secrets are never written into the profile; it records secret source names or
 redacted values only.
+
+When protocol v2 declares cumulative model cost, the admission snapshot
+contributes the remaining task cost to `resource_budget.max_cost_usd`. The
+compiler takes the minimum of that value and any approved attempt-local cost
+limit, then applies the existing backend/I/O observability gate. A backend mode
+that cannot expose cost fails before lock acquisition and attempt creation.
+After the lock is acquired, dispatch re-derives and compares the admission
+snapshot before materializing the already compiled profile.
 
 ## Enforcement Classes
 

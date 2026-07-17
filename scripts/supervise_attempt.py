@@ -25,6 +25,46 @@ from supervisor import (
 )
 
 
+def _human_usage_receipt(task_dir: str, attempt_id: str) -> tuple[dict[str, object] | None, str | None]:
+    """Project coordinator-owned human-backend usage logs into the outer receipt."""
+
+    if not task_dir or not attempt_id:
+        return None, None
+    runtime = Path(task_dir) / "attempts" / attempt_id / "runtime"
+    usage_path = runtime / "USAGE.ndjson"
+    violation_path = runtime / "VIOLATIONS.ndjson"
+    usage_record: dict[str, object] | None = None
+    budget_reason: str | None = None
+    try:
+        if usage_path.is_file() and not usage_path.is_symlink():
+            for line in usage_path.read_text(encoding="utf-8").splitlines():
+                value = json.loads(line)
+                if isinstance(value, dict) and value.get("event") == "model_usage":
+                    usage_record = value
+        if violation_path.is_file() and not violation_path.is_symlink():
+            for line in violation_path.read_text(encoding="utf-8").splitlines():
+                value = json.loads(line)
+                if (
+                    isinstance(value, dict)
+                    and value.get("hard") is True
+                    and value.get("event")
+                    in {"resource_budget_exceeded", "usage_observation_missing"}
+                ):
+                    budget_reason = str(value.get("reason") or "resource budget exceeded")
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, None
+    if usage_record is None:
+        return None, budget_reason
+    return {
+        "totals": usage_record.get("totals"),
+        "observed_metrics": usage_record.get("observed_metrics", []),
+        "source_events": [usage_record.get("source_event")]
+        if usage_record.get("source_event")
+        else [],
+        "budget_exceeded": budget_reason,
+    }, budget_reason
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Supervise one worker attempt.")
     parser.add_argument("--timeout-seconds", required=True, type=float)
@@ -376,6 +416,7 @@ def main() -> int:
                 encoding="utf-8",
             )
             os.replace(temporary_state, state_path)
+    usage_receipt, budget_reason = _human_usage_receipt(args.task_dir, args.attempt_id)
     payload = {
         "exit_code": exit_code,
         "child_exit_code": result.child_exit_code,
@@ -404,6 +445,9 @@ def main() -> int:
             else None
         ),
         "elapsed_seconds": result.elapsed_seconds,
+        "execution_elapsed_seconds": result.execution_elapsed_seconds,
+        "budget_exceeded": budget_reason is not None,
+        "usage": usage_receipt,
         "observed_pids": list(result.observed_pids),
         "observed_pgids": list(result.observed_pgids),
         "surviving_pids": list(result.surviving_pids),

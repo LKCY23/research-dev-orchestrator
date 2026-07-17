@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from protocol_cli import (
+    _failure_status_fields,
     _failed_attempt_outcome,
     cmd_reconcile_dispatch_exit,
     cmd_validate_handoff,
@@ -130,6 +131,39 @@ class AttemptOutcomeTests(unittest.TestCase):
             self.assertEqual("timed_out_unfinalized", metadata["outcome"])
             self.assertEqual(124, metadata["exit_code"])
             self.assertEqual("budget", task_status["blocker_type"])
+
+    def test_resource_overage_reconciles_to_budget_blocker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt, status = self.make_active(root)
+            self.write_json(
+                attempt / "supervisor-result.json",
+                {
+                    "timed_out": False,
+                    "budget_exceeded": True,
+                    "exit_code": 125,
+                    "usage": {
+                        "budget_exceeded": (
+                            "resource budget exceeded: max_cost_usd observed=3 limit=2"
+                        )
+                    },
+                },
+            )
+            self.assertEqual(0, self.reconcile(root, task, attempt, status))
+            metadata = json.loads((attempt / "ATTEMPT.json").read_text())
+            task_status = json.loads(status.read_text())
+            self.assertEqual("execution_failed", metadata["outcome"])
+            self.assertEqual("budget", task_status["blocker_type"])
+            self.assertIn("max_cost_usd", task_status["blocking_reason"])
+
+    def test_missing_terminal_task_budget_receipt_is_a_budget_blocker(self):
+        summary, blocker_type, reason = _failure_status_fields(
+            "invalid_handoff",
+            budget_reason="task budget cost observation is unavailable",
+        )
+        self.assertEqual("budget", blocker_type)
+        self.assertIn("task budget", summary.lower())
+        self.assertIn("cost observation", reason)
 
     def test_finalization_timeout_has_a_distinct_outcome(self):
         with tempfile.TemporaryDirectory() as temporary:

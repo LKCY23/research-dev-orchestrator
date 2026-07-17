@@ -14,6 +14,7 @@ from backend_governance import (
 from agent_backends import build_command
 from protocol import utc_now, write_json
 from strategy import DEFAULT_EXECUTION_POLICY
+from task_budget import assess_task_budget
 from validation import validate_worker_handoff
 
 
@@ -117,6 +118,9 @@ class BackendGovernanceTests(unittest.TestCase):
             strategy_path=self.strategy,
         )
 
+    def test_absent_task_budget_does_not_add_a_profile_control(self):
+        self.assertNotIn("task_budget", self.compile())
+
     def compile_codex(self, *, native_subagents: bool = True):
         strategy = strategy_payload("codex")
         if native_subagents:
@@ -150,6 +154,41 @@ class BackendGovernanceTests(unittest.TestCase):
             phase="execution",
             strategy_path=self.strategy,
         )
+
+    def task_cost_assessment(self, limit: float = 5.0):
+        policy = dict(DEFAULT_EXECUTION_POLICY)
+        policy["task_budget"] = {"max_cost_usd": limit}
+        write_json(self.task / "EXECUTION_POLICY.json", policy)
+        return assess_task_budget(self.task, next_attempt_id="A001")
+
+    def test_task_remaining_cost_tightens_attempt_resource_budget(self):
+        strategy = strategy_payload()
+        strategy["resource_budget"] = {"max_cost_usd": 2.0}
+        write_json(self.strategy, strategy)
+        profile = compile_backend_profile(
+            repo_root=self.root,
+            task_dir=self.task,
+            backend_id="claude-code",
+            phase="execution",
+            strategy_path=self.strategy,
+            io_mode="machine",
+            task_budget_assessment=self.task_cost_assessment(5.0),
+        )
+        self.assertEqual(2.0, profile["resource_budget"]["max_cost_usd"])
+        self.assertEqual(5.0, profile["task_budget"]["remaining"]["cost_usd"])
+
+    def test_task_cost_budget_rejects_unobservable_backend_mode(self):
+        write_json(self.strategy, strategy_payload("codex"))
+        with self.assertRaisesRegex(BackendGovernanceError, "not observable"):
+            compile_backend_profile(
+                repo_root=self.root,
+                task_dir=self.task,
+                backend_id="codex",
+                phase="execution",
+                strategy_path=self.strategy,
+                io_mode="machine",
+                task_budget_assessment=self.task_cost_assessment(),
+            )
 
     def test_compile_is_pure_and_merges_shipped_governance(self):
         profile = self.compile()

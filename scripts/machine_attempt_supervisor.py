@@ -1011,6 +1011,7 @@ def main() -> int:
             else None
         ),
         "elapsed_seconds": round(time.monotonic() - started_monotonic, 6),
+        "execution_elapsed_seconds": round(deadline.execution_elapsed_seconds(), 6),
         "observed_pids": sorted(observed_pids),
         "observed_pgids": sorted(observed_pgids),
         "surviving_pids": list(survivors),

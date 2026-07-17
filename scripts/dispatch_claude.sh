@@ -19,6 +19,7 @@ AGENT_BACKEND_CLI="${SCRIPT_DIR}/agent_backend_cli.py"
 BACKEND_GOVERNANCE_CLI="${SCRIPT_DIR}/backend_governance_cli.py"
 BACKEND_PREFLIGHT="${SCRIPT_DIR}/backend_preflight.py"
 RESUME_CONTEXT_CLI="${SCRIPT_DIR}/resume_context.py"
+TASK_BUDGET_CLI="${SCRIPT_DIR}/task_budget_cli.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -533,18 +534,6 @@ if [[ -z "${RDO_WORKER_COMMAND}" ]]; then
     --agent-name "${RDO_WORKER_AGENT_NAME}" >/dev/null
 fi
 
-BACKEND_PROFILE_COMPILE_ARGS=(
-  compile
-  --repo-root "${REPO_ROOT}"
-  --task-dir "${TASK_DIR}"
-  --backend "${RDO_WORKER_BACKEND}"
-  --phase "${RDO_ATTEMPT_PHASE}"
-  --io-mode "${RDO_IO_MODE}"
-)
-if [[ -n "${STRATEGY_PATH}" ]]; then
-  BACKEND_PROFILE_COMPILE_ARGS+=(--strategy "${STRATEGY_PATH}")
-fi
-BACKEND_PROFILE_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" "${BACKEND_PROFILE_COMPILE_ARGS[@]}")" || exit 2
 if [[ -n "${RDO_WORKER_COMMAND}" && "${RDO_TEST_ALLOW_UNGOVERNED_COMMAND_OVERRIDE:-0}" != "1" ]]; then
   echo "worker.command overrides do not provide a registered startup-event contract; use the registered backend command" >&2
   exit 2
@@ -558,6 +547,40 @@ import secrets
 print(secrets.token_hex(3))
 PY
 )"
+ATTEMPT_POLICY_TIMEOUT_SECONDS="${ATTEMPT_TIMEOUT_SECONDS}"
+set +e
+TASK_BUDGET_ASSESSMENT="$(python3 "${TASK_BUDGET_CLI}" assess \
+  --task-dir "${TASK_DIR}" \
+  --artifact-protocol-version "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
+  --attempt-wall-seconds "${ATTEMPT_POLICY_TIMEOUT_SECONDS}" \
+  --next-attempt-id "${ATTEMPT_ID}")"
+TASK_BUDGET_CODE=$?
+set -e
+if [[ "${TASK_BUDGET_CODE}" -ne 0 ]]; then
+  if [[ -n "${TASK_BUDGET_ASSESSMENT}" ]]; then
+    printf '%s\n' "${TASK_BUDGET_ASSESSMENT}" >&2
+  fi
+  exit "${TASK_BUDGET_CODE}"
+fi
+TASK_BUDGET_ENABLED="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("enabled") else "0")' "${TASK_BUDGET_ASSESSMENT}")"
+ATTEMPT_TIMEOUT_SECONDS="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["admission"]["attempt_wall_seconds"] or sys.argv[2])' "${TASK_BUDGET_ASSESSMENT}" "${ATTEMPT_POLICY_TIMEOUT_SECONDS}")"
+
+BACKEND_PROFILE_COMPILE_ARGS=(
+  compile
+  --repo-root "${REPO_ROOT}"
+  --task-dir "${TASK_DIR}"
+  --backend "${RDO_WORKER_BACKEND}"
+  --phase "${RDO_ATTEMPT_PHASE}"
+  --io-mode "${RDO_IO_MODE}"
+)
+if [[ -n "${STRATEGY_PATH}" ]]; then
+  BACKEND_PROFILE_COMPILE_ARGS+=(--strategy "${STRATEGY_PATH}")
+fi
+if [[ "${TASK_BUDGET_ENABLED}" == "1" ]]; then
+  BACKEND_PROFILE_COMPILE_ARGS+=(--task-budget-json "${TASK_BUDGET_ASSESSMENT}")
+fi
+BACKEND_PROFILE_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" "${BACKEND_PROFILE_COMPILE_ARGS[@]}")" || exit 2
+
 WORKER_CONTEXT="$(python3 - "${STATUS_PATH}" "${RDO_WORKER_BACKEND}" <<'PY'
 import json, sys
 status = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -671,6 +694,26 @@ python3 "${PROTOCOL_CLI}" check-dispatch-transition \
   --fsm-path "${FSM_PATH}" \
   --phase "${RDO_ATTEMPT_PHASE}"
 
+set +e
+TASK_BUDGET_RECHECK="$(python3 "${TASK_BUDGET_CLI}" assess \
+  --task-dir "${TASK_DIR}" \
+  --artifact-protocol-version "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
+  --attempt-wall-seconds "${ATTEMPT_POLICY_TIMEOUT_SECONDS}" \
+  --next-attempt-id "${ATTEMPT_ID}")"
+TASK_BUDGET_CODE=$?
+set -e
+if [[ "${TASK_BUDGET_CODE}" -ne 0 ]]; then
+  if [[ -n "${TASK_BUDGET_RECHECK}" ]]; then
+    printf '%s\n' "${TASK_BUDGET_RECHECK}" >&2
+  fi
+  exit "${TASK_BUDGET_CODE}"
+fi
+if ! python3 -c 'import json,sys; raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)' \
+  "${TASK_BUDGET_ASSESSMENT}" "${TASK_BUDGET_RECHECK}"; then
+  echo "task budget history changed during dispatch; retry admission" >&2
+  exit 3
+fi
+
 BRANCH="$(python3 - "$STATUS_PATH" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8")).get("branch", ""))
@@ -691,6 +734,8 @@ TASK_INPUTS_SHA256=""
 TASK_INPUTS_REF=""
 TASK_BASE_COMMIT=""
 WORKTREE_BEFORE_SHA256=""
+TASK_BUDGET_REF=""
+TASK_BUDGET_SHA256=""
 if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "2" ]]; then
   TASK_INPUTS_RESULT="$(python3 "${PROTOCOL_CLI}" freeze-task-inputs \
     --task-dir "${TASK_DIR}" \
@@ -706,6 +751,14 @@ if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" == "2" ]]; then
   TASK_BASE_COMMIT="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["task_base_commit"])' "${TASK_INPUTS_RESULT}")"
 else
   mkdir -p "${ATTEMPT_DIR}"
+fi
+
+if [[ "${TASK_BUDGET_ENABLED}" == "1" ]]; then
+  TASK_BUDGET_RESULT="$(python3 "${TASK_BUDGET_CLI}" freeze \
+    --attempt-dir "${ATTEMPT_DIR}" \
+    --assessment-json "${TASK_BUDGET_ASSESSMENT}")" || exit 2
+  TASK_BUDGET_REF="runtime/TASK_BUDGET.json"
+  TASK_BUDGET_SHA256="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["sha256"])' "${TASK_BUDGET_RESULT}")"
 fi
 
 BACKEND_MATERIALIZED_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" materialize \
@@ -989,6 +1042,8 @@ python3 "${PROTOCOL_CLI}" create-attempt \
   --artifact-protocol-version "${TASK_ARTIFACT_PROTOCOL_VERSION}" \
   --task-inputs-ref "${TASK_INPUTS_REF}" \
   --task-inputs-sha256 "${TASK_INPUTS_SHA256}" \
+  --task-budget-ref "${TASK_BUDGET_REF}" \
+  --task-budget-sha256 "${TASK_BUDGET_SHA256}" \
   --attempt-id "${ATTEMPT_ID}" \
   --task-id "${TASK_ID}" \
   --agent-name "${RDO_WORKER_AGENT_NAME}" \

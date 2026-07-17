@@ -12,6 +12,7 @@ from pathlib import Path
 from artifact_bundle import publish_bundle
 from completion import write_completion
 from supervisor import load_or_create_attempt_deadline, pid_alive
+from supervise_attempt import _human_usage_receipt
 from task_contract import TASK_INPUT_FILENAMES, build_task_inputs_payload
 
 
@@ -127,6 +128,38 @@ class InteractiveAttemptSupervisorTests(unittest.TestCase):
             "--deadline-reminder-seconds",
             "0.1",
         ]
+
+    def test_human_usage_receipt_projects_cost_overage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary) / "tasks" / "T001"
+            runtime = task / "attempts" / "A001" / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "USAGE.ndjson").write_text(
+                json.dumps(
+                    {
+                        "event": "model_usage",
+                        "source_event": "message.completed",
+                        "observed_metrics": ["cost_usd"],
+                        "totals": {"cost_usd": 3.0},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (runtime / "VIOLATIONS.ndjson").write_text(
+                json.dumps(
+                    {
+                        "event": "resource_budget_exceeded",
+                        "hard": True,
+                        "reason": "max_cost_usd observed=3 limit=2",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            usage, reason = _human_usage_receipt(str(task), "A001")
+            self.assertEqual(3.0, usage["totals"]["cost_usd"])
+            self.assertIn("max_cost_usd", reason)
 
     def test_valid_v2_ready_stops_interactive_worker_and_cleans_descendants(self):
         with tempfile.TemporaryDirectory() as temporary:

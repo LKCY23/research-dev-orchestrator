@@ -40,7 +40,22 @@ silently convert a task to Full.
   sections carry behavioral and coordinator judgment.
 - `EXECUTION_POLICY.json` owns execution limits, the explicit `allowed_paths`,
   `read_paths`, `forbidden_paths`, and `context_sources`, plus the deterministic
-  `strategy_required == (profile == full)` binding.
+  `strategy_required == (profile == full)` binding. Protocol v2 may also set
+  `task_budget` to a non-empty subset of `max_attempts`,
+  `max_execution_seconds`, and `max_cost_usd`; each value is a positive hard
+  cumulative limit. `null` or an omitted field preserves existing behavior.
+
+Task cumulative limits are distinct from a Full strategy's attempt-local
+`resource_budget`. Attempts are counted after `ATTEMPT.json` is created,
+including startup and execution failures. A backend preflight failure before
+attempt creation is free, and a same-attempt runtime fallback is still one
+attempt. Execution time stops when finalization begins, so the independent T1
+finalization grace is never charged to or shortened by the task budget. Cost
+is accepted only from an observable backend usage stream; missing historical
+cost evidence blocks admission instead of being treated as zero.
+For an enabled metered dimension, terminal handoff also requires the current
+attempt's bound execution/cost receipt; a task cannot reach review or verified
+with an unobservable cumulative total.
 
 `STATUS.json` owns task state, profile, branch, worktree, and current attempt.
 Those controls do not belong in `TASK.md`.
@@ -56,6 +71,13 @@ After a successful readiness check, dispatch derives immutable
 base commit, resolved dependency commits, and a stable contract digest.
 `ATTEMPT.json` references this file by path and exact digest. A later attempt
 with a different stable contract is rejected and requires a revision task.
+
+When `task_budget` is enabled, dispatch also derives immutable
+`runtime/TASK_BUDGET.json` while holding the task dispatch lock. It records the
+source attempt digests, consumed and remaining amounts, the effective next
+attempt wall/cost caps, and the admission decision. `ATTEMPT.json` binds this
+snapshot and its assessment digest. It is an audit snapshot, not a mutable
+counter; every later decision is recomputed from frozen attempt evidence.
 
 ## Attempt outputs
 

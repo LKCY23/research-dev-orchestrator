@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from task_budget import TaskBudgetError, normalize_task_budget
+
 
 ARTIFACT_PROTOCOL_VERSION = 2
 TASK_INPUTS_SCHEMA_VERSION = 2
@@ -502,6 +504,10 @@ def validate_execution_policy_v2(policy: Any, *, profile: str) -> dict[str, Any]
         )
     if not isinstance(policy.get("allow_unbounded_search"), bool):
         raise TaskContractError("EXECUTION_POLICY.allow_unbounded_search must be boolean")
+    try:
+        normalized["task_budget"] = normalize_task_budget(policy.get("task_budget"))
+    except TaskBudgetError as exc:
+        raise TaskContractError(f"EXECUTION_POLICY.{exc}") from exc
 
     allowed_paths = _normalize_path_list(
         policy.get("allowed_paths"),

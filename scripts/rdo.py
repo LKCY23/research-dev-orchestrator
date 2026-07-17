@@ -73,6 +73,7 @@ from task_contract import (
     parse_execution_policy,
     validate_task_inputs_payload,
 )
+from task_budget import TaskBudgetError, assess_task_budget
 from worktree_fingerprint import fingerprint
 
 
@@ -3135,6 +3136,22 @@ def status_action(args: argparse.Namespace) -> int:
         "backend_events": [],
         "governance_violations": [],
     }
+    if (
+        task_protocol(path, status) == ARTIFACT_PROTOCOL_VERSION
+        and (path / "EXECUTION_POLICY.json").is_file()
+    ):
+        try:
+            payload["task_budget"] = assess_task_budget(path)
+        except TaskBudgetError as exc:
+            payload["task_budget"] = {
+                "enabled": True,
+                "admission": {
+                    "allowed": False,
+                    "blocker_type": "budget",
+                    "blocking_reason": str(exc),
+                    "reasons": [{"code": "budget_evidence_invalid", "reason": str(exc)}],
+                },
+            }
     if attempt_id:
         attempt_dir = path / "attempts" / str(attempt_id)
         attempt_path = attempt_dir / "ATTEMPT.json"

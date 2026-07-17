@@ -368,6 +368,29 @@ class CollectStatusV2Tests(unittest.TestCase):
             self.assertEqual("v2", artifacts["protocol"])
             self.assertEqual("unpublished", artifacts["publication_state"])
 
+    def test_v2_status_projects_optional_task_budget_without_mutating_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = self.make_run(root, 2)
+            task = run / "tasks" / "T001"
+            self.write_json(
+                task / "EXECUTION_POLICY.json",
+                {
+                    "schema_version": 2,
+                    "strategy_required": False,
+                    "task_budget": {"max_attempts": 2},
+                },
+            )
+            status_before = (task / "STATUS.json").read_bytes()
+            with patch("collect_status.repo_root", return_value=root):
+                report = collect("run", 24)
+            projection = report["tasks"][0]["task_budget"]
+            self.assertTrue(projection["enabled"])
+            self.assertEqual(0, projection["consumed"]["attempts"])
+            self.assertEqual(2, projection["remaining"]["attempts"])
+            self.assertTrue(projection["admission"]["allowed"])
+            self.assertEqual(status_before, (task / "STATUS.json").read_bytes())
+
     def test_v2_status_requires_an_explicit_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

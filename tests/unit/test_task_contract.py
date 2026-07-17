@@ -367,6 +367,21 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertEqual(["."], parsed["read_paths"])
         self.assertEqual(["private"], parsed["forbidden_paths"])
 
+    def test_optional_task_budget_is_normalized_and_invalid_limits_are_rejected(self) -> None:
+        value = policy()
+        value["task_budget"] = {
+            "max_attempts": 3,
+            "max_execution_seconds": 7200,
+            "max_cost_usd": 4,
+        }
+        parsed = validate_execution_policy_v2(value, profile="direct")
+        self.assertEqual(4.0, parsed["task_budget"]["max_cost_usd"])
+        for invalid in ({}, {"max_attempts": 0}, {"max_cost_usd": -1}):
+            value = policy()
+            value["task_budget"] = invalid
+            with self.subTest(invalid=invalid), self.assertRaises(TaskContractError):
+                validate_execution_policy_v2(value, profile="direct")
+
     def test_rejects_schema_one_and_duplicate_paths(self) -> None:
         value = policy()
         value["schema_version"] = 1
