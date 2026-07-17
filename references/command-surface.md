@@ -9,6 +9,7 @@ Coordinator-only commands:
 ```text
 rdo strategy approve|changes
 rdo task review|revise|resume|merge
+rdo tmux prune --terminal
 rdo worker message|interrupt|terminate
 rdo status
 ```
@@ -18,6 +19,7 @@ Read-only diagnostics:
 ```text
 rdo cleanup audit --attempt-dir <path>
 rdo task preview-prompt --task-dir <path>
+rdo tmux list [--repo-root <path>] [--run <run-id>] [--active]
 ```
 
 Cleanup audit is eligible only after the attempt and its outer supervisor have
@@ -36,6 +38,22 @@ deterministic pre-preflight dispatch rules. Its JSON result is explicitly
 marked `selection_stage=preflight_candidate` and `byte_exact=false`: backend
 preflight may still turn a resume candidate into a full-context start. Use
 `--body-only` when only the rendered prompt is needed.
+
+`rdo tmux list` joins live tmux identities to attempt artifacts in one
+repository. It does not infer task truth from tmux and does not mutate protocol
+files. `--run` narrows the displayed run without weakening global ambiguity
+checks; `--active` shows active mappings, including ambiguous mappings that
+contain an active attempt. Sessions not attributable to this repository are
+reported separately and are never cleanup candidates.
+
+`rdo tmux prune --terminal` is an explicit coordinator cleanup action. It
+selects only successful completed attempts with a valid handoff, verified
+process cleanup, a preserved transcript, no retained active/blocked lock, and
+an exact attempt-local tmux identity receipt. Immediately before closing the
+session it rechecks tmux session ID, name, and creation time and targets the
+stable session ID rather than its reusable name. Active, blocked, invalid,
+ambiguous, legacy-unbound, and untracked sessions are retained. The command
+does not edit `STATUS.json`, `ATTEMPT.json`, evidence, or events.
 
 Worker-only commands:
 

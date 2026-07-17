@@ -33,3 +33,4 @@ attempt_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["c
 attempt_dir="${repo_persistent}/.agent-collab/runs/smoke-persistent/tasks/T002-tmux-persistent/attempts/${attempt_id}"
 assert_json_expr "${attempt_dir}/runtime/HANDOFF_READY.json" "payload['attempt_id'] == '${attempt_id}' and payload['requested_state'] == 'review'"
 assert_json_expr "${attempt_dir}/supervisor-result.json" "payload['completion_requested'] is True"
+assert_json_expr "${attempt_dir}/runtime/TMUX_SESSION.json" "payload['run_id'] == 'smoke-persistent' and payload['task_id'] == 'T002-tmux-persistent' and payload['attempt_id'] == '${attempt_id}' and payload['session_id'].startswith(chr(36))"

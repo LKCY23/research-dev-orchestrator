@@ -29,6 +29,29 @@ separate actions. Recognized legacy-v0.5/v1 attempts use their historical
 With `RDO_TMUX_KEEP_SESSION=1`, the runner leaves a login shell in the pane after
 the worker process has been quiesced, so an attached observer can still inspect
 the attempt. Otherwise dispatch cleans up the tmux session after validation.
+When a session is created, dispatch best-effort records its tmux ID, name, and
+creation time in attempt-local `runtime/TMUX_SESSION.json`. This receipt binds
+later lifecycle cleanup to the created session instead of trusting a reusable
+session name.
+
+## Lifecycle Inventory And Prune
+
+```bash
+python scripts/rdo.py tmux list --repo-root <repo> [--run <run-id>] [--active]
+python scripts/rdo.py tmux prune --repo-root <repo> [--run <run-id>] --terminal
+```
+
+The list command is read-only. Terminal prune closes only a retained tmux shell
+whose attempt completed successfully, published a valid handoff, preserved its
+transcript, and has verified descendant cleanup. It revalidates the exact tmux
+ID and creation time before killing by ID. Sessions associated with active or
+blocked work, invalid handoffs, retained dispatch locks, missing cleanup or
+transcript evidence, ambiguous artifact mappings, or missing/mismatched
+identity receipts are left untouched. Historical sessions created before the
+identity receipt was introduced remain visible but require manual handling.
+
+Prune changes only tmux runtime state. It never edits task/attempt protocol
+state, deletes transcripts, or treats a missing pane as completion evidence.
 
 ## Attach And Detach
 

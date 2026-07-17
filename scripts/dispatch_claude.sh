@@ -133,6 +133,12 @@ PY
 )"
   tmux new-session -d -s "${TMUX_SESSION}" "${TMUX_COMMAND}"
   TMUX_WORKER_LAUNCHED=1
+  python3 "${SCRIPT_DIR}/tmux_lifecycle.py" record \
+    --output "${ATTEMPT_DIR}/runtime/TMUX_SESSION.json" \
+    --run-id "${RUN_ID}" \
+    --task-id "${TASK_ID}" \
+    --attempt-id "${ATTEMPT_ID}" \
+    --session-name "${TMUX_SESSION}" >/dev/null 2>&1 || true
   if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
     tmux pipe-pane -o -t "${TMUX_SESSION}" "cat >> '${TRANSCRIPT_PATH}'" || true
   fi

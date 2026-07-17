@@ -81,6 +81,12 @@ from task_contract import (
     validate_task_inputs_payload,
 )
 from task_budget import TaskBudgetError, assess_task_budget
+from tmux_lifecycle import (
+    TmuxLifecycleError,
+    build_tmux_inventory,
+    kill_live_tmux_session,
+    list_live_tmux_sessions,
+)
 from worktree_fingerprint import fingerprint
 
 
@@ -3661,6 +3667,76 @@ def cleanup_audit(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _tmux_inventory(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        return build_tmux_inventory(
+            Path(args.repo_root),
+            list_live_tmux_sessions(),
+            run_id=args.run,
+            active_only=getattr(args, "active", False),
+        )
+    except TmuxLifecycleError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def tmux_list(args: argparse.Namespace) -> int:
+    """List live tmux sessions attributable to this repository's attempts."""
+
+    print(json.dumps(_tmux_inventory(args), indent=2))
+    return 0
+
+
+def tmux_prune(args: argparse.Namespace) -> int:
+    """Close only clean terminal tmux sessions after identity revalidation."""
+
+    if getattr(args, "terminal", False) is not True:
+        raise SystemExit("tmux prune requires explicit --terminal")
+    inventory = _tmux_inventory(args)
+    selected = [row for row in inventory["sessions"] if row.get("prunable") is True]
+    results: list[dict[str, Any]] = []
+    for row in selected:
+        try:
+            outcome = kill_live_tmux_session(row)
+        except TmuxLifecycleError as exc:
+            outcome = {"status": "failed", "reason": str(exc)}
+        results.append(
+            {
+                "run_id": row["run_id"],
+                "task_id": row["task_id"],
+                "attempt_id": row["attempt_id"],
+                "session_name": row["session_name"],
+                "session_id": row["session_id"],
+                **outcome,
+            }
+        )
+    failures = [
+        item for item in results if item["status"] in {"failed", "identity_changed"}
+    ]
+    payload = {
+        "schema_version": 1,
+        "action": "prune_terminal",
+        "repo_root": inventory["repo_root"],
+        "run_filter": inventory["run_filter"],
+        "selected": len(selected),
+        "results": results,
+        "summary": {
+            "killed": sum(item["status"] == "killed" for item in results),
+            "already_absent": sum(
+                item["status"] == "already_absent" for item in results
+            ),
+            "failed": len(failures),
+            "retained_active": inventory["summary"]["active"],
+            "retained_attention_required": inventory["summary"][
+                "attention_required"
+            ],
+            "retained_ambiguous": inventory["summary"]["ambiguous"],
+            "retained_untracked": inventory["summary"]["untracked_live"],
+        },
+    }
+    print(json.dumps(payload, indent=2))
+    return 1 if failures else 0
+
+
 def control(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
     status = load_json(path / "STATUS.json")
@@ -3735,6 +3811,9 @@ def build_parser() -> argparse.ArgumentParser:
     command = areas.add_parser("status"); command.add_argument("--task-dir", required=True); command.set_defaults(func=status_action)
     cleanup = areas.add_parser("cleanup").add_subparsers(dest="cleanup_action", required=True)
     command = cleanup.add_parser("audit"); command.add_argument("--attempt-dir", required=True); command.set_defaults(func=cleanup_audit)
+    tmux = areas.add_parser("tmux").add_subparsers(dest="tmux_action", required=True)
+    command = tmux.add_parser("list"); command.add_argument("--repo-root", default="."); command.add_argument("--run", default=""); command.add_argument("--active", action="store_true"); command.set_defaults(func=tmux_list)
+    command = tmux.add_parser("prune"); command.add_argument("--repo-root", default="."); command.add_argument("--run", default=""); command.add_argument("--terminal", action="store_true", required=True); command.set_defaults(func=tmux_prune, active=False)
     workers = areas.add_parser("worker").add_subparsers(dest="worker_action", required=True)
     command = workers.add_parser("message"); command.add_argument("--task-dir", required=True); command.add_argument("--text", required=True); command.set_defaults(func=control)
     for name in ("interrupt", "terminate"):

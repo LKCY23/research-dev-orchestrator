@@ -180,6 +180,8 @@ $research-dev-orchestrator status run=<run-id> [json] [summary] [dashboard] [dia
 $research-dev-orchestrator review run=<run-id> task=<task-id>
 $research-dev-orchestrator revise run=<run-id> task=<task-id> findings=<task-local-file>
 $research-dev-orchestrator resume run=<run-id> task=<task-id>
+$research-dev-orchestrator tmux-list [run=<run-id>] [active]
+$research-dev-orchestrator tmux-prune [run=<run-id>] terminal
 $research-dev-orchestrator merge run=<run-id> task=<task-id> target-worktree=<path> [commit=<sha>]
 $research-dev-orchestrator recover-lock run=<run-id> task=<task-id>
 $research-dev-orchestrator close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
@@ -230,6 +232,13 @@ not create a separate merge transaction artifact or call an internal FSM helper
 from ad hoc agent code.
 
 `dispatch_assets.py` renders attempt-local worker assets such as `prompt.md` and tmux `run-worker.sh`. It must not mutate protocol state; dispatch remains responsible for locks, worktrees, process supervision, and handoff validation.
+
+`rdo.py tmux list` is a read-only live-session inventory. The
+`rdo.py tmux prune --terminal` command closes only artifact-bound, successfully
+completed sessions with a
+preserved transcript, verified process cleanup, and an exact dispatch-time tmux
+identity receipt. It never prunes active, blocked, invalid, ambiguous,
+legacy-unbound, or untracked sessions and never changes task protocol state.
 
 `dispatch_agent.sh` is the generic worker dispatch entrypoint. Direct and Delegated tasks map `pending|blocked|changes_requested -> running`. Full tasks map `pending -> planning`, `strategy_review -> running` after exact-digest approval, and ordinary `blocked|changes_requested -> running` while the strategy remains valid. Each dispatch creates a new bounded attempt but normally resumes the same logical worker and native backend session. Valid Direct execution produces `verified`; Delegated execution produces `review`; Full planning/execution produces `strategy_review`, `review`, or `blocked`. Invalid handoff becomes `blocked` with `blocker_type = needs_coordinator`.
 
