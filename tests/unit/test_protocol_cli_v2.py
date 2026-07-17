@@ -28,6 +28,10 @@ from artifact_bundle import (  # noqa: E402
 from protocol_cli import cmd_validate_handoff  # noqa: E402
 from strategy import canonical_digest, review_strategy, submit_strategy  # noqa: E402
 from supervisor import load_or_create_attempt_deadline  # noqa: E402
+from task_contract import (  # noqa: E402
+    build_task_inputs_payload,
+    write_task_inputs_immutable,
+)
 from worktree_fingerprint import fingerprint  # noqa: E402
 
 
@@ -927,7 +931,7 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
         dependency.mkdir()
         self.write_json(
             dependency / "STATUS.json",
-            {"task_id": "T000", "artifact_protocol_version": 2, "state": "merged"},
+            {"task_id": "T000", "artifact_protocol_version": 1, "state": "merged"},
         )
         self.append_event(
             {
@@ -955,6 +959,106 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
             payload["resolved_dependencies"],
             [{"task_id": "T000", "required_state": "merged", "commit": self.base}],
         )
+
+    def test_freeze_publishes_bound_context_for_a_v2_dependency(self) -> None:
+        dependency = self.run_dir / "tasks" / "T000"
+        dependency_attempt = dependency / "attempts" / "A001"
+        dependency_attempt.mkdir(parents=True)
+        (dependency / "TASK.md").write_text(task_text(), encoding="utf-8")
+        (dependency / "CONTEXT.md").write_text(CONTEXT, encoding="utf-8")
+        (dependency / "ACCEPTANCE.md").write_text(ACCEPTANCE, encoding="utf-8")
+        self.write_json(dependency / "EXECUTION_POLICY.json", POLICY)
+        source_bytes = {
+            name: (dependency / name).read_bytes()
+            for name in ("TASK.md", "CONTEXT.md", "ACCEPTANCE.md", "EXECUTION_POLICY.json")
+        }
+        dependency_inputs = build_task_inputs_payload(
+            task_id="T000",
+            attempt_id="A001",
+            source_bytes=source_bytes,
+            task_base_commit=self.base,
+            resolved_dependencies=[],
+        )
+        dependency_inputs_sha = write_task_inputs_immutable(
+            dependency_attempt / "TASK_INPUTS.json",
+            dependency_inputs,
+        )
+        self.write_json(
+            dependency_attempt / "ATTEMPT.json",
+            {
+                "schema_version": 2,
+                "artifact_protocol_version": 2,
+                "task_id": "T000",
+                "attempt_id": "A001",
+                "task_inputs_ref": "TASK_INPUTS.json",
+                "task_inputs_sha256": dependency_inputs_sha,
+                "state": "completed",
+                "handoff_valid": True,
+                "handoff_state": "review",
+            },
+        )
+        bundle = publish_bundle(
+            dependency_attempt,
+            requested_state="review",
+            summary="Dependency implementation is complete.",
+            known_limitations=[],
+            direct_self_review={
+                "performed": False,
+                "passed": False,
+                "summary": "",
+                "findings": [],
+            },
+            source_commit=self.base,
+            changed_paths=["file.txt"],
+        )
+        self.write_json(
+            dependency / "STATUS.json",
+            {
+                "task_id": "T000",
+                "artifact_protocol_version": 2,
+                "profile": "delegated",
+                "state": "merged",
+                "current_attempt_id": "A001",
+            },
+        )
+        self.append_event(
+            {
+                "event": "task_merged",
+                "task_id": "T000",
+                "commit": self.base,
+                "attempt_id": "A001",
+                "artifact_binding": artifact_binding(bundle),
+                "verification": {"passed": True},
+            }
+        )
+        dependencies = json.dumps(
+            {
+                "schema_version": 2,
+                "dependencies": [{"task_id": "T000", "required_state": "merged"}],
+            },
+            indent=2,
+        )
+        (self.task_dir / "TASK.md").write_text(
+            task_text().replace(
+                '{\n  "schema_version": 2,\n  "dependencies": []\n}',
+                dependencies,
+            ),
+            encoding="utf-8",
+        )
+
+        frozen = json.loads(self.freeze("A001").stdout)
+        self.assertIsNotNone(frozen["dependency_context"])
+        manifest_sha = frozen["dependency_context"]["sha256"]
+        Path(frozen["path"]).unlink()
+        frozen = json.loads(self.freeze("A001").stdout)
+        self.assertEqual(manifest_sha, frozen["dependency_context"]["sha256"])
+        task_inputs = json.loads(Path(frozen["path"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            "runtime/DEPENDENCY_CONTEXT.json",
+            task_inputs["dependency_context"]["ref"],
+        )
+        attempt = self.create_attempt("A001", frozen["sha256"])
+        self.assertTrue((attempt / "runtime" / "DEPENDENCY_CONTEXT.json").is_file())
 
     def test_dependency_with_failed_v2_merge_verification_is_not_ready(self) -> None:
         dependency = self.run_dir / "tasks" / "T000"

@@ -123,6 +123,22 @@ Context Broker uses `rg` for bounded search and a deterministic Markdown heading
 parser for section retrieval. Results include source digests and request
 metadata. It does not call an LLM or a document-extraction agent.
 
+Merged v2 task dependencies are exposed only as manifest-authorized virtual
+sources such as `dependency:T001`. The full worker prompt embeds a bounded
+summary projection; `index` lists available fields without values, while
+`get` and explicit-source `search` revalidate the merge event, artifact bundle,
+task-input digests, and manifest binding before returning one bounded result.
+Raw predecessor task directories, diffs, transcripts, and logs are not virtual
+sources. `--question` is retained for audit and does not drive semantic
+selection. Compact same-session resume prompts do not repeat the immutable
+predecessor manifest.
+
+For a full prompt, `task preview-prompt` reuses the current attempt's bound
+projection when one exists. Otherwise its JSON reports
+`dependency_projection=not_bound_for_preview`; the real projection is created
+during dispatch input freeze. Compact previews report
+`dependency_projection=not_used_compact_resume`.
+
 Supported native read/search adapters also append normalized, content-free
 request facts to attempt-local `CONTEXT_ACCESS.ndjson`. Each record identifies
 the backend, operation, path or search scope, requested bounds, allow/deny

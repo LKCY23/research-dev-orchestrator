@@ -92,6 +92,7 @@ class PreviewPromptTests(unittest.TestCase):
             self.assertFalse(payload["byte_exact"])
             self.assertEqual("resume", payload["execution_mode_candidate"])
             self.assertEqual("compact_resume", payload["prompt_mode"])
+            self.assertEqual("not_used_compact_resume", payload["dependency_projection"])
             self.assertIn("# Worker Resume Prompt", payload["prompt"])
             self.assertIn("Worktree is not materialized yet", payload["prompt"])
             self.assertNotIn("\n## TASK.md\n", payload["prompt"])

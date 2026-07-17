@@ -22,7 +22,11 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
-from task_contract import TaskContractError, validate_task_inputs_payload
+from task_contract import (
+    DEPENDENCY_CONTEXT_REF,
+    TaskContractError,
+    validate_task_inputs_payload,
+)
 
 
 ARTIFACT_PROTOCOL_VERSION = 2
@@ -341,6 +345,17 @@ def validate_task_inputs_binding(
         raise IntegrityError("TASK_INPUTS.json task_id does not match ATTEMPT.json")
     if task_inputs.get("attempt_id") != attempt_id:
         raise IntegrityError("TASK_INPUTS.json attempt_id does not match ATTEMPT.json")
+    dependency_context = task_inputs.get("dependency_context")
+    if dependency_context is not None:
+        dependency_ref = dependency_context.get("ref")
+        dependency_digest = dependency_context.get("sha256")
+        if dependency_ref != DEPENDENCY_CONTEXT_REF:
+            raise IntegrityError("TASK_INPUTS.json dependency context ref is invalid")
+        dependency_path = safe_ref(attempt_dir, dependency_ref)
+        if file_sha256(dependency_path) != dependency_digest:
+            raise IntegrityError(
+                "TASK_INPUTS.json dependency context digest does not match its file"
+            )
 
     identity = _attempt_identity_payload(
         task_id=task_id,

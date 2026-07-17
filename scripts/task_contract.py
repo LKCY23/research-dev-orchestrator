@@ -24,6 +24,7 @@ from task_budget import TaskBudgetError, normalize_task_budget
 
 ARTIFACT_PROTOCOL_VERSION = 2
 TASK_INPUTS_SCHEMA_VERSION = 2
+DEPENDENCY_CONTEXT_REF = "runtime/DEPENDENCY_CONTEXT.json"
 
 TASK_REQUIRED_SECTIONS = (
     "Objective",
@@ -810,6 +811,7 @@ def build_task_inputs_payload(
     source_bytes: Mapping[str, bytes],
     task_base_commit: str,
     resolved_dependencies: Sequence[Mapping[str, str]],
+    dependency_context_binding: Mapping[str, str] | None = None,
     generated_at: str | None = None,
 ) -> dict[str, Any]:
     """Derive the immutable, attempt-local ``TASK_INPUTS.json`` payload."""
@@ -885,6 +887,21 @@ def build_task_inputs_payload(
         "resolved_dependencies": dependency_commits,
         "contract_sha256": payload_sha256(contract_basis),
     }
+    if dependency_context_binding is not None:
+        if not dependency_commits:
+            raise TaskContractError(
+                "dependency_context requires at least one resolved dependency"
+            )
+        binding = dict(dependency_context_binding)
+        if set(binding) != {"ref", "sha256"}:
+            raise TaskContractError("dependency_context binding fields are invalid")
+        if binding.get("ref") != DEPENDENCY_CONTEXT_REF:
+            raise TaskContractError("dependency_context ref is invalid")
+        if not isinstance(binding.get("sha256"), str) or re.fullmatch(
+            r"[0-9a-f]{64}", binding["sha256"]
+        ) is None:
+            raise TaskContractError("dependency_context sha256 is invalid")
+        payload["dependency_context"] = binding
     if generated_at is not None:
         if not isinstance(generated_at, str) or not generated_at.strip():
             raise TaskContractError("generated_at must be a non-empty string when provided")
@@ -898,6 +915,7 @@ def build_task_inputs_from_readiness(
     task_id: str,
     attempt_id: str,
     task_base_commit: str,
+    dependency_context_binding: Mapping[str, str] | None = None,
     generated_at: str | None = None,
 ) -> dict[str, Any]:
     """Derive ``TASK_INPUTS.json`` only from a successful readiness result."""
@@ -909,6 +927,7 @@ def build_task_inputs_from_readiness(
         source_bytes=readiness.source_bytes,
         task_base_commit=task_base_commit,
         resolved_dependencies=readiness.resolved_dependencies,
+        dependency_context_binding=dependency_context_binding,
         generated_at=generated_at,
     )
 
@@ -987,6 +1006,23 @@ def validate_task_inputs_payload(payload: Any) -> dict[str, Any]:
     expected_digest = payload_sha256(contract_basis)
     if payload.get("contract_sha256") != expected_digest:
         raise TaskContractError("TASK_INPUTS contract_sha256 does not match its bindings")
+    dependency_context = payload.get("dependency_context")
+    if dependency_context is not None:
+        if not dependencies:
+            raise TaskContractError(
+                "TASK_INPUTS dependency_context requires a resolved dependency"
+            )
+        if not isinstance(dependency_context, dict) or set(dependency_context) != {
+            "ref",
+            "sha256",
+        }:
+            raise TaskContractError("TASK_INPUTS dependency_context binding is invalid")
+        if dependency_context.get("ref") != DEPENDENCY_CONTEXT_REF:
+            raise TaskContractError("TASK_INPUTS dependency_context ref is invalid")
+        if not isinstance(dependency_context.get("sha256"), str) or re.fullmatch(
+            r"[0-9a-f]{64}", dependency_context["sha256"]
+        ) is None:
+            raise TaskContractError("TASK_INPUTS dependency_context sha256 is invalid")
     return payload
 
 
@@ -996,13 +1032,20 @@ def compare_task_inputs(previous: Any, current: Any) -> dict[str, Any]:
     previous = validate_task_inputs_payload(previous)
     current = validate_task_inputs_payload(current)
     input_names = ("task", "context", "acceptance", "execution_policy")
+    dependency_context_changed = (
+        previous.get("dependency_context") is not None
+        and previous.get("dependency_context") != current.get("dependency_context")
+    )
     changed_inputs = [
         name
         for name in input_names
         if previous["inputs"][name]["sha256"] != current["inputs"][name]["sha256"]
     ]
     comparison = {
-        "matches": previous["contract_sha256"] == current["contract_sha256"],
+        "matches": (
+            previous["contract_sha256"] == current["contract_sha256"]
+            and not dependency_context_changed
+        ),
         "previous_contract_sha256": previous["contract_sha256"],
         "current_contract_sha256": current["contract_sha256"],
         "changed_inputs": changed_inputs,
@@ -1013,6 +1056,7 @@ def compare_task_inputs(previous: Any, current: Any) -> dict[str, Any]:
         "resolved_dependencies_changed": (
             previous["resolved_dependencies"] != current["resolved_dependencies"]
         ),
+        "dependency_context_changed": dependency_context_changed,
     }
     return comparison
 
@@ -1032,6 +1076,8 @@ def assert_resume_inputs_unchanged(previous: Any, current: Any) -> None:
         reasons.append("task base commit changed")
     if comparison["resolved_dependencies_changed"]:
         reasons.append("dependency commits changed")
+    if comparison["dependency_context_changed"]:
+        reasons.append("dependency context binding changed")
     raise TaskContractError(
         "task input contract drift blocks ordinary resume; create a revision task"
         + (" (" + "; ".join(reasons) + ")" if reasons else "")

@@ -39,6 +39,10 @@ from check_broker import broker_directory_for_attempt, run_brokered
 from completion import write_completion
 from config import load_config
 from dispatch_assets import render_worker_prompt
+from dependency_context import (
+    DependencyContextError,
+    load_bound_dependency_context,
+)
 from protocol import (
     ARTIFACT_PROTOCOL_VERSION,
     EventJournalError,
@@ -1117,6 +1121,23 @@ def task_preview_prompt(args: argparse.Namespace) -> int:
         )
     prompt_mode = "compact_resume" if execution_mode == "resume" else "full"
     preview_attempt = path / "attempts" / "A-PREVIEW"
+    dependency_context_payload = None
+    current_attempt_id = status.get("current_attempt_id")
+    if (
+        prompt_mode == "full"
+        and isinstance(current_attempt_id, str)
+        and current_attempt_id
+    ):
+        if Path(current_attempt_id).name != current_attempt_id:
+            raise SystemExit("task current_attempt_id is unsafe")
+        try:
+            dependency_context_payload = load_bound_dependency_context(
+                path / "attempts" / current_attempt_id
+            )
+        except DependencyContextError as exc:
+            raise SystemExit(
+                f"cannot preview prompt with invalid dependency context: {exc}"
+            ) from exc
     prompt = render_worker_prompt(
         worktree_path=str(worktree),
         task_dir=path,
@@ -1132,6 +1153,7 @@ def task_preview_prompt(args: argparse.Namespace) -> int:
         strategy_path=strategy_path,
         prompt_mode=prompt_mode,
         prompt_mode_reason=reason,
+        dependency_context_payload=dependency_context_payload,
     )
     if args.body_only:
         print(prompt)
@@ -1147,6 +1169,15 @@ def task_preview_prompt(args: argparse.Namespace) -> int:
                     "reason": reason,
                     "worker_backend": worker_backend,
                     "phase": phase,
+                    "dependency_projection": (
+                        "not_used_compact_resume"
+                        if prompt_mode == "compact_resume"
+                        else (
+                            "bound_current_attempt"
+                            if dependency_context_payload is not None
+                            else "not_bound_for_preview"
+                        )
+                    ),
                     "preview_attempt_dir": str(preview_attempt),
                     "prompt_sha256": hashlib.sha256(encoded).hexdigest(),
                     "prompt_bytes": len(encoded),

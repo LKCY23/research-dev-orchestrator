@@ -130,12 +130,21 @@ The stable shape is:
       "commit": "89abcdef0123456789abcdef0123456789abcdef"
     }
   ],
+  "dependency_context": {
+    "ref": "runtime/DEPENDENCY_CONTEXT.json",
+    "sha256": "<sha256>"
+  },
   "contract_sha256": "<sha256>"
 }
 ```
 
 The contract digest excludes attempt identity and is computed from canonical
 input digests, task base commit, and sorted resolved dependency bindings.
+When at least one merged dependency has a validated v2 merge bundle, the
+optional `dependency_context` descriptor binds a derived, non-normative short
+manifest. The descriptor is deliberately excluded from `contract_sha256`:
+dependency commits are contractual, while their bounded context projection is
+an implementation detail that older attempts may not contain.
 The four `inputs.*.ref` values are task-root logical paths; only
 `ATTEMPT.task_inputs_ref` is relative to the attempt directory.
 
@@ -156,6 +165,7 @@ attempts/<attempt-id>/
 ├── HANDOFF.json
 ├── EVIDENCE.json
 └── runtime/
+    ├── DEPENDENCY_CONTEXT.json
     ├── HANDOFF_READY.json
     ├── ARTIFACT_LOCK
     ├── COMMANDS.ndjson
@@ -169,6 +179,7 @@ attempts/<attempt-id>/
 | --- | --- | --- |
 | `ATTEMPT.json` | Canonical attempt identity/runtime metadata; input binding is only a `TASK_INPUTS.json` ref and digest | Dispatcher creates it; protocol code advances attempt metadata |
 | `TASK_INPUTS.json` | Derived immutable snapshot of canonical task inputs and resolved commits | Dispatcher publishes it before launch |
+| `runtime/DEPENDENCY_CONTEXT.json` | Optional short catalog binding merged predecessor bundles and Broker-visible fields; contains no full predecessor document, diff, or log | Dispatcher derives it from verified `task_merged` artifact bindings before prompt rendering; `TASK_INPUTS.json` binds its exact digest |
 | `runtime/COMMANDS.ndjson` | Append-only raw supervised-command facts, including before/after semantic source digests | `rdo check` appends records before or during finalization |
 | `runtime/check-broker/` | Ephemeral request, one-use supervision lease, and cleanup receipt transport; not evidence | Machine attempt supervisor creates one instance per launch and serves it only for that worker lifetime |
 | `runtime/ARTIFACT_LOCK` | Internal process lock; not evidence | Shared by supervised command writers and held exclusively by finalization so no command can append after publication |

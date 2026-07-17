@@ -14,7 +14,14 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
+from typing import Any, Mapping
 
+from dependency_context import (
+    DEPENDENCY_CONTEXT_REF,
+    load_frozen_dependency_context,
+    render_dependency_prompt_manifest,
+    validate_dependency_context,
+)
 from task_contract import TaskContractError, parse_acceptance_markdown
 
 
@@ -299,6 +306,7 @@ def render_worker_prompt(
     strategy_path: str = "",
     prompt_mode: str = "full",
     prompt_mode_reason: str = "new_or_replacement_session",
+    dependency_context_payload: Mapping[str, Any] | None = None,
 ) -> str:
     if prompt_mode not in {"full", "compact_resume"}:
         raise ValueError("prompt_mode must be full or compact_resume")
@@ -309,6 +317,20 @@ def render_worker_prompt(
     context_broker = Path(__file__).resolve().parent / "context_broker.py"
     prompt_strategy = load_prompt_strategy(strategy_path)
     strategy_block = ""
+    dependency_block = ""
+    dependency_path = attempt_dir / DEPENDENCY_CONTEXT_REF
+    if prompt_mode == "full" and dependency_context_payload is not None:
+        dependency_payload = validate_dependency_context(
+            dict(dependency_context_payload)
+        )
+        dependency_block = render_dependency_prompt_manifest(dependency_payload)
+    elif prompt_mode == "full" and dependency_path.exists():
+        dependency_payload = load_frozen_dependency_context(attempt_dir)
+        if dependency_payload is None:
+            raise ValueError(
+                "dependency context exists without a frozen TASK_INPUTS binding"
+            )
+        dependency_block = render_dependency_prompt_manifest(dependency_payload)
     coordinator_feedback = ""
     strategy_feedback = ""
     review_pointer = task_dir / "reviews" / "CURRENT_TASK_REVIEW.json"
@@ -552,6 +574,14 @@ def render_worker_prompt(
             f"- List indexed headings: python3 {context_broker} --policy {read_policy_path} index [--source <path>]",
             f"- Search indexed sources: python3 {context_broker} --policy {read_policy_path} search --query <pattern> [--source <path>]",
             f"- Retrieve one section: python3 {context_broker} --policy {read_policy_path} get --source <path> --section <heading> --question <specific-question>",
+            *(
+                [
+                    "- Merged predecessor details use virtual sources such as dependency:T001; index the alias first, then retrieve one exact field.",
+                    f"- Dependency example: python3 {context_broker} --policy {read_policy_path} get --source dependency:T001 --section required_interfaces --question <specific-question>",
+                ]
+                if dependency_block
+                else []
+            ),
             "- Context Broker retrieval is deterministic and bounded. Do not launch a model or subagent merely to extract a document section.",
             "",
             *phase_rules,
@@ -560,6 +590,8 @@ def render_worker_prompt(
             "",
             strategy_feedback,
             coordinator_feedback,
+            dependency_block,
+            "",
             "## TASK.md",
             read_text(task_dir / "TASK.md"),
             "",

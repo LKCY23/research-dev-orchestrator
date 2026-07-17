@@ -13,6 +13,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from dependency_context import (
+    DEPENDENCY_ALIAS_PREFIX,
+    DependencyContextError,
+    dependency_entry,
+    dependency_section,
+    dependency_section_values,
+    dependency_source_payload,
+    load_bound_dependency_context,
+    render_dependency_value,
+)
 from protocol import load_json, utc_now
 from read_policy import resolve_source
 
@@ -26,7 +36,7 @@ def digest(path: Path) -> str:
 
 def bounded_text(data: bytes, maximum: int) -> tuple[str, bool]:
     clipped = len(data) > maximum
-    return data[:maximum].decode("utf-8", errors="replace"), clipped
+    return data[:maximum].decode("utf-8", errors="ignore"), clipped
 
 
 def headings(path: Path) -> list[dict[str, Any]]:
@@ -86,9 +96,46 @@ def source_payload(policy: dict[str, Any], source: Path) -> dict[str, Any]:
     }
 
 
-def command_index(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str, Any]:
+def _dependency_manifest(policy_path: Path) -> dict[str, Any] | None:
+    attempt_dir = policy_path.parent.parent
+    if not (attempt_dir / "ATTEMPT.json").is_file():
+        return None
+    return load_bound_dependency_context(attempt_dir)
+
+
+def _is_dependency_source(value: str) -> bool:
+    return value.startswith(DEPENDENCY_ALIAS_PREFIX)
+
+
+def command_index(
+    args: argparse.Namespace,
+    policy: dict[str, Any],
+    policy_path: Path,
+) -> dict[str, Any]:
+    manifest = _dependency_manifest(policy_path)
+    if args.source and _is_dependency_source(args.source):
+        if manifest is None:
+            raise ValueError("this attempt has no dependency context sources")
+        entry = dependency_entry(manifest, args.source)
+        sections = entry["available_sections"]
+        start = args.offset
+        selected = sections[start:start + args.limit]
+        return {
+            "sources": [{
+                **dependency_source_payload(entry),
+                "source_kind": "dependency",
+                "sections": selected,
+                "section_offset": start,
+                "section_limit": args.limit,
+                "section_count": len(sections),
+                "truncated": start + len(selected) < len(sections),
+            }]
+        }
     sources = [args.source] if args.source else policy.get("context_sources", [])
-    if not sources:
+    dependency_entries = (
+        manifest.get("dependencies", []) if manifest is not None and not args.source else []
+    )
+    if not sources and not dependency_entries:
         raise ValueError("context_sources is empty; pass --source or declare it in EXECUTION_POLICY.json")
     if args.source:
         source = resolve_source(policy, args.source)
@@ -105,20 +152,78 @@ def command_index(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str,
                 "truncated": start + len(selected) < len(entries),
             }]
         }
-    indexed = []
+    indexed: list[dict[str, Any]] = []
     maximum_sources = 100
     for raw in sources[:maximum_sources]:
         source = resolve_source(policy, raw)
         indexed.append({**source_payload(policy, source), "heading_count": len(headings(source))})
-    return {"sources": indexed, "truncated": len(sources) > maximum_sources}
+    remaining = maximum_sources - len(indexed)
+    for entry in dependency_entries[:max(0, remaining)]:
+        indexed.append({
+            **dependency_source_payload(entry),
+            "source_kind": "dependency",
+            "section_count": len(entry["available_sections"]),
+        })
+    total = len(sources) + len(dependency_entries)
+    return {"sources": indexed, "truncated": total > maximum_sources}
 
 
-def command_search(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str, Any]:
+def command_search(
+    args: argparse.Namespace,
+    policy: dict[str, Any],
+    policy_path: Path,
+) -> dict[str, Any]:
+    if args.source and _is_dependency_source(args.source):
+        manifest = _dependency_manifest(policy_path)
+        if manifest is None:
+            raise ValueError("this attempt has no dependency context sources")
+        entry = dependency_entry(manifest, args.source)
+        values = dependency_section_values(policy_path.parent.parent, entry)
+        searchable = "\n".join(
+            f"## {section}\n{render_dependency_value(values[section]).rstrip()}"
+            for section in entry["available_sections"]
+        ) + "\n"
+        command = [
+            "rg",
+            "--line-number",
+            "--no-heading",
+            "--color",
+            "never",
+            "--max-count",
+            str(args.max_matches),
+            "--",
+            args.query,
+        ]
+        completed = subprocess.run(
+            command,
+            input=searchable.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if completed.returncode not in {0, 1}:
+            raise RuntimeError(
+                completed.stderr.decode("utf-8", errors="replace").strip()
+                or "rg failed"
+            )
+        maximum = int(policy.get("section_max_bytes", 16 * 1024))
+        content, clipped = bounded_text(completed.stdout, maximum)
+        return {
+            "query": args.query,
+            "sources": [{
+                **dependency_source_payload(entry),
+                "source_kind": "dependency",
+            }],
+            "content": content,
+            "truncated": clipped,
+            "max_bytes": maximum,
+        }
     raw_sources = [args.source] if args.source else policy.get("context_sources", [])
     if not raw_sources:
         raise ValueError("search requires --source when EXECUTION_POLICY.json context_sources is empty")
     sources = [resolve_source(policy, raw) for raw in raw_sources]
-    command = ["rg", "--line-number", "--no-heading", "--color", "never", "--max-count", str(args.max_matches), args.query]
+    command = ["rg", "--line-number", "--no-heading", "--color", "never", "--max-count", str(args.max_matches), "--", args.query]
     command.extend(str(path) for path in sources)
     completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if completed.returncode not in {0, 1}:
@@ -134,7 +239,33 @@ def command_search(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str
     }
 
 
-def command_get(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str, Any]:
+def command_get(
+    args: argparse.Namespace,
+    policy: dict[str, Any],
+    policy_path: Path,
+) -> dict[str, Any]:
+    if _is_dependency_source(args.source):
+        manifest = _dependency_manifest(policy_path)
+        if manifest is None:
+            raise ValueError("this attempt has no dependency context sources")
+        entry = dependency_entry(manifest, args.source)
+        content, field_sha256 = dependency_section(
+            policy_path.parent.parent,
+            entry,
+            args.section,
+        )
+        maximum = int(policy.get("section_max_bytes", 16 * 1024))
+        rendered, clipped = bounded_text(content.encode("utf-8"), maximum)
+        return {
+            **dependency_source_payload(entry),
+            "source_kind": "dependency",
+            "section": args.section,
+            "question": args.question,
+            "field_sha256": field_sha256,
+            "content": rendered,
+            "truncated": clipped,
+            "max_bytes": maximum,
+        }
     source = resolve_source(policy, args.source)
     start, end, content = select_section(source, args.section)
     maximum = int(policy.get("section_max_bytes", 16 * 1024))
@@ -174,7 +305,32 @@ def main() -> int:
     policy_path = Path(args.policy).resolve()
     policy = load_json(policy_path)
     handlers = {"index": command_index, "search": command_search, "get": command_get}
-    result = handlers[args.action](args, policy)
+    try:
+        result = handlers[args.action](args, policy, policy_path)
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
+        try:
+            audit(policy_path, {
+                "schema_version": 1,
+                "action": args.action,
+                "source": getattr(args, "source", ""),
+                "source_kind": (
+                    "dependency"
+                    if _is_dependency_source(getattr(args, "source", ""))
+                    else "path"
+                ),
+                "query": getattr(args, "query", ""),
+                "section": getattr(args, "section", ""),
+                "question": getattr(args, "question", ""),
+                "decision": "deny",
+                "error_code": type(exc).__name__,
+                "result_sources": [],
+                "result_bytes": 0,
+                "result_content_bytes": 0,
+                "result_truncated": False,
+            })
+        except OSError:
+            pass
+        raise
     content = result.get("content")
     rendered = json.dumps(result, indent=2, ensure_ascii=False) + "\n"
     nested_sources = result.get("sources") if isinstance(result.get("sources"), list) else []
@@ -189,6 +345,12 @@ def main() -> int:
         "query": getattr(args, "query", ""),
         "section": getattr(args, "section", ""),
         "question": getattr(args, "question", ""),
+        "source_kind": (
+            "dependency"
+            if _is_dependency_source(getattr(args, "source", ""))
+            else "path"
+        ),
+        "decision": "allow",
         "result_sources": [item.get("source") for item in result.get("sources", [])]
         if isinstance(result.get("sources"), list) else [result.get("source")],
         "result_bytes": len(rendered.encode("utf-8")),
@@ -202,6 +364,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         print(f"context broker error: {exc}", file=sys.stderr)
         raise SystemExit(2)

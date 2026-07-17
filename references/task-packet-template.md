@@ -72,6 +72,14 @@ base commit, resolved dependency commits, and a stable contract digest.
 `ATTEMPT.json` references this file by path and exact digest. A later attempt
 with a different stable contract is rejected and requires a revision task.
 
+For validated merged v2 dependencies, dispatch also derives one optional,
+attempt-local `runtime/DEPENDENCY_CONTEXT.json`. It contains only exact merge
+and artifact bindings plus a short prompt projection and an allowlist of
+Broker fields. `TASK_INPUTS.json` binds its digest. Workers retrieve detailed
+summary, limitation, check, changed-path, objective, or named CONTEXT sections
+through `dependency:<task-id>`; dispatch never copies complete predecessor
+handoffs, evidence, diffs, or logs into the task prompt.
+
 When `task_budget` is enabled, dispatch also derives immutable
 `runtime/TASK_BUDGET.json` while holding the task dispatch lock. It records the
 source attempt digests, consumed and remaining amounts, the effective next

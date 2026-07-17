@@ -26,6 +26,12 @@ from artifact_bundle import (
     validate_required_output_bindings,
     validate_task_inputs_binding,
 )
+from dependency_context import (
+    DependencyContextError,
+    build_dependency_context,
+    dependency_context_file_sha256,
+    write_dependency_context_immutable,
+)
 from protocol import (
     EventJournalError,
     append_event as append_event_line,
@@ -397,18 +403,48 @@ def cmd_freeze_task_inputs(args: argparse.Namespace) -> int:
             task_base_commit,
             readiness.resolved_dependencies,
         )
+        generated_at = utc_now()
         payload = build_task_inputs_from_readiness(
             readiness,
             task_id=args.task_id,
             attempt_id=args.attempt_id,
             task_base_commit=task_base_commit,
-            generated_at=utc_now(),
+            generated_at=generated_at,
         )
+        dependency_context = build_dependency_context(
+            attempt_dir=attempt_dir,
+            task_inputs=payload,
+        )
+        dependency_context_path = None
+        dependency_context_digest = None
+        if dependency_context is not None:
+            dependency_context_digest = dependency_context_file_sha256(
+                dependency_context
+            )
+            payload = build_task_inputs_from_readiness(
+                readiness,
+                task_id=args.task_id,
+                attempt_id=args.attempt_id,
+                task_base_commit=task_base_commit,
+                dependency_context_binding={
+                    "ref": "runtime/DEPENDENCY_CONTEXT.json",
+                    "sha256": dependency_context_digest,
+                },
+                generated_at=generated_at,
+            )
         for previous in prior:
             assert_resume_inputs_unchanged(previous, payload)
+        if dependency_context is not None:
+            dependency_context_path, written_dependency_digest = (
+                write_dependency_context_immutable(attempt_dir, dependency_context)
+            )
+            if written_dependency_digest != dependency_context_digest:
+                raise DependencyContextError(
+                    "dependency context publication digest changed during freeze"
+                )
         path = attempt_dir / "TASK_INPUTS.json"
         digest = write_task_inputs_immutable(path, payload)
-    except (TaskContractError, ImmutableArtifactError) as exc:
+    except (TaskContractError, ImmutableArtifactError, DependencyContextError) as exc:
         raise SystemExit(str(exc)) from exc
     print(
         json.dumps(
@@ -417,6 +453,14 @@ def cmd_freeze_task_inputs(args: argparse.Namespace) -> int:
                 "sha256": digest,
                 "contract_sha256": payload["contract_sha256"],
                 "task_base_commit": task_base_commit,
+                "dependency_context": (
+                    {
+                        "path": str(dependency_context_path),
+                        "sha256": dependency_context_digest,
+                    }
+                    if dependency_context_path is not None
+                    else None
+                ),
             },
             sort_keys=True,
         )
@@ -527,6 +571,21 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
             raise SystemExit(f"cannot bind TASK_INPUTS.json: {exc}") from exc
         if actual_digest != args.task_inputs_sha256:
             raise SystemExit("ATTEMPT task_inputs_sha256 does not match TASK_INPUTS.json")
+        inputs_payload = load_json(inputs_path)
+        dependency_context = inputs_payload.get("dependency_context")
+        if isinstance(dependency_context, dict):
+            try:
+                dependency_path = safe_ref(
+                    Path(args.path).parent,
+                    str(dependency_context.get("ref") or ""),
+                )
+                dependency_digest = file_sha256(dependency_path)
+            except ArtifactBundleError as exc:
+                raise SystemExit(f"cannot bind dependency context: {exc}") from exc
+            if dependency_digest != dependency_context.get("sha256"):
+                raise SystemExit(
+                    "TASK_INPUTS dependency context digest does not match its file"
+                )
         payload.update(
             {
                 "schema_version": 2,

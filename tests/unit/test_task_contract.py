@@ -508,6 +508,7 @@ class TaskInputsTests(unittest.TestCase):
         sources: dict[str, bytes] | None = None,
         base: str = COMMIT_A,
         dependency_commit: str | None = None,
+        dependency_context_sha256: str | None = None,
         generated_at: str = "2026-07-15T00:00:00Z",
     ) -> dict[str, object]:
         dependencies = []
@@ -525,6 +526,14 @@ class TaskInputsTests(unittest.TestCase):
             source_bytes=sources or source_bytes(),
             task_base_commit=base,
             resolved_dependencies=dependencies,
+            dependency_context_binding=(
+                {
+                    "ref": "runtime/DEPENDENCY_CONTEXT.json",
+                    "sha256": dependency_context_sha256,
+                }
+                if dependency_context_sha256
+                else None
+            ),
             generated_at=generated_at,
         )
 
@@ -560,6 +569,28 @@ class TaskInputsTests(unittest.TestCase):
         assert_resume_inputs_unchanged(first, unchanged)
         changed = self._payload(attempt_id="A002", sources=source_bytes(changed_task=True))
         with self.assertRaisesRegex(TaskContractError, "create a revision task"):
+            assert_resume_inputs_unchanged(first, changed)
+
+    def test_dependency_context_upgrade_is_compatible_but_later_drift_blocks_resume(self) -> None:
+        first = self._payload(
+            attempt_id="A002",
+            dependency_commit=COMMIT_A,
+            dependency_context_sha256="1" * 64,
+        )
+        legacy = self._payload(dependency_commit=COMMIT_A)
+        assert_resume_inputs_unchanged(legacy, first)
+        unchanged = self._payload(
+            attempt_id="A003",
+            dependency_commit=COMMIT_A,
+            dependency_context_sha256="1" * 64,
+        )
+        assert_resume_inputs_unchanged(first, unchanged)
+        changed = self._payload(
+            attempt_id="A003",
+            dependency_commit=COMMIT_A,
+            dependency_context_sha256="2" * 64,
+        )
+        with self.assertRaisesRegex(TaskContractError, "dependency context binding changed"):
             assert_resume_inputs_unchanged(first, changed)
 
     def test_builds_only_from_ready_result(self) -> None:
