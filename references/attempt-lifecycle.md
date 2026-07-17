@@ -27,6 +27,12 @@ Task FSM stays about task progress only.
 ATTEMPT.json owns worker execution lifecycle.
 Strategy revisions own reviewed execution intent; runtime workflow events own activity inside an execution attempt.
 
+During Full planning, `runtime/STRATEGY_DRAFT.json` may hold one mutable,
+preflighted candidate. It is a non-canonical transport artifact: no consumer
+may treat it as submitted intent, evidence, or approval. Only the immutable
+task-level `strategy/STRATEGY-vNNN.json` produced by `strategy submit|revise`
+enters the handoff and review chain.
+
 Each non-dry-run attempt also writes `runtime/STARTUP.json`. Machine startup
 progresses through `process_started -> prompt_dispatched -> worker_started`, or
 terminates as `worker_startup_failed`. Tmux human startup records

@@ -7,8 +7,10 @@ from protocol import write_json
 from strategy import (
     DEFAULT_EXECUTION_POLICY,
     StrategyValidationError,
+    build_strategy_scaffold,
     canonical_digest,
     load_approved_strategy,
+    preflight_strategy,
     review_strategy,
     submit_strategy,
 )
@@ -80,6 +82,19 @@ class StrategyTests(unittest.TestCase):
         loaded, review = load_approved_strategy(self.task)
         self.assertEqual(digest, canonical_digest(loaded))
         self.assertEqual(digest, review["strategy_sha256"])
+
+    def test_scaffold_is_the_next_preflighted_revision(self):
+        first = build_strategy_scaffold(self.task, "claude-code")
+        preflight = preflight_strategy(self.task, first)
+        self.assertTrue(preflight["valid"])
+        self.assertEqual("submit", preflight["action"])
+        self.assertEqual(1, preflight["expected_revision"])
+
+        submit_strategy(self.task, first)
+        second = build_strategy_scaffold(self.task, "claude-code")
+        self.assertEqual(2, second["revision"])
+        self.assertEqual(first["strategy_id"], second["supersedes"])
+        self.assertEqual("revise", preflight_strategy(self.task, second)["action"])
 
     def test_revisions_are_sequential_and_immutable(self):
         first = strategy_payload("T001-test")

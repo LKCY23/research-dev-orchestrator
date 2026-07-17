@@ -40,7 +40,10 @@ preflight may still turn a resume candidate into a full-context start. Use
 Worker-only commands:
 
 ```text
-rdo strategy submit|revise
+rdo strategy scaffold --attempt-dir <path>
+rdo strategy preflight --attempt-dir <path> (--file <path|-> | --draft)
+rdo strategy draft --attempt-dir <path> --file <path|->
+rdo strategy submit|revise --task-dir <path> (--file <path|-> | --draft)
 rdo workflow start|heartbeat|complete [--review-evidence REVIEWER_ID=ARTIFACT_PATH]
 rdo exec --attempt-dir <path> --workflow-id <id> --instance-id <id> --timeout <seconds> -- <non-acceptance-command>
 rdo check --attempt-dir <path> --check-id <acceptance-id>
@@ -49,6 +52,16 @@ rdo finalize --attempt-dir <path> --state verified|review|blocked --summary <tex
 ```
 
 Workers may submit artifacts and runtime events, but may not approve strategy, mutate `STATUS.json`, or merge.
+For an active v2 Full planning attempt, `strategy scaffold` emits the next
+policy-bounded revision without writing it. `strategy preflight` is read-only
+and runs the exact immutable strategy-payload gates. `strategy draft` runs the same
+preflight and atomically replaces only
+`runtime/STRATEGY_DRAFT.json`; this mutable candidate is not evidence, an event,
+or a reviewable strategy revision. A successful `submit|revise --draft`
+revalidates those bytes before the existing immutable publication and handoff.
+Using `--file -` reads one JSON object from stdin, eliminating the need for an
+arbitrary `/tmp` draft.
+
 `rdo check` selects exact `argv`, `cwd`, and timeout from the attempt's frozen
 acceptance contract and appends a structured supervised record. In machine
 mode the command remains inside the worker sandbox while the outer attempt

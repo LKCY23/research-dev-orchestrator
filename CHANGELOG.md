@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 - Planning prompts select `strategy submit` or `strategy revise` from the existing immutable revisions instead of always emitting the first-revision command.
 - Optional protocol-v2 cumulative task budgets for attempts, pre-finalization execution time, and observable model cost, with locked pre-attempt admission and derived status diagnostics.
 - Digest-bound predecessor context manifests with bounded prompt summaries and deterministic `dependency:<task-id>` Broker field retrieval.
+- Deterministic Full-strategy scaffold/preflight commands and an attempt-local draft channel, with immutable submission and coordinator approval unchanged.
 
 ## [0.3.0] - 2026-07-08
 

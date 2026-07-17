@@ -129,7 +129,10 @@ class DispatchAssetsTests(unittest.TestCase):
             self.assertIn('"backend_id": "claude-code"', prompt)
             self.assertIn('"allowed_paths": [\n          "."', prompt)
             self.assertIn("do not inspect RDO source code or tests", prompt)
+            self.assertIn("strategy scaffold --attempt-dir", prompt)
+            self.assertIn("strategy draft --attempt-dir", prompt)
             self.assertIn("strategy submit --task-dir", prompt)
+            self.assertIn("--draft", prompt)
 
     def test_revision_prompt_uses_strategy_revise(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -157,6 +160,7 @@ class DispatchAssetsTests(unittest.TestCase):
             )
 
             self.assertIn("strategy revise --task-dir", prompt)
+            self.assertIn("strategy preflight --attempt-dir", prompt)
             self.assertIn('"revision": 2', prompt)
             self.assertIn('"supersedes": "T101-example-S001"', prompt)
 

@@ -145,6 +145,7 @@ No additional background is needed.
         forbidden_paths: list[str] | None = None,
         pre_merge_commands: list[dict[str, object]] | None = None,
         post_merge_commands: list[dict[str, object]] | None = None,
+        phase: str = "execution",
     ) -> SimpleNamespace:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
@@ -182,11 +183,14 @@ No additional background is needed.
 
         self.addCleanup(cleanup)
         before = fingerprint(worktree)
-        (worktree / "change.txt").write_text("task change\n", encoding="utf-8")
-        if create_output:
-            (worktree / "result.txt").write_text("done\n", encoding="utf-8")
-        git(worktree, "add", ".")
-        git(worktree, "commit", "-m", "task result")
+        if phase == "execution":
+            (worktree / "change.txt").write_text("task change\n", encoding="utf-8")
+            if create_output:
+                (worktree / "result.txt").write_text("done\n", encoding="utf-8")
+            git(worktree, "add", ".")
+            git(worktree, "commit", "-m", "task result")
+        elif phase != "planning":
+            raise ValueError("phase must be planning or execution")
         source_commit = git(worktree, "rev-parse", "HEAD")
 
         run = root / ".agent-collab" / "runs" / "run-v2"
@@ -231,7 +235,7 @@ No additional background is needed.
             "artifact_protocol_version": 2,
             "task_id": self.task_id,
             "profile": profile,
-            "state": "running",
+            "state": "planning" if phase == "planning" else "running",
             "previous_state": "pending",
             "owner": "worker",
             "branch": branch,
@@ -273,7 +277,7 @@ No additional background is needed.
                 "task_id": self.task_id,
                 "attempt_id": self.attempt_id,
                 "state": "running",
-                "phase": "execution",
+                "phase": phase,
                 "backend_id": "claude-code",
                 "task_inputs_ref": "TASK_INPUTS.json",
                 "task_inputs_sha256": task_inputs_sha256,
@@ -1034,6 +1038,114 @@ No additional background is needed.
                     note=[],
                 )
             )
+
+    def test_planning_strategy_uses_preflighted_attempt_local_draft(self) -> None:
+        fixture = self.make_fixture(profile="full", phase="planning")
+        scaffold_output = io.StringIO()
+        with contextlib.redirect_stdout(scaffold_output):
+            self.assertEqual(
+                0,
+                rdo.strategy_scaffold(
+                    argparse.Namespace(attempt_dir=str(fixture.attempt))
+                ),
+            )
+        candidate = json.loads(scaffold_output.getvalue())
+        candidate["objective"] = "Implement the frozen task contract."
+        candidate["workflows"][0]["purpose"] = "Implement and verify the task."
+
+        invalid = copy.deepcopy(candidate)
+        invalid["global_budget"]["max_workflows"] += 1
+        invalid_output = io.StringIO()
+        with patch("sys.stdin", io.StringIO(json.dumps(invalid))):
+            with contextlib.redirect_stdout(invalid_output):
+                self.assertEqual(
+                    2,
+                    rdo.strategy_draft(
+                        argparse.Namespace(
+                            attempt_dir=str(fixture.attempt),
+                            file="-",
+                        )
+                    ),
+                )
+        self.assertFalse(json.loads(invalid_output.getvalue())["valid"])
+        self.assertFalse(
+            (fixture.attempt / rdo.STRATEGY_DRAFT_REF).exists()
+        )
+
+        draft_output = io.StringIO()
+        with patch("sys.stdin", io.StringIO(json.dumps(candidate))):
+            with contextlib.redirect_stdout(draft_output):
+                self.assertEqual(
+                    0,
+                    rdo.strategy_draft(
+                        argparse.Namespace(
+                            attempt_dir=str(fixture.attempt),
+                            file="-",
+                        )
+                    ),
+                )
+        draft_result = json.loads(draft_output.getvalue())
+        self.assertTrue(draft_result["valid"])
+        self.assertTrue(draft_result["published"])
+
+        draft_path = fixture.attempt / rdo.STRATEGY_DRAFT_REF
+        draft_before = draft_path.read_bytes()
+        runtime_files_before = sorted(
+            path.relative_to(fixture.attempt)
+            for path in (fixture.attempt / "runtime").rglob("*")
+            if path.is_file()
+        )
+        preflight_output = io.StringIO()
+        with contextlib.redirect_stdout(preflight_output):
+            self.assertEqual(
+                0,
+                rdo.strategy_preflight(
+                    argparse.Namespace(
+                        attempt_dir=str(fixture.attempt),
+                        draft=True,
+                        file=None,
+                    )
+                ),
+            )
+        self.assertEqual(
+            "submit",
+            json.loads(preflight_output.getvalue())["action"],
+        )
+        self.assertEqual(draft_before, draft_path.read_bytes())
+        self.assertEqual(
+            runtime_files_before,
+            sorted(
+                path.relative_to(fixture.attempt)
+                for path in (fixture.attempt / "runtime").rglob("*")
+                if path.is_file()
+            ),
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                0,
+                rdo.strategy_submit(
+                    argparse.Namespace(
+                        task_dir=str(fixture.task),
+                        file=None,
+                        draft=True,
+                        strategy_action="submit",
+                    )
+                ),
+            )
+        self.assertTrue(
+            (fixture.task / "strategy" / "STRATEGY-v001.json").is_file()
+        )
+        self.assertTrue((fixture.attempt / "runtime" / "HANDOFF_READY.json").is_file())
+        bundle = load_bundle(
+            fixture.attempt,
+            expected_requested_state="strategy_review",
+            expected_source_commit=fixture.base_commit,
+        )
+        self.assertNotIn(
+            rdo.STRATEGY_DRAFT_REF,
+            [artifact["ref"] for artifact in bundle.evidence["artifacts"]],
+        )
 
     def test_full_execution_attempt_can_pause_for_strategy_revision(self) -> None:
         from tests.unit.test_strategy import strategy_payload

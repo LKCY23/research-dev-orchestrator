@@ -58,9 +58,11 @@ from protocol import (
 )
 from strategy import (
     StrategyValidationError,
+    build_strategy_scaffold,
     canonical_digest,
     load_approved_strategy,
     load_bound_approved_strategy,
+    preflight_strategy,
     review_strategy,
     submit_strategy,
 )
@@ -725,6 +727,149 @@ def approval_git_binding(path: Path, status: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+STRATEGY_DRAFT_REF = "runtime/STRATEGY_DRAFT.json"
+
+
+def _strategy_planning_context(
+    attempt_dir: str | Path,
+) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
+    attempt, task, status, metadata, _binding = _require_attempt_ownership(
+        attempt_dir,
+        allow_ready=False,
+    )
+    if status.get("profile") != "full":
+        raise SystemExit("strategy authoring requires profile='full'")
+    if status.get("state") != "planning" or metadata.get("phase") != "planning":
+        raise SystemExit("strategy authoring requires the active planning attempt")
+    backend_id = metadata.get("backend_id")
+    if not isinstance(backend_id, str) or not backend_id:
+        raise SystemExit("planning attempt backend_id is missing")
+    return attempt, task, status, metadata
+
+
+def _load_strategy_candidate(value: str, *, label: str) -> dict[str, Any]:
+    try:
+        payload = json.load(sys.stdin) if value == "-" else load_json(Path(value))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise StrategyValidationError(f"cannot read {label}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise StrategyValidationError(f"{label} must contain a JSON object")
+    return payload
+
+
+def _write_strategy_draft(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _strategy_draft_path(attempt: Path) -> Path:
+    path = attempt / STRATEGY_DRAFT_REF
+    if path.is_symlink():
+        raise StrategyValidationError("attempt-local strategy draft must not be a symlink")
+    return path
+
+
+@contextmanager
+def _strategy_draft_lock(attempt: Path, *, exclusive: bool):
+    descriptor = os.open(attempt.parent.parent / "LOCK", os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _preflight_result(task: Path, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    try:
+        return 0, preflight_strategy(task, payload)
+    except StrategyValidationError as exc:
+        return 2, {"valid": False, "errors": [str(exc)]}
+
+
+def strategy_scaffold(args: argparse.Namespace) -> int:
+    _attempt, task, _status, metadata = _strategy_planning_context(args.attempt_dir)
+    scaffold = build_strategy_scaffold(task, str(metadata["backend_id"]))
+    print(json.dumps(scaffold, ensure_ascii=False, indent=2))
+    return 0
+
+
+def strategy_preflight(args: argparse.Namespace) -> int:
+    attempt, task, _status, _metadata = _strategy_planning_context(args.attempt_dir)
+    source = STRATEGY_DRAFT_REF if args.draft else args.file
+    candidate_path = _strategy_draft_path(attempt) if args.draft else None
+    if candidate_path is not None:
+        with _strategy_draft_lock(attempt, exclusive=False):
+            payload = _load_strategy_candidate(
+                str(candidate_path),
+                label="strategy draft",
+            )
+            code, result = _preflight_result(task, payload)
+    else:
+        payload = _load_strategy_candidate(str(args.file), label="strategy candidate")
+        code, result = _preflight_result(task, payload)
+    result["source"] = source
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return code
+
+
+def strategy_draft(args: argparse.Namespace) -> int:
+    attempt, task, _status, _metadata = _strategy_planning_context(args.attempt_dir)
+    payload = _load_strategy_candidate(args.file, label="strategy candidate")
+    draft_path = _strategy_draft_path(attempt)
+    with _strategy_draft_lock(attempt, exclusive=True):
+        code, result = _preflight_result(task, payload)
+        if code != 0:
+            draft_path.unlink(missing_ok=True)
+            result["published"] = False
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return code
+        _write_strategy_draft(draft_path, payload)
+        draft_file_sha256 = file_sha256(draft_path)
+    result.update(
+        published=True,
+        draft_ref=STRATEGY_DRAFT_REF,
+        draft_file_sha256=draft_file_sha256,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _strategy_submission_payload(
+    task: Path,
+    status: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if not getattr(args, "draft", False):
+        return _load_strategy_candidate(args.file, label="strategy candidate")
+    attempt_id = status.get("current_attempt_id")
+    if not isinstance(attempt_id, str) or Path(attempt_id).name != attempt_id:
+        raise SystemExit("strategy draft requires a safe current attempt id")
+    attempt, draft_task, _status, _metadata = _strategy_planning_context(
+        task / "attempts" / attempt_id
+    )
+    if draft_task != task:
+        raise SystemExit("strategy draft belongs to a different task")
+    with _strategy_draft_lock(attempt, exclusive=False):
+        return _load_strategy_candidate(
+            str(_strategy_draft_path(attempt)),
+            label="attempt-local strategy draft",
+        )
+
+
 def strategy_submit(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
     status = load_json(path / "STATUS.json")
@@ -739,7 +884,7 @@ def strategy_submit(args: argparse.Namespace) -> int:
     expected_phase = "planning" if status["state"] == "planning" else "execution"
     if attempt.get("phase") != expected_phase or attempt.get("state") not in {"created", "running"}:
         raise SystemExit("strategy submission requires the current active attempt")
-    payload = load_json(Path(args.file))
+    payload = _strategy_submission_payload(path, status, args)
     if args.strategy_action == "submit" and payload.get("revision") != 1:
         raise SystemExit("strategy submit is only for revision 1; use strategy revise")
     if args.strategy_action == "revise" and (
@@ -3354,7 +3499,16 @@ def build_parser() -> argparse.ArgumentParser:
     areas = parser.add_subparsers(dest="area", required=True)
     strategy = areas.add_parser("strategy").add_subparsers(dest="strategy_action", required=True)
     for name in ("submit", "revise"):
-        command = strategy.add_parser(name); command.add_argument("--task-dir", required=True); command.add_argument("--file", required=True); command.set_defaults(func=strategy_submit)
+        command = strategy.add_parser(name); command.add_argument("--task-dir", required=True)
+        source = command.add_mutually_exclusive_group(required=True)
+        source.add_argument("--file"); source.add_argument("--draft", action="store_true")
+        command.set_defaults(func=strategy_submit)
+    command = strategy.add_parser("scaffold"); command.add_argument("--attempt-dir", required=True); command.set_defaults(func=strategy_scaffold)
+    command = strategy.add_parser("preflight"); command.add_argument("--attempt-dir", required=True)
+    source = command.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file"); source.add_argument("--draft", action="store_true")
+    command.set_defaults(func=strategy_preflight)
+    command = strategy.add_parser("draft"); command.add_argument("--attempt-dir", required=True); command.add_argument("--file", required=True); command.set_defaults(func=strategy_draft)
     for name in ("approve", "changes"):
         command = strategy.add_parser(name); command.add_argument("--task-dir", required=True); command.add_argument("--revision", type=int, required=True); command.add_argument("--reviewer", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=strategy_review)
     tasks = areas.add_parser("task").add_subparsers(dest="task_action", required=True)

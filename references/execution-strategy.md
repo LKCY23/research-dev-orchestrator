@@ -34,6 +34,15 @@ Strategy and review revisions are immutable. `CURRENT.json` is a derived pointer
 
 A planning attempt is read-only with respect to the task worktree. It may inspect task context and source files, but may write only its attempt artifacts and the next strategy revision. A valid planning handoff requests `strategy_review`; dispatch validates the revision and applies `planning -> strategy_review`.
 
+The planning prompt and `rdo strategy scaffold` share one deterministic,
+policy-bounded builder. A worker may stream a completed candidate to
+`rdo strategy draft --file -`; only a candidate that passes the exact
+strategy-payload preflight is stored as mutable attempt-local
+`runtime/STRATEGY_DRAFT.json`. `strategy preflight` never writes, and
+`strategy submit|revise --draft` revalidates before creating the immutable
+revision. The draft is transport state only: it is excluded from handoff
+evidence and never changes coordinator approval semantics.
+
 Dispatch fingerprints tracked and untracked worktree content before and after planning. Any content change invalidates the handoff and blocks the task for coordinator review; the changed files are retained as evidence rather than silently reverted.
 
 Execution uses the same fingerprints to reject changes outside the union of write-enabled workflow paths in the approved strategy or inside task-level forbidden paths. This check includes committed, uncommitted, and untracked content changes.

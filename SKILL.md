@@ -269,6 +269,9 @@ Use these files to recover context after days or weeks:
 
 For v2, the current attempt's `HANDOFF.json` is the canonical minimal worker
 request and `EVIDENCE.json` is its frozen structured review index. Worker-side
+`rdo strategy scaffold|preflight|draft` provides a deterministic Full-planning
+authoring path without arbitrary temporary files; the mutable attempt-local
+draft is not evidence or approval. Worker-side
 `rdo strategy submit|revise` and `rdo finalize` publish
 `runtime/HANDOFF_READY.json` last, binding the exact attempt inputs, source
 commit, handoff, and evidence. The supervisor may use that marker to quiesce an

@@ -422,7 +422,79 @@ def write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
         raise StrategyValidationError(f"immutable protocol artifact already exists: {path}") from exc
 
 
-def submit_strategy(task_dir: Path, payload: dict[str, Any]) -> tuple[Path, str]:
+def build_strategy_scaffold(task_dir: Path, backend_id: str) -> dict[str, Any]:
+    """Build the next policy-bounded strategy revision without publishing it."""
+
+    policy = load_execution_policy(task_dir)
+    status = load_json(task_dir / "STATUS.json")
+    existing = sorted((task_dir / "strategy").glob("STRATEGY-v*.json"))
+    revision = len(existing) + 1
+    supersedes = load_json(existing[-1]).get("strategy_id") if existing else None
+    command_seconds = min(
+        policy["default_command_seconds"],
+        policy["attempt_wall_seconds"],
+    )
+    scaffold = {
+        "schema_version": 2,
+        "backend_id": backend_id,
+        "strategy_id": f"{status['task_id']}-S{revision:03d}",
+        "task_id": status["task_id"],
+        "revision": revision,
+        "supersedes": supersedes,
+        "objective": "Replace with the task-specific execution objective",
+        "global_budget": {
+            "wall_seconds": policy["attempt_wall_seconds"],
+            "max_workflows": policy["max_workflows"],
+            "max_workflow_instances": policy["max_workflow_instances"],
+            "max_parallel_workflows": policy["max_parallel_workflows"],
+            "max_subagents": policy["max_subagents"],
+            "max_parallel_subagents": policy["max_parallel_subagents"],
+        },
+        "workflows": [
+            {
+                "workflow_id": "WF-implementation",
+                "kind": "implementation",
+                "purpose": "Replace with a bounded task-specific workflow",
+                "depends_on": [],
+                "required": True,
+                "executor": {
+                    "mode": "primary_worker",
+                    "write_access": True,
+                    "max_agents": 0,
+                    "max_parallel": 0,
+                    "allowed_paths": policy["allowed_paths"],
+                },
+                "budget": {
+                    "wall_seconds": policy["attempt_wall_seconds"],
+                    "command_seconds": command_seconds,
+                    "max_enumerated_cases": policy["max_enumerated_cases"],
+                    "max_instances": 1,
+                },
+                "completion": {
+                    "evidence": "Replace with concrete completion evidence"
+                },
+                "on_timeout": "block",
+            }
+        ],
+        "runtime_change_policy": {
+            "allow_new_instances_of_approved_workflows": True,
+            "require_revision_for_new_workflow_kind": True,
+            "require_revision_for_budget_increase": True,
+            "allow_unbounded_search": policy["allow_unbounded_search"],
+        },
+        "completion_gate": {
+            "required_workflows_complete": True,
+            "acceptance_commands_pass": True,
+            "optional_workflows_may_timeout": True,
+        },
+    }
+    validate_strategy(scaffold, policy, task_id=str(status.get("task_id")))
+    return scaffold
+
+
+def preflight_strategy(task_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the exact deterministic payload gates used before immutable submission."""
+
     policy = load_execution_policy(task_dir)
     status = load_json(task_dir / "STATUS.json")
     task_id = status.get("task_id")
@@ -444,7 +516,21 @@ def submit_strategy(task_dir: Path, payload: dict[str, Any]) -> tuple[Path, str]
             raise StrategyValidationError("strategy supersedes must name the previous strategy_id")
     path = strategy_path(task_dir, strategy["revision"])
     digest = canonical_digest(strategy)
-    write_immutable_json(path, strategy)
+    return {
+        "valid": True,
+        "action": "submit" if expected_revision == 1 else "revise",
+        "expected_revision": expected_revision,
+        "strategy_id": strategy["strategy_id"],
+        "strategy_sha256": digest,
+        "output_path": str(path),
+    }
+
+
+def submit_strategy(task_dir: Path, payload: dict[str, Any]) -> tuple[Path, str]:
+    preflight = preflight_strategy(task_dir, payload)
+    path = Path(preflight["output_path"])
+    digest = str(preflight["strategy_sha256"])
+    write_immutable_json(path, payload)
     return path, digest
 
 
