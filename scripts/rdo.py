@@ -59,6 +59,7 @@ from strategy import (
     submit_strategy,
 )
 from supervisor import (
+    audit_supervision_token,
     run_supervised,
     terminate_processes,
     validate_attempt_deadline_payload,
@@ -3030,6 +3031,113 @@ def status_action(args: argparse.Namespace) -> int:
     return 0
 
 
+def cleanup_audit(args: argparse.Namespace) -> int:
+    """Read-only post-attempt audit of current token-bearing processes."""
+
+    attempt = Path(args.attempt_dir).resolve()
+    if attempt.parent.name != "attempts" or attempt.name in {"", ".", ".."}:
+        raise SystemExit("attempt directory must be task-local under attempts/")
+    task = attempt.parent.parent.resolve()
+    if attempt.parent.resolve() != (task / "attempts").resolve():
+        raise SystemExit("attempt directory is not owned by the task")
+    status = load_json(task / "STATUS.json")
+    metadata = load_json(attempt / "ATTEMPT.json")
+    supervisor_path = attempt / "runtime" / "supervisor.json"
+    supervisor = (
+        load_json(supervisor_path)
+        if supervisor_path.is_file() and not supervisor_path.is_symlink()
+        else None
+    )
+    task_id = status.get("task_id") if isinstance(status, dict) else None
+    identity_valid = bool(
+        isinstance(status, dict)
+        and isinstance(metadata, dict)
+        and metadata.get("task_id") == task_id
+        and metadata.get("attempt_id") == attempt.name
+    )
+    supervisor_state = supervisor.get("state") if isinstance(supervisor, dict) else None
+    supervisor_finished = bool(
+        isinstance(supervisor_state, str)
+        and supervisor_state
+        and supervisor_state != "running"
+    )
+    completed = bool(
+        identity_valid
+        and metadata.get("state") == "completed"
+        and supervisor_finished
+    )
+    recorded_cleanup = (
+        {
+            "state": supervisor.get("state"),
+            "cleanup_verified": supervisor.get("cleanup_verified"),
+            "cleanup_failure_reason": supervisor.get("cleanup_failure_reason"),
+            "surviving_pids": supervisor.get("surviving_pids", []),
+        }
+        if isinstance(supervisor, dict)
+        else None
+    )
+    base: dict[str, Any] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "attempt_id": attempt.name,
+        "audited_at": utc_now(),
+        "eligible": completed,
+        "observation_scope": "current_token_visible_processes",
+        "recorded_cleanup": recorded_cleanup,
+        "live_processes": [],
+    }
+    if not completed:
+        reason = (
+            "attempt_identity_mismatch"
+            if not identity_valid
+            else "supervisor_state_missing"
+            if not isinstance(supervisor, dict)
+            else "attempt_not_completed"
+            if metadata.get("state") != "completed"
+            else "supervisor_still_running"
+            if supervisor_state == "running"
+            else "supervisor_state_invalid"
+        )
+        print(json.dumps({**base, "status": "ineligible", "reason": reason}, indent=2))
+        return 2
+
+    token = supervisor.get("supervision_token")
+    try:
+        audit = audit_supervision_token(token)
+    except ValueError as exc:
+        print(
+            json.dumps(
+                {**base, "status": "invalid_evidence", "reason": str(exc)},
+                indent=2,
+            )
+        )
+        return 2
+    live = [
+        {"pid": pid, "ppid": ppid, "pgid": pgid}
+        for pid, ppid, pgid in audit.live_processes
+    ]
+    if not audit.inspection_verified:
+        result = {
+            **base,
+            "status": "inspection_unavailable",
+            "reason": audit.inspection_failure_reason,
+            "live_processes": live,
+        }
+        exit_code = 126
+    elif live:
+        result = {**base, "status": "live_processes", "reason": None, "live_processes": live}
+        exit_code = 1
+    else:
+        result = {
+            **base,
+            "status": "no_live_processes_observed",
+            "reason": None,
+        }
+        exit_code = 0
+    print(json.dumps(result, indent=2))
+    return exit_code
+
+
 def control(args: argparse.Namespace) -> int:
     path = task_dir(args.task_dir)
     status = load_json(path / "STATUS.json")
@@ -3082,6 +3190,8 @@ def build_parser() -> argparse.ArgumentParser:
     command = areas.add_parser("check"); command.add_argument("--attempt-dir", required=True); command.add_argument("--check-id", required=True); command.add_argument("--workflow-id", default=""); command.add_argument("--instance-id", default=""); command.set_defaults(func=check_command)
     command = areas.add_parser("exec"); command.add_argument("--attempt-dir", required=True); command.add_argument("--workflow-id", required=True); command.add_argument("--instance-id", required=True); command.add_argument("--timeout", type=float, required=True); command.add_argument("--cwd", default=""); command.add_argument("--acceptance", action="store_true"); command.add_argument("command", nargs=argparse.REMAINDER); command.set_defaults(func=execute_command)
     command = areas.add_parser("status"); command.add_argument("--task-dir", required=True); command.set_defaults(func=status_action)
+    cleanup = areas.add_parser("cleanup").add_subparsers(dest="cleanup_action", required=True)
+    command = cleanup.add_parser("audit"); command.add_argument("--attempt-dir", required=True); command.set_defaults(func=cleanup_audit)
     workers = areas.add_parser("worker").add_subparsers(dest="worker_action", required=True)
     command = workers.add_parser("message"); command.add_argument("--task-dir", required=True); command.add_argument("--text", required=True); command.set_defaults(func=control)
     for name in ("interrupt", "terminate"):

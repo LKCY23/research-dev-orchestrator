@@ -169,6 +169,12 @@ Full tasks use strategy-gated execution. A planning worker may inspect the repos
 
 Execution remains flexible inside that approved envelope. A worker may start multiple instances of approved workflows and use declared subagents, but new workflow kinds, wider paths or permissions, larger budgets, or unbounded search require a new strategy revision. `supervise_attempt.py` enforces the attempt wall clock and process cleanup independently of model timeout settings; `rdo exec` supervises non-acceptance workflow commands, while `rdo check` selects and records exact commands from the frozen acceptance contract. See [execution strategy](references/execution-strategy.md), [attempt supervision](references/attempt-supervision.md), and [tmux control](references/tmux-control.md).
 
+After an attempt has finished, `rdo cleanup audit --attempt-dir <path>` provides
+a read-only point-in-time check for processes that visibly retain its
+supervision token lineage. It does not trust historical PIDs as ownership
+evidence, does not treat an empty observation as an absolute containment proof,
+and does not terminate anything.
+
 Strategy revisions can explicitly reuse completed work across attempts and backend changes. Dispatch verifies the terminal source attempt, source workflow completion, and exact worktree digest, then exposes carried and remaining workflows through attempt-local `RESUME_CONTEXT.json`. Acceptance evidence is always regenerated in the current attempt.
 
 Full strategies may also declare hard model-turn, token, cost, context, first-progress, and no-progress budgets. RDO enables them only for metrics the selected backend/I/O adapter can observe, records normalized usage in `runtime/USAGE.ndjson`, and terminates on violation. Independent review workflows require distinct observed reviewer agents and hashed review artifacts; the primary worker cannot self-attest independence.

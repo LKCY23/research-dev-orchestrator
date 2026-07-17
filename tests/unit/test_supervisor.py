@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from supervisor import (
     AttemptDeadline,
+    audit_supervision_token,
     current_termination_targets,
     load_or_create_attempt_deadline,
     pid_alive,
@@ -19,6 +20,23 @@ from supervisor import (
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_read_only_token_audit_reports_current_identities(self):
+        table = {41001: (1, 41001), 41002: (41001, 41001)}
+        with (
+            patch("supervisor._process_table", return_value=table),
+            patch("supervisor.tagged_processes", return_value={41002}),
+        ):
+            result = audit_supervision_token("a" * 32)
+        self.assertTrue(result.inspection_verified)
+        self.assertEqual(((41002, 41001, 41001),), result.live_processes)
+
+    def test_read_only_token_audit_fails_closed_without_process_table(self):
+        with patch("supervisor._process_table", side_effect=OSError):
+            result = audit_supervision_token("a" * 32)
+        self.assertFalse(result.inspection_verified)
+        self.assertEqual("process_table_unavailable", result.inspection_failure_reason)
+        self.assertEqual((), result.live_processes)
+
     def test_timeout_kills_descendants(self):
         result = run_supervised(
             ["/bin/sh", "-c", "sleep 30 & wait"],

@@ -54,6 +54,13 @@ class SupervisedResult:
     deadline_sha256: str
 
 
+@dataclass(frozen=True)
+class SupervisionAuditResult:
+    inspection_verified: bool
+    inspection_failure_reason: str | None
+    live_processes: tuple[tuple[int, int, int], ...]
+
+
 def _iso_from_epoch(value: float) -> str:
     return (
         datetime.fromtimestamp(value, timezone.utc)
@@ -807,6 +814,43 @@ def tagged_processes(
         if pid in table:
             tagged.add(pid)
     return tagged
+
+
+def audit_supervision_token(token: str) -> SupervisionAuditResult:
+    """Inspect current token-bearing processes without signalling or writing."""
+
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("supervision token must be 32 lowercase hexadecimal characters")
+    observation: dict[str, Any] = {"verified": True, "reason": None}
+    try:
+        table = _process_table()
+    except (OSError, subprocess.SubprocessError):
+        return SupervisionAuditResult(
+            inspection_verified=False,
+            inspection_failure_reason="process_table_unavailable",
+            live_processes=(),
+        )
+    tagged = tagged_processes(
+        token,
+        table,
+        cleanup_observation=observation,
+    )
+    identities = tuple(
+        sorted(
+            (pid, table[pid][0], table[pid][1])
+            for pid in tagged
+            if pid in table
+        )
+    )
+    return SupervisionAuditResult(
+        inspection_verified=bool(observation["verified"]),
+        inspection_failure_reason=(
+            str(observation["reason"])
+            if observation["reason"] is not None
+            else None
+        ),
+        live_processes=identities,
+    )
 
 
 def current_termination_targets(

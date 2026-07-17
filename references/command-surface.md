@@ -13,6 +13,21 @@ rdo worker message|interrupt|terminate
 rdo status
 ```
 
+Read-only diagnostics:
+
+```text
+rdo cleanup audit --attempt-dir <path>
+```
+
+Cleanup audit is eligible only after the attempt and its outer supervisor have
+finished. It compares no historical PID or PGID as proof of ownership; it
+reports only processes whose current userspace state exposes the attempt's
+supervision token lineage. A zero result is therefore
+`no_live_processes_observed`, not an absolute containment proof. The command
+never writes protocol artifacts or sends signals. Exit status is `0` when no
+tagged process is observed, `1` for observed live tagged processes, `2` for
+ineligible/invalid evidence, and `126` when process inspection is unavailable.
+
 Worker-only commands:
 
 ```text
