@@ -37,6 +37,8 @@ from artifact_bundle import (
 from artifact_resolver import ArtifactResolutionError, require_current_bundle
 from check_broker import broker_directory_for_attempt, run_brokered
 from completion import write_completion
+from config import load_config
+from dispatch_assets import render_worker_prompt
 from protocol import (
     ARTIFACT_PROTOCOL_VERSION,
     EventJournalError,
@@ -1022,6 +1024,136 @@ def task_review(args: argparse.Namespace) -> int:
         findings_path=findings_relative.as_posix(),
     )
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _preview_dispatch_phase(
+    task_path: Path, status: dict[str, Any], requested_phase: str
+) -> str:
+    if requested_phase != "auto":
+        phase = requested_phase
+    else:
+        profile = status.get("profile", "full")
+        state = status.get("state")
+        if profile != "full":
+            if state not in {"pending", "blocked", "changes_requested"}:
+                raise SystemExit(
+                    f"cannot auto-detect {profile} preview phase from state {state}"
+                )
+            phase = "execution"
+        elif state == "pending":
+            phase = "planning"
+        elif state == "strategy_review":
+            phase = "execution"
+        elif state in {"blocked", "changes_requested"}:
+            try:
+                load_approved_strategy(task_path)
+            except StrategyValidationError:
+                phase = "planning"
+            else:
+                phase = "execution"
+        else:
+            raise SystemExit(f"cannot auto-detect preview phase from state {state}")
+    if status.get("profile", "full") != "full" and phase != "execution":
+        raise SystemExit(
+            f"task profile {status.get('profile')} does not use planning attempts"
+        )
+    return phase
+
+
+def task_preview_prompt(args: argparse.Namespace) -> int:
+    """Render the next prompt candidate without mutating task or repository state."""
+
+    path = task_dir(args.task_dir)
+    status = load_json(path / "STATUS.json")
+    root = repo_root(path)
+    worktree_value = status.get("worktree")
+    if not isinstance(worktree_value, str) or not worktree_value:
+        raise SystemExit("task worktree is missing")
+    worktree_candidate = Path(worktree_value)
+    worktree = (
+        worktree_candidate.resolve()
+        if worktree_candidate.is_absolute()
+        else (root / worktree_candidate).resolve()
+    )
+    config_result = load_config(root)
+    if config_result.errors:
+        raise SystemExit("cannot preview prompt with invalid RDO configuration")
+    assigned = status.get("assigned_worker")
+    assigned = assigned if isinstance(assigned, dict) else {}
+    worker_backend = args.worker_backend or config_result.config.worker_backend
+    assigned_backend = assigned.get("backend_id")
+    session_id = assigned.get("backend_session_id") or assigned.get("session_id")
+
+    execution_mode = args.execution_mode
+    if execution_mode == "auto":
+        if assigned_backend == worker_backend and session_id:
+            execution_mode = "resume"
+            reason = "same_backend_session_present_preflight_not_run"
+        elif assigned and assigned_backend != worker_backend:
+            execution_mode = "replace"
+            reason = "assigned_worker_uses_different_backend"
+        else:
+            execution_mode = "start"
+            reason = "no_resumable_assigned_session"
+    elif execution_mode == "resume":
+        if assigned_backend != worker_backend or not session_id:
+            raise SystemExit(
+                "resume preview requires an assigned session for the selected backend"
+            )
+        reason = "explicit_resume_preflight_not_run"
+    elif execution_mode == "replace":
+        reason = "explicit_backend_replacement"
+    else:
+        reason = "explicit_new_session"
+
+    phase = _preview_dispatch_phase(path, status, args.phase)
+    strategy_path = ""
+    if status.get("profile", "full") == "full" and phase == "execution":
+        strategy, _ = load_approved_strategy(path)
+        strategy_path = str(
+            path / "strategy" / f"STRATEGY-v{int(strategy['revision']):03d}.json"
+        )
+    prompt_mode = "compact_resume" if execution_mode == "resume" else "full"
+    preview_attempt = path / "attempts" / "A-PREVIEW"
+    prompt = render_worker_prompt(
+        worktree_path=str(worktree),
+        task_dir=path,
+        status_path=path / "STATUS.json",
+        attempt_dir=preview_attempt,
+        worker_backend=worker_backend,
+        agent_name=str(
+            assigned.get("agent_name")
+            if assigned_backend == worker_backend and assigned.get("agent_name")
+            else config_result.config.worker_agent_name
+        ),
+        phase=phase,
+        strategy_path=strategy_path,
+        prompt_mode=prompt_mode,
+        prompt_mode_reason=reason,
+    )
+    if args.body_only:
+        print(prompt)
+    else:
+        encoded = prompt.encode("utf-8")
+        print(
+            json.dumps(
+                {
+                    "selection_stage": "preflight_candidate",
+                    "byte_exact": False,
+                    "execution_mode_candidate": execution_mode,
+                    "prompt_mode": prompt_mode,
+                    "reason": reason,
+                    "worker_backend": worker_backend,
+                    "phase": phase,
+                    "preview_attempt_dir": str(preview_attempt),
+                    "prompt_sha256": hashlib.sha256(encoded).hexdigest(),
+                    "prompt_bytes": len(encoded),
+                    "prompt": prompt,
+                },
+                indent=2,
+            )
+        )
     return 0
 
 
@@ -3179,6 +3311,7 @@ def build_parser() -> argparse.ArgumentParser:
         command = strategy.add_parser(name); command.add_argument("--task-dir", required=True); command.add_argument("--revision", type=int, required=True); command.add_argument("--reviewer", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=strategy_review)
     tasks = areas.add_parser("task").add_subparsers(dest="task_action", required=True)
     command = tasks.add_parser("review"); command.add_argument("--task-dir", required=True); command.add_argument("--decision", choices=("approved", "changes_requested", "failed"), required=True); command.add_argument("--reviewer", required=True); command.add_argument("--findings-file", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=task_review)
+    command = tasks.add_parser("preview-prompt"); command.add_argument("--task-dir", required=True); command.add_argument("--worker-backend", choices=("claude-code", "codex", "opencode", "kimi-code"), default=""); command.add_argument("--execution-mode", choices=("auto", "start", "resume", "replace"), default="auto"); command.add_argument("--phase", choices=("auto", "planning", "execution"), default="auto"); command.add_argument("--body-only", action="store_true"); command.set_defaults(func=task_preview_prompt)
     command = tasks.add_parser("merge"); command.add_argument("--task-dir", required=True); command.add_argument("--target-worktree", required=True); command.add_argument("--expected-commit", default=""); command.add_argument("--verify-command", action="append", default=[]); command.add_argument("--verification-timeout", type=float, default=300); command.add_argument("--coordinator", required=True); command.set_defaults(func=task_merge)
     workflows = areas.add_parser("workflow").add_subparsers(dest="workflow_action", required=True)
     for name in ("start", "heartbeat", "complete"):

@@ -12,7 +12,10 @@ import hashlib
 import json
 import os
 import shlex
+import subprocess
 from pathlib import Path
+
+from task_contract import TaskContractError, parse_acceptance_markdown
 
 
 def read_text(path: Path) -> str:
@@ -161,6 +164,129 @@ def render_full_execution_protocol(
     return lines, block
 
 
+def _markdown_section(text: str, heading: str, *, max_lines: int = 5) -> list[str]:
+    """Return a small, deterministic excerpt from one level-two section."""
+
+    lines = text.splitlines()
+    start = next(
+        (index + 1 for index, line in enumerate(lines) if line.strip() == f"## {heading}"),
+        None,
+    )
+    if start is None:
+        return []
+    excerpt: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("## "):
+            break
+        value = line.strip()
+        if not value or value.startswith("```"):
+            continue
+        excerpt.append(value[:500])
+        if len(excerpt) == max_lines:
+            break
+    return excerpt
+
+
+def _critical_proof_obligations(task_dir: Path) -> list[str]:
+    acceptance_path = task_dir / "ACCEPTANCE.md"
+    if not acceptance_path.exists():
+        return ["- Complete the acceptance criteria frozen in the original task packet."]
+    acceptance = acceptance_path.read_text(encoding="utf-8")
+    lines = _markdown_section(acceptance, "Critical Proof Obligations")
+    if not lines:
+        lines = _markdown_section(acceptance, "Behavioral Checks")
+    obligations = [line if line.startswith(("-", "*")) else f"- {line}" for line in lines]
+    try:
+        parsed = parse_acceptance_markdown(acceptance)
+    except TaskContractError:
+        parsed = None
+    if parsed is not None:
+        check_ids = [
+            command["id"] for command in parsed["contract"]["required_commands"]
+        ]
+        obligations.append(f"- Required acceptance check IDs: {json.dumps(check_ids)}")
+    return obligations or [
+        "- Complete the acceptance criteria frozen in the original task packet."
+    ]
+
+
+def _current_source_state(worktree_path: str) -> list[str]:
+    worktree = Path(worktree_path)
+    if not worktree.is_dir():
+        return ["- Worktree is not materialized yet; inspect it after dispatch creates it."]
+
+    def git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=worktree,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    head = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain=v1")
+    if head.returncode != 0 or status.returncode != 0:
+        return ["- Current Git state is unavailable; inspect the assigned worktree directly."]
+    raw_status = status.stdout.rstrip("\n")
+    entries = raw_status.splitlines() if raw_status else []
+    digest = hashlib.sha256(raw_status.encode("utf-8")).hexdigest()
+    result = [
+        f"- HEAD: {head.stdout.strip()}",
+        f"- Worktree status: {'clean' if not entries else f'{len(entries)} changed path(s)'}",
+        f"- Status SHA-256: {digest}",
+    ]
+    result.extend(f"  - {entry[:500]}" for entry in entries[:40])
+    if len(entries) > 40:
+        result.append(f"  - ... {len(entries) - 40} additional path(s) omitted")
+    return result
+
+
+def _resume_work_summary(task_dir: Path, status: dict[str, object]) -> list[str]:
+    parent_id = status.get("current_attempt_id")
+    result = [
+        f"- Task state at dispatch: {status.get('state') or 'unknown'}",
+        f"- Parent attempt: {parent_id or 'none'}",
+    ]
+    safe_parent = (
+        isinstance(parent_id, str)
+        and parent_id not in {".", ".."}
+        and Path(parent_id).name == parent_id
+    )
+    if safe_parent:
+        assert isinstance(parent_id, str)
+        attempt_path = task_dir / "attempts" / parent_id / "ATTEMPT.json"
+        if attempt_path.exists():
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+            result.extend(
+                [
+                    f"- Parent outcome: {attempt.get('outcome') or attempt.get('state') or 'unknown'}",
+                    f"- Parent handoff state: {attempt.get('handoff_state') or 'none'}",
+                ]
+            )
+        handoff_path = task_dir / "attempts" / parent_id / "HANDOFF.json"
+        if handoff_path.exists():
+            handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+            summary = str(handoff.get("summary") or "").strip()
+            if summary:
+                result.append(f"- Previous handoff summary: {summary[:1000]}")
+    elif parent_id:
+        result.append("- Parent attempt metadata was not read because its identifier is unsafe.")
+    summary = str(status.get("summary") or "").strip()
+    blocker = str(status.get("blocking_reason") or "").strip()
+    if summary:
+        result.append(f"- Coordinator-visible summary: {summary[:1000]}")
+    if blocker:
+        result.append(f"- Blocking reason to resolve: {blocker[:1000]}")
+    result.extend(
+        [
+            "- Preserve compatible work already present in the worktree; do not redo completed work merely to recreate evidence.",
+            "- Resolve only the current feedback or unfinished work; follow the phase instructions below for this attempt's closeout.",
+        ]
+    )
+    return result
+
+
 def render_worker_prompt(
     *,
     worktree_path: str,
@@ -171,7 +297,11 @@ def render_worker_prompt(
     agent_name: str = "",
     phase: str = "execution",
     strategy_path: str = "",
+    prompt_mode: str = "full",
+    prompt_mode_reason: str = "new_or_replacement_session",
 ) -> str:
+    if prompt_mode not in {"full", "compact_resume"}:
+        raise ValueError("prompt_mode must be full or compact_resume")
     status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
     profile = status.get("profile", "full")
     artifact_v2 = status.get("artifact_protocol_version") == 2
@@ -335,6 +465,51 @@ def render_worker_prompt(
         artifact_reminder = (
             "- Do not hand-edit EVIDENCE.md, HANDOFF.md, HANDOFF.json, or "
             "COMPLETION.json; rdo strategy/finalize writes them atomically."
+        )
+    if prompt_mode == "compact_resume":
+        compact_strategy = strategy_block if profile == "full" and phase == "execution" else ""
+        return "\n".join(
+            [
+                "# Worker Resume Prompt",
+                "",
+                f"You are resuming the existing {worker_backend} session for this task.",
+                f"Agent name: {agent_name or worker_backend}.",
+                f"Execution profile: {profile}.",
+                f"Prompt mode reason: {prompt_mode_reason}.",
+                "The original frozen task packet is already in this native session. This delta supersedes stale runtime details; it does not replace the task contract.",
+                "",
+                "## Protocol File Paths",
+                "",
+                f"- WORKTREE_PATH: {worktree_path}",
+                *protocol_paths,
+                "",
+                "## Protocol Reminders",
+                "",
+                "- Do not edit STATUS.json. Dispatch owns task state transitions.",
+                artifact_reminder,
+                "- Keep code changes inside the allowed paths from the original frozen task packet.",
+                f"- Current machine read policy: {read_policy_path}",
+                f"- Deterministic Context Broker: python3 {context_broker} --policy {read_policy_path} <index|search|get> ...",
+                "",
+                "## Current Source State",
+                "",
+                *_current_source_state(worktree_path),
+                "",
+                "## Remaining Work",
+                "",
+                *_resume_work_summary(task_dir, status),
+                "",
+                "## Critical Proof Obligations",
+                "",
+                *_critical_proof_obligations(task_dir),
+                "",
+                *phase_rules,
+                "",
+                compact_strategy,
+                "",
+                strategy_feedback,
+                coordinator_feedback,
+            ]
         )
     return "\n".join(
         [
@@ -531,6 +706,8 @@ def cmd_render_prompt(args: argparse.Namespace) -> int:
             agent_name=args.agent_name,
             phase=args.phase,
             strategy_path=args.strategy_path,
+            prompt_mode=args.prompt_mode,
+            prompt_mode_reason=args.prompt_mode_reason,
         ),
         encoding="utf-8",
     )
@@ -575,6 +752,8 @@ def build_parser() -> argparse.ArgumentParser:
     prompt.add_argument("--agent-name", default="")
     prompt.add_argument("--phase", choices=["planning", "execution"], required=True)
     prompt.add_argument("--strategy-path", default="")
+    prompt.add_argument("--prompt-mode", choices=["full", "compact_resume"], default="full")
+    prompt.add_argument("--prompt-mode-reason", default="new_or_replacement_session")
     prompt.set_defaults(func=cmd_render_prompt)
 
     runner = sub.add_parser("render-tmux-runner")

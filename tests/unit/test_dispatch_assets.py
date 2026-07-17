@@ -9,6 +9,99 @@ from strategy import DEFAULT_EXECUTION_POLICY
 
 
 class DispatchAssetsTests(unittest.TestCase):
+    def test_compact_resume_uses_delta_instead_of_repeating_frozen_packet(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary)
+            attempt = task / "attempts" / "A001"
+            attempt.mkdir(parents=True)
+            (attempt / "ATTEMPT.json").write_text(
+                json.dumps(
+                    {
+                        "state": "invalid_handoff",
+                        "outcome": "timed_out_unfinalized",
+                        "handoff_state": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task / "STATUS.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "T101-example",
+                        "state": "blocked",
+                        "profile": "direct",
+                        "artifact_protocol_version": 2,
+                        "current_attempt_id": "A001",
+                        "blocking_reason": "Finish the bounded API fix.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (task / "TASK.md").write_text(
+                "UNIQUE FULL TASK CONTENT " * 200, encoding="utf-8"
+            )
+            (task / "CONTEXT.md").write_text(
+                "UNIQUE FULL CONTEXT CONTENT " * 200, encoding="utf-8"
+            )
+            (task / "ACCEPTANCE.md").write_text(
+                """# Acceptance
+
+```json rdo-acceptance-contract
+{"schema_version":2,"required_commands":[{"id":"focused","argv":["true"],"cwd":".","timeout_seconds":10}],"required_outputs":["result.txt"],"pre_merge_commands":[],"post_merge_commands":[]}
+```
+
+## Behavioral Checks
+
+- The resumed worker preserves completed work and proves the focused behavior.
+
+## Merge Preconditions
+
+- Focused check passes.
+
+## Blocked Conditions
+
+- Required input is unavailable.
+
+## Pre-Merge Checks
+
+- None.
+
+## Post-Merge Checks
+
+- None.
+""",
+                encoding="utf-8",
+            )
+            (task / "EXECUTION_POLICY.json").write_text(
+                json.dumps(DEFAULT_EXECUTION_POLICY), encoding="utf-8"
+            )
+            arguments = dict(
+                worktree_path="/tmp/not-materialized-worktree",
+                task_dir=task,
+                status_path=task / "STATUS.json",
+                attempt_dir=task / "attempts" / "A002",
+                worker_backend="claude-code",
+                phase="execution",
+            )
+
+            full = render_worker_prompt(**arguments)
+            compact = render_worker_prompt(
+                **arguments,
+                prompt_mode="compact_resume",
+                prompt_mode_reason="backend_session_resume_preflight_passed",
+            )
+
+            self.assertIn("# Worker Resume Prompt", compact)
+            self.assertIn("## Current Source State", compact)
+            self.assertIn("## Remaining Work", compact)
+            self.assertIn("Parent outcome: timed_out_unfinalized", compact)
+            self.assertIn("## Critical Proof Obligations", compact)
+            self.assertIn("Required acceptance check IDs: [\"focused\"]", compact)
+            self.assertNotIn("\n## TASK.md\n", compact)
+            self.assertNotIn("\n## CONTEXT.md\n", compact)
+            self.assertNotIn("UNIQUE FULL TASK CONTENT", compact)
+            self.assertLess(len(compact), len(full))
+
     def test_planning_prompt_embeds_policy_bounded_strategy_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
             task = Path(temporary)

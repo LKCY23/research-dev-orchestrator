@@ -17,6 +17,7 @@ Read-only diagnostics:
 
 ```text
 rdo cleanup audit --attempt-dir <path>
+rdo task preview-prompt --task-dir <path>
 ```
 
 Cleanup audit is eligible only after the attempt and its outer supervisor have
@@ -27,6 +28,14 @@ supervision token lineage. A zero result is therefore
 never writes protocol artifacts or sends signals. Exit status is `0` when no
 tagged process is observed, `1` for observed live tagged processes, `2` for
 ineligible/invalid evidence, and `126` when process inspection is unavailable.
+
+`rdo task preview-prompt` renders the next dispatch prompt candidate without
+creating an attempt, taking a lock, changing task state, or writing a prompt
+file. Automatic backend, phase, and start/resume/replace selection mirrors the
+deterministic pre-preflight dispatch rules. Its JSON result is explicitly
+marked `selection_stage=preflight_candidate` and `byte_exact=false`: backend
+preflight may still turn a resume candidate into a full-context start. Use
+`--body-only` when only the rendered prompt is needed.
 
 Worker-only commands:
 

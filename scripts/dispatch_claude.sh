@@ -752,16 +752,32 @@ if [[ "${DISPATCH_DRY_RUN}" != "1" ]]; then
   fi
 fi
 
-python3 "${DISPATCH_ASSETS}" render-prompt \
-  --output "${ATTEMPT_DIR}/prompt.md" \
-  --worktree-path "${WORKTREE_PATH}" \
-  --task-dir "${TASK_DIR}" \
-  --status-path "${STATUS_PATH}" \
-  --attempt-dir "${ATTEMPT_DIR}" \
-  --worker-backend "${RDO_WORKER_BACKEND}" \
-  --agent-name "${RDO_WORKER_AGENT_NAME}" \
-  --phase "${RDO_ATTEMPT_PHASE}" \
-  --strategy-path "${STRATEGY_PATH}"
+render_dispatch_prompt() {
+  local prompt_mode="$1"
+  local prompt_mode_reason="$2"
+  python3 "${DISPATCH_ASSETS}" render-prompt \
+    --output "${ATTEMPT_DIR}/prompt.md" \
+    --worktree-path "${WORKTREE_PATH}" \
+    --task-dir "${TASK_DIR}" \
+    --status-path "${STATUS_PATH}" \
+    --attempt-dir "${ATTEMPT_DIR}" \
+    --worker-backend "${RDO_WORKER_BACKEND}" \
+    --agent-name "${RDO_WORKER_AGENT_NAME}" \
+    --phase "${RDO_ATTEMPT_PHASE}" \
+    --strategy-path "${STRATEGY_PATH}" \
+    --prompt-mode "${prompt_mode}" \
+    --prompt-mode-reason "${prompt_mode_reason}"
+}
+
+if [[ "${RDO_EXECUTION_MODE}" == "resume" ]]; then
+  render_dispatch_prompt "compact_resume" "backend_session_resume_preflight_passed"
+elif [[ -n "${RESUME_FALLBACK_REASON}" ]]; then
+  render_dispatch_prompt "full" "preflight_resume_fallback:${RESUME_FALLBACK_REASON}"
+elif [[ "${RDO_EXECUTION_MODE}" == "replace" ]]; then
+  render_dispatch_prompt "full" "backend_replacement_session"
+else
+  render_dispatch_prompt "full" "new_backend_session"
+fi
 
 PROMPT_TRANSPORT="stdin"
 PROMPT_SUBMIT_KEY=""
@@ -1070,6 +1086,7 @@ PY
         if [[ "${RDO_WORKER_BACKEND}" == "claude-code" ]]; then
           FALLBACK_SESSION_ID="${REQUESTED_SESSION_ID}"
         fi
+        render_dispatch_prompt "full" "runtime_resume_fallback:runtime_session_not_found"
         FALLBACK_COMMAND_JSON="$(python3 "${AGENT_BACKEND_CLI}" command \
           --backend "${RDO_WORKER_BACKEND}" \
           --io-mode "${RDO_IO_MODE}" \
@@ -1186,6 +1203,7 @@ PY
         if [[ "${RDO_WORKER_BACKEND}" == "claude-code" ]]; then
           FALLBACK_SESSION_ID="${REQUESTED_SESSION_ID}"
         fi
+        render_dispatch_prompt "full" "runtime_resume_fallback:runtime_session_not_found"
         FALLBACK_COMMAND_JSON="$(python3 "${AGENT_BACKEND_CLI}" command \
           --backend "${RDO_WORKER_BACKEND}" \
           --io-mode "${RDO_IO_MODE}" \

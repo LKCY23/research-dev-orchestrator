@@ -6,6 +6,14 @@ An attempt is one bounded supervision and audit slice, not a worker identity. Or
 
 Session continuity and work continuity are independent. Backend replacement starts a new native session, but an approved Full strategy may still carry compatible workflow checkpoints from a terminal prior attempt. Dispatch records those mappings in `runtime/RESUME_CONTEXT.json` and `workflow_carried_forward` events.
 
+Prompt continuity follows the verified native-session boundary. A new or
+replacement session receives the complete frozen task packet. A resume that
+passes backend preflight receives a compact delta containing current source
+state, unfinished work, coordinator feedback, critical proof obligations, and
+current phase/closeout rules. If resume fails during preflight or startup,
+dispatch re-renders the complete prompt before launching the fallback session;
+a compact prompt is never used as the sole context for a new session.
+
 For a Full task in `blocked` or `changes_requested`, automatic dispatch uses an
 approved strategy only when the current strategy still validates under the
 installed protocol. A missing or invalid strategy routes to a new read-only
