@@ -1178,6 +1178,197 @@ def task_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def task_revise(args: argparse.Namespace) -> int:
+    """Record a changes-requested decision through the canonical review primitive."""
+
+    return task_review(
+        argparse.Namespace(
+            task_dir=args.task_dir,
+            decision="changes_requested",
+            reviewer=args.reviewer,
+            findings_file=args.findings_file,
+            note=list(args.note),
+        )
+    )
+
+
+def _task_dispatch_identity(
+    path: Path,
+    status: dict[str, Any],
+) -> tuple[Path, str, str]:
+    root = repo_root(path)
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise SystemExit("task directory is outside its repository") from exc
+    parts = relative.parts
+    if (
+        len(parts) != 5
+        or parts[0] != ".agent-collab"
+        or parts[1] != "runs"
+        or parts[3] != "tasks"
+    ):
+        raise SystemExit(
+            "task resume requires .agent-collab/runs/<run-id>/tasks/<task-id>"
+        )
+    run_id, task_id = parts[2], parts[4]
+    if status.get("task_id") != task_id:
+        raise SystemExit("STATUS.task_id does not match the task directory")
+    return root, run_id, task_id
+
+
+def _resume_result(
+    path: Path,
+    status_before: dict[str, Any],
+    existing_attempt_ids: set[str],
+    dispatch_exit_code: int,
+    requested_mode: str,
+) -> dict[str, Any]:
+    previous_attempt_id = status_before.get("current_attempt_id")
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "task_id": status_before.get("task_id"),
+        "dispatch_exit_code": dispatch_exit_code,
+        "previous_attempt_id": previous_attempt_id,
+        "attempt_created": False,
+        "attempt_id": None,
+        "selection_source": None,
+        "requested_execution_mode": requested_mode,
+        "execution_mode": None,
+        "resume_fallback_reason": None,
+        "backend_id": None,
+        "runtime_backend": None,
+        "phase": None,
+        "attempt_state": None,
+        "attempt_outcome": None,
+        "worker_exit_code": None,
+    }
+    attempts_dir = path / "attempts"
+    observed_ids = sorted(
+        candidate.name
+        for candidate in attempts_dir.iterdir()
+        if not candidate.is_symlink()
+        and candidate.is_dir()
+        and candidate.name not in existing_attempt_ids
+        and candidate.name not in {"", ".", ".."}
+        and Path(candidate.name).name == candidate.name
+        and "/" not in candidate.name
+        and "\\" not in candidate.name
+    )
+    matching: list[tuple[str, dict[str, Any]]] = []
+    invalid: list[str] = []
+    for attempt_id in observed_ids:
+        try:
+            attempt = load_json(attempts_dir / attempt_id / "ATTEMPT.json")
+        except Exception as exc:
+            invalid.append(f"{attempt_id}: unreadable ATTEMPT.json ({exc})")
+            continue
+        if not isinstance(attempt, dict):
+            invalid.append(f"{attempt_id}: ATTEMPT.json is not an object")
+            continue
+        if (
+            attempt.get("attempt_id") == attempt_id
+            and attempt.get("task_id") == status_before.get("task_id")
+            and attempt.get("parent_attempt_id") == previous_attempt_id
+        ):
+            matching.append((attempt_id, attempt))
+    if len(matching) != 1:
+        if observed_ids or dispatch_exit_code == 0:
+            detail = f"; invalid={invalid}" if invalid else ""
+            result["result_error"] = (
+                "cannot uniquely attribute a new attempt to this dispatch: "
+                f"observed={observed_ids}, matching={[item[0] for item in matching]}"
+                f"{detail}"
+            )
+        return result
+    attempt_id, attempt = matching[0]
+    runtime = attempt.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    result.update(
+        attempt_created=True,
+        attempt_id=attempt_id,
+        selection_source=f"attempts/{attempt_id}/ATTEMPT.json",
+        requested_execution_mode=attempt.get("requested_execution_mode"),
+        execution_mode=attempt.get("execution_mode"),
+        resume_fallback_reason=attempt.get("resume_fallback_reason"),
+        backend_id=attempt.get("backend_id"),
+        runtime_backend=runtime.get("backend"),
+        phase=attempt.get("phase"),
+        attempt_state=attempt.get("state"),
+        attempt_outcome=attempt.get("outcome"),
+        worker_exit_code=attempt.get("exit_code"),
+    )
+    return result
+
+
+def _run_task_dispatch(command: list[str], root: Path) -> int:
+    completed = subprocess.run(
+        command,
+        cwd=root,
+        check=False,
+        stdout=sys.stderr,
+    )
+    return int(completed.returncode)
+
+
+def task_resume(args: argparse.Namespace) -> int:
+    """Continue one task through the canonical dispatch entrypoint."""
+
+    path = task_dir(args.task_dir)
+    status = load_json(path / "STATUS.json")
+    if status.get("state") not in {"blocked", "changes_requested"}:
+        raise SystemExit("task resume requires blocked or changes_requested state")
+    if (path / ".dispatch-lock").exists():
+        raise SystemExit("task resume is forbidden while a dispatch lock exists")
+    previous_attempt_id = status.get("current_attempt_id")
+    if (
+        not isinstance(previous_attempt_id, str)
+        or not previous_attempt_id
+        or Path(previous_attempt_id).name != previous_attempt_id
+        or "/" in previous_attempt_id
+        or "\\" in previous_attempt_id
+    ):
+        raise SystemExit("task resume requires a safe current attempt id")
+    root, run_id, task_id = _task_dispatch_identity(path, status)
+    existing_attempt_ids = {
+        candidate.name
+        for candidate in (path / "attempts").iterdir()
+        if not candidate.is_symlink() and candidate.is_dir()
+    }
+    command = [
+        str(Path(__file__).resolve().parent / "dispatch_agent.sh"),
+        run_id,
+        task_id,
+    ]
+    option_values = (
+        ("--worker", args.worker_backend),
+        ("--runtime", args.runtime_backend),
+        ("--io", args.io_mode),
+        ("--permission", args.permission_mode),
+        ("--agent-name", args.agent_name),
+        ("--session-id", args.session_id),
+        ("--worker-id", args.worker_id),
+    )
+    for option, value in option_values:
+        if value:
+            command.extend((option, value))
+    if args.execution_mode != "auto":
+        command.extend(("--execution-mode", args.execution_mode))
+    if args.phase != "auto":
+        command.extend(("--phase", args.phase))
+
+    dispatch_exit_code = _run_task_dispatch(command, root)
+    result = _resume_result(
+        path,
+        status,
+        existing_attempt_ids,
+        dispatch_exit_code,
+        args.execution_mode,
+    )
+    print(json.dumps(result, indent=2))
+    return dispatch_exit_code
+
+
 def _preview_dispatch_phase(
     task_path: Path, status: dict[str, Any], requested_phase: str
 ) -> str:
@@ -3520,6 +3711,16 @@ def build_parser() -> argparse.ArgumentParser:
         command = strategy.add_parser(name); command.add_argument("--task-dir", required=True); command.add_argument("--revision", type=int, required=True); command.add_argument("--reviewer", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=strategy_review)
     tasks = areas.add_parser("task").add_subparsers(dest="task_action", required=True)
     command = tasks.add_parser("review"); command.add_argument("--task-dir", required=True); command.add_argument("--decision", choices=("approved", "changes_requested", "failed"), required=True); command.add_argument("--reviewer", required=True); command.add_argument("--findings-file", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=task_review)
+    command = tasks.add_parser("revise"); command.add_argument("--task-dir", required=True); command.add_argument("--reviewer", required=True); command.add_argument("--findings-file", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=task_revise)
+    command = tasks.add_parser("resume"); command.add_argument("--task-dir", required=True)
+    command.add_argument("--worker-backend", choices=("claude-code", "codex", "opencode", "kimi-code"), default="")
+    command.add_argument("--runtime-backend", choices=("plain", "tmux"), default="")
+    command.add_argument("--io-mode", choices=("machine", "human"), default="")
+    command.add_argument("--permission-mode", choices=("default", "auto", "yolo"), default="")
+    command.add_argument("--agent-name", default=""); command.add_argument("--session-id", default=""); command.add_argument("--worker-id", default="")
+    command.add_argument("--execution-mode", choices=("auto", "start", "resume", "replace"), default="auto")
+    command.add_argument("--phase", choices=("auto", "planning", "execution"), default="auto")
+    command.set_defaults(func=task_resume)
     command = tasks.add_parser("preview-prompt"); command.add_argument("--task-dir", required=True); command.add_argument("--worker-backend", choices=("claude-code", "codex", "opencode", "kimi-code"), default=""); command.add_argument("--execution-mode", choices=("auto", "start", "resume", "replace"), default="auto"); command.add_argument("--phase", choices=("auto", "planning", "execution"), default="auto"); command.add_argument("--body-only", action="store_true"); command.set_defaults(func=task_preview_prompt)
     command = tasks.add_parser("merge"); command.add_argument("--task-dir", required=True); command.add_argument("--target-worktree", required=True); command.add_argument("--expected-commit", default=""); command.add_argument("--verify-command", action="append", default=[]); command.add_argument("--verification-timeout", type=float, default=300); command.add_argument("--coordinator", required=True); command.set_defaults(func=task_merge)
     workflows = areas.add_parser("workflow").add_subparsers(dest="workflow_action", required=True)

@@ -8,7 +8,7 @@ Coordinator-only commands:
 
 ```text
 rdo strategy approve|changes
-rdo task review|merge
+rdo task review|revise|resume|merge
 rdo worker message|interrupt|terminate
 rdo status
 ```
@@ -268,6 +268,47 @@ An `approved` v2 decision binds the exact clean task-branch commit, source
 branch, run target branch/commit, task inputs, handoff, evidence, and READY
 digests. Merge rejects any task commit or reviewed artifact changed after
 approval.
+
+### revise and resume
+
+Use the public revision-cycle commands after a coordinator has written findings
+for a task in `review`:
+
+```bash
+python scripts/rdo.py task revise \
+  --task-dir <task-dir> \
+  --reviewer <coordinator-id> \
+  --findings-file <task-local-review-file>
+
+python scripts/rdo.py task preview-prompt --task-dir <task-dir>
+
+python scripts/rdo.py task resume \
+  --task-dir <task-dir> \
+  [--worker-backend claude-code|codex|opencode|kimi-code] \
+  [--runtime-backend plain|tmux] \
+  [--io-mode machine|human] \
+  [--permission-mode default|auto|yolo] \
+  [--execution-mode auto|start|resume|replace] \
+  [--phase auto|planning|execution]
+```
+
+`task revise` is a narrow alias for
+`task review --decision changes_requested`; it creates the same immutable,
+digest-bound decision and uses the same events and FSM transition. It does not
+create a second revision protocol.
+
+`task resume` accepts only `blocked` or `changes_requested`, rejects an active
+dispatch lock and an unsafe task identity before mutation, then invokes the
+canonical `dispatch_agent.sh` entrypoint. Omitted options continue to use
+project configuration and dispatch auto-selection. The command does not edit
+task or session metadata itself and does not send a second worker message:
+digest-bound review findings already enter the existing resume delta.
+
+The final JSON is derived from the newly selected `ATTEMPT.json`, not from
+`preview-prompt`. It reports the requested and actual execution modes, any
+resume fallback, backend, phase, attempt ID, worker result, and dispatch exit
+code. Child dispatch output is streamed to stderr so stdout contains one
+machine-readable result. `task resume` returns the dispatch exit code.
 
 ### merge
 

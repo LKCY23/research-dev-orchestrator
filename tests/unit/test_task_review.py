@@ -3,8 +3,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from rdo import task_review
+from rdo import task_revise, task_review
 
 
 class TaskReviewTests(unittest.TestCase):
@@ -83,6 +84,22 @@ class TaskReviewTests(unittest.TestCase):
                         note=[],
                     )
                 )
+
+    def test_revise_is_a_thin_changes_requested_review_alias(self):
+        arguments = argparse.Namespace(
+            task_dir="/task",
+            reviewer="coordinator",
+            findings_file="/task/review.md",
+            note=["one note"],
+        )
+        with patch("rdo.task_review", return_value=0) as review:
+            self.assertEqual(0, task_revise(arguments))
+        submitted = review.call_args.args[0]
+        self.assertEqual("changes_requested", submitted.decision)
+        self.assertEqual(arguments.task_dir, submitted.task_dir)
+        self.assertEqual(arguments.reviewer, submitted.reviewer)
+        self.assertEqual(arguments.findings_file, submitted.findings_file)
+        self.assertEqual(arguments.note, submitted.note)
 
 
 if __name__ == "__main__":

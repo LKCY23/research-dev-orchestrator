@@ -178,6 +178,8 @@ $research-dev-orchestrator create-task run=<run-id> task=<task-id> goal="<text>"
 $research-dev-orchestrator dispatch run=<run-id> task=<task-id> [backend=plain|tmux] [timeout=<seconds>]
 $research-dev-orchestrator status run=<run-id> [json] [summary] [dashboard] [diagnostics]
 $research-dev-orchestrator review run=<run-id> task=<task-id>
+$research-dev-orchestrator revise run=<run-id> task=<task-id> findings=<task-local-file>
+$research-dev-orchestrator resume run=<run-id> task=<task-id>
 $research-dev-orchestrator merge run=<run-id> task=<task-id> target-worktree=<path> [commit=<sha>]
 $research-dev-orchestrator recover-lock run=<run-id> task=<task-id>
 $research-dev-orchestrator close run=<run-id> summary="<text>" [changed="<text>"] [next="<text>"]
@@ -208,6 +210,15 @@ requires an explicit user-authorized decision and a non-empty task-local
 findings file, records an immutable digest-bound decision, performs only the
 legal `review -> approved|changes_requested|failed` transition, and makes
 `changes_requested` feedback available to later worker prompts.
+
+`rdo.py task revise` reuses that review primitive with
+`decision=changes_requested`. `rdo.py task resume` validates revision-cycle
+eligibility and then invokes `dispatch_agent.sh`; dispatch remains the sole
+owner of backend preflight, session selection, compact resume, fallback, and
+attempt creation. Use `task preview-prompt` when desired, then call `task
+resume` without separately messaging the worker. Treat the new
+`ATTEMPT.json`, not the preview candidate, as the source of truth for the
+actual execution mode and fallback.
 
 `rdo.py task merge` is the coordinator-owned merge mutation. It derives the
 approved source and run target from protocol state, permits only a clean
