@@ -71,6 +71,33 @@ consumers resolve the current attempt and validate its exact
 `runtime/HANDOFF_READY.json` bindings. They never fall back to task-root
 handoff/evidence files.
 
+## Derived status projection
+
+`rdo status` and `collect_status.py` expose a read-only `projection` or
+`status_projection`; it is never written back to `STATUS.json`. Its source
+boundaries are explicit:
+
+```text
+projection.task                  <- STATUS.json task/FSM fields
+projection.attempt               <- current ATTEMPT.json lifecycle/outcome
+projection.publication           <- current attempt's validated v2 bundle
+projection.previous_publication  <- latest earlier validated v2 bundle
+projection.display               <- summary plus current/previous attribution
+```
+
+For v2, `compatibility.status_summary_authoritative` and
+`status_evidence_authoritative` are always false. A missing, partial, rejected,
+or invalid current publication never falls back to those STATUS fields. An
+earlier valid publication may be shown while a newer attempt is active, but it
+is identified by `relation = previous` and its own `attempt_id`. Evidence
+availability and counts are attributed to the publication attempt, not the
+current worker by implication.
+
+The raw `status` record remains visible in `rdo status` for compatibility.
+Machine consumers should use `projection`; `collect_status.py` derives its
+task summary and renderers from the same projection. Recognized legacy routes
+retain their historical STATUS/task-root handoff summary behavior.
+
 Optional cumulative task budgets do not add fields to mutable `STATUS.json` or
 new FSM states. `rdo status` and `collect_status.py` derive a `task_budget`
 projection from frozen attempt/deadline/usage evidence. It reports limits,

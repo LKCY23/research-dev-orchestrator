@@ -246,6 +246,12 @@ machine acknowledgement.
 
 `collect_status.py` is read-only by default. It must not modify `STATUS.json`, delete locks, change FSM state, or repair violations. `--write-summary` may update only `SUMMARY.md`; `--write-diagnostics` may write only diagnostics files.
 
+For Artifact Protocol v2, consume `status_projection` (or `projection` from
+`rdo status`) for attempt outcome, publication, summary, and evidence display.
+Do not treat compatibility `STATUS.summary` or `STATUS.evidence` as current
+worker results. Earlier valid publications are usable context only when marked
+`previous` with their original attempt ID.
+
 `render_dashboard.py` writes only derived `dashboard.html` by reading the same status report as `collect_status.py`. It must not mutate protocol truth.
 
 `remove_dispatch_lock.py` is a user-approved mechanical recovery tool. Use it only after a Lock Recovery Review and explicit user confirmation. It snapshots `.dispatch-lock`, removes only `.dispatch-lock`, and appends `dispatch_lock_removed`; it must not modify `STATUS.json`, `ATTEMPT.json`, `LOCK`, the attempt-local handoff/evidence bundle, or FSM state.

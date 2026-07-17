@@ -187,6 +187,16 @@ required observation produces a machine-readable `budget` admission blocker
 and no new attempt directory. `rdo status` and `collect_status.py` expose this
 derived diagnosis without adding a cumulative-budget state to the task FSM.
 
+## Status projection boundary
+
+Monitoring does not copy attempt results back into task truth. For v2,
+`STATUS.json` supplies the task FSM and current attempt pointer,
+`ATTEMPT.json` supplies lifecycle/outcome, and only a digest-valid current
+attempt bundle supplies publication summary and evidence. If a newer attempt
+has no valid publication, monitoring may expose the latest valid earlier bundle
+only as `previous_publication` with its original attempt ID. Rejected, partial,
+and invalid current bytes remain explicitly non-published.
+
 ## Attempt States
 
 - `created`: `ATTEMPT.json` exists, but the worker has not been launched yet. This should be brief; stale `created` attempts should be reported as warnings.

@@ -214,6 +214,13 @@ diagnostics  -> --write-diagnostics
 
 `collect_status.py` is read-only except for derived `SUMMARY.md` and diagnostics outputs.
 `render_dashboard.py` writes only derived `dashboard.html`.
+For v2, JSON output includes `status_projection`; summaries and the dashboard
+use its attempt-attributed display fields rather than `STATUS.summary` or
+`STATUS.evidence`. A previous publication is labeled with its attempt ID.
+
+For a single task, `python scripts/rdo.py status --task-dir <task-dir>` returns
+the same canonical projection under `projection`. Its separate raw `status`
+member is the compatibility record and is not the v2 result/evidence source.
 
 ### review
 

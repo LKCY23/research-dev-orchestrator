@@ -46,6 +46,7 @@ from task_budget import (
     attempt_budget_binding_reasons,
     attempt_budget_receipt_reasons,
 )
+from status_projection import resolve_status_projection
 
 
 def load_events(run_dir: Path, run_id: str) -> tuple[list[dict[str, Any]], list[str], list[str]]:
@@ -985,24 +986,6 @@ def collect(
                         if status.get("state") != "running":
                             warnings.append(f"{task_dir.name}: .dispatch-lock pid is not alive: {pid}")
 
-        handoff_index: dict[str, Any] | None = None
-        artifact_resolution: dict[str, Any]
-        try:
-            resolved_artifacts = resolve_task_artifacts(task_dir, status)
-        except ArtifactResolutionError as exc:
-            violations.append(f"{task_dir.name}: artifact resolution failed: {exc}")
-            artifact_resolution = {
-                "valid": False,
-                "protocol": status.get("artifact_protocol_version"),
-                "error": str(exc),
-            }
-        else:
-            handoff_index = resolved_artifacts.handoff_index
-            artifact_resolution = {"valid": True, **resolved_artifacts.as_dict()}
-            warnings.extend(
-                f"{task_dir.name}: {warning}" for warning in resolved_artifacts.warnings
-            )
-
         attempt = None
         current_attempt_id = status.get("current_attempt_id")
         if isinstance(current_attempt_id, str) and current_attempt_id:
@@ -1013,6 +996,32 @@ def collect(
                 loaded_attempt = None
             if isinstance(loaded_attempt, dict):
                 attempt = loaded_attempt
+
+        handoff_index: dict[str, Any] | None = None
+        projection_result = resolve_status_projection(
+            task_dir,
+            status,
+            attempt=attempt,
+        )
+        status_projection = projection_result.projection
+        artifact_resolution: dict[str, Any]
+        if projection_result.error is not None:
+            violations.append(
+                f"{task_dir.name}: artifact resolution failed: {projection_result.error}"
+            )
+            artifact_resolution = {
+                "valid": False,
+                "protocol": status.get("artifact_protocol_version"),
+                "error": projection_result.error,
+            }
+        else:
+            resolved_artifacts = projection_result.artifacts
+            assert resolved_artifacts is not None
+            handoff_index = resolved_artifacts.handoff_index
+            artifact_resolution = {"valid": True, **resolved_artifacts.as_dict()}
+            warnings.extend(
+                f"{task_dir.name}: {warning}" for warning in resolved_artifacts.warnings
+            )
 
         task_budget = None
         if status_uses_v2(status) and (task_dir / "EXECUTION_POLICY.json").is_file():
@@ -1041,7 +1050,9 @@ def collect(
                 "needs_coordinator": status.get("needs_coordinator"),
                 "blocker_type": status.get("blocker_type"),
                 "blocking_reason": status.get("blocking_reason"),
-                "summary": status.get("summary"),
+                "summary": status_projection["display"]["summary"],
+                "summary_relation": status_projection["display"]["summary_relation"],
+                "summary_attempt_id": status_projection["display"]["summary_attempt_id"],
                 "current_attempt": (
                     {
                         "attempt_id": attempt.get("attempt_id"),
@@ -1056,6 +1067,7 @@ def collect(
                     else None
                 ),
                 **({"task_budget": task_budget} if status_uses_v2(status) else {}),
+                "status_projection": status_projection,
                 "handoff_index": handoff_index,
                 "artifact_resolution": artifact_resolution,
                 "lock": lock_info,
@@ -1100,6 +1112,34 @@ def render_human(report: dict[str, Any]) -> str:
     lines.append("Tasks:")
     for task in report["tasks"]:
         blocker = f" blocker={task['blocker_type']}" if task.get("blocker_type") else ""
+        projection = task.get("status_projection")
+        publication = (
+            projection.get("publication") if isinstance(projection, dict) else None
+        )
+        publication_state = (
+            publication.get("state") if isinstance(publication, dict) else None
+        )
+        publication_label = (
+            f" publication={publication_state}" if publication_state else ""
+        )
+        evidence = (
+            publication.get("evidence") if isinstance(publication, dict) else None
+        )
+        evidence_label = (
+            f" evidence={'yes' if evidence.get('available') else 'no'}"
+            if isinstance(evidence, dict)
+            else ""
+        )
+        previous = (
+            projection.get("previous_publication")
+            if isinstance(projection, dict)
+            else None
+        )
+        previous_label = (
+            f" previous_publication={previous.get('attempt_id')}"
+            if isinstance(previous, dict) and previous.get("attempt_id")
+            else ""
+        )
         handoff = ""
         if isinstance(task.get("handoff_index"), dict) and not task["handoff_index"].get("template"):
             handoff = " handoff_json=yes"
@@ -1107,7 +1147,8 @@ def render_human(report: dict[str, Any]) -> str:
         dispatch_lock = " dispatch_lock=yes" if task.get("dispatch_lock") else ""
         lines.append(
             f"  {task['task_id']}: {task['state']} attempt={task.get('current_attempt_id')}"
-            f"{blocker}{handoff}{lock}{dispatch_lock}"
+            f"{blocker}{publication_label}{evidence_label}{previous_label}"
+            f"{handoff}{lock}{dispatch_lock}"
         )
 
     if report["protocol_violations"]:
@@ -1146,8 +1187,16 @@ def render_summary(report: dict[str, Any]) -> str:
     for task in report["tasks"]:
         review = "ready" if task["state"] == "review" else ""
         handoff_summary = ""
-        if isinstance(task.get("handoff_index"), dict) and not task["handoff_index"].get("template"):
-            handoff_summary = str(task["handoff_index"].get("summary") or "")[:80]
+        summary = str(task.get("summary") or "")
+        if summary:
+            relation = task.get("summary_relation")
+            attempt_id = task.get("summary_attempt_id")
+            prefix = (
+                f"previous {attempt_id}: "
+                if relation == "previous" and attempt_id
+                else ""
+            )
+            handoff_summary = (prefix + summary)[:80]
         rows.append(
             f"| {task['task_id']} | {task['state']} | {task.get('owner') or ''} | "
             f"{task.get('current_attempt_id') or ''} | {handoff_summary} | {task.get('blocker_type') or ''} | {review} |"

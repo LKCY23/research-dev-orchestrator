@@ -54,6 +54,25 @@ def render_task_card(run_dir: Path, task: dict[str, Any]) -> str:
         if requested_state:
             handoff_meta = f"<span>requested: {esc(requested_state)}</span>"
 
+    projection = task.get("status_projection")
+    publication = projection.get("publication") if isinstance(projection, dict) else None
+    publication_state = (
+        publication.get("state") if isinstance(publication, dict) else None
+    )
+    publication_meta = (
+        f"<span>publication: {esc(publication_state)}</span>"
+        if publication_state
+        else ""
+    )
+    summary = str(task.get("summary") or handoff_summary or "")
+    summary_relation = task.get("summary_relation")
+    summary_attempt_id = task.get("summary_attempt_id")
+    summary_prefix = (
+        f"<strong>Previous {esc(summary_attempt_id)}:</strong> "
+        if summary_relation == "previous" and summary_attempt_id
+        else ""
+    )
+
     blocker = ""
     if task.get("blocker_type") or task.get("blocking_reason"):
         blocker = (
@@ -111,11 +130,12 @@ def render_task_card(run_dir: Path, task: dict[str, Any]) -> str:
           <h3>{rel_link(run_dir, task_dir / "TASK.md", task_id)}</h3>
           <span class="pill {css}">{esc(state)}</span>
         </div>
-        <p class="summary">{esc(task.get("summary") or handoff_summary or "No summary yet.")}</p>
+        <p class="summary">{summary_prefix}{esc(summary or "No summary yet.")}</p>
         <div class="meta">
           <span>attempt: {esc(task.get("current_attempt_id") or "-")}</span>
           <span>owner: {esc(task.get("owner") or "-")}</span>
           <span>artifacts: {esc(protocol_label)}</span>
+          {publication_meta}
           {handoff_meta}
         </div>
         {blocker}

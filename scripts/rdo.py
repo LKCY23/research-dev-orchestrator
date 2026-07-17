@@ -66,6 +66,7 @@ from strategy import (
     review_strategy,
     submit_strategy,
 )
+from status_projection import resolve_status_projection
 from supervisor import (
     audit_supervision_token,
     run_supervised,
@@ -3303,6 +3304,7 @@ def status_action(args: argparse.Namespace) -> int:
     status = load_json(path / "STATUS.json")
     attempt_id = status.get("current_attempt_id")
     payload: dict[str, Any] = {
+        "projection": None,
         "status": status,
         "attempt": None,
         "supervisor": None,
@@ -3352,6 +3354,11 @@ def status_action(args: argparse.Namespace) -> int:
             path = runtime_dir / filename
             if path.exists():
                 payload[key] = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    payload["projection"] = resolve_status_projection(
+        path,
+        status,
+        attempt=payload["attempt"],
+    ).projection
     print(json.dumps(payload, indent=2))
     return 0
 

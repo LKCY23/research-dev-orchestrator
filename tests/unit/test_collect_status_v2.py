@@ -12,11 +12,15 @@ from artifact_bundle import artifact_binding, file_sha256, publish_bundle
 from collect_status import (
     collect,
     load_events,
+    render_human,
+    render_summary,
     validate_approved_task,
     validate_attempt,
     validate_merged_task,
 )
 from protocol import PACKAGE_VERSION, PROTOCOL_VERSION, utc_now
+from render_dashboard import render_task_card
+from status_projection import resolve_status_projection
 from task_contract import TASK_INPUT_FILENAMES, build_task_inputs_payload
 
 
@@ -355,6 +359,242 @@ class CollectStatusV2Tests(unittest.TestCase):
                 },
             )
         return task, status, commit, binding
+
+    def add_attempt(
+        self,
+        task: Path,
+        attempt_id: str,
+        commit: str,
+        *,
+        state: str = "running",
+        outcome: str | None = None,
+    ) -> Path:
+        attempt = task / "attempts" / attempt_id
+        attempt.mkdir(parents=True)
+        inputs = build_task_inputs_payload(
+            task_id="T001",
+            attempt_id=attempt_id,
+            source_bytes={name: f"{name}\n".encode() for name in TASK_INPUT_FILENAMES},
+            task_base_commit=commit,
+            resolved_dependencies=[],
+        )
+        self.write_json(attempt / "TASK_INPUTS.json", inputs)
+        inputs_digest = hashlib.sha256(
+            (attempt / "TASK_INPUTS.json").read_bytes()
+        ).hexdigest()
+        payload = {
+            "schema_version": 2,
+            "artifact_protocol_version": 2,
+            "task_id": "T001",
+            "attempt_id": attempt_id,
+            "task_inputs_ref": "TASK_INPUTS.json",
+            "task_inputs_sha256": inputs_digest,
+            "state": state,
+            "phase": "execution",
+            "handoff_valid": False,
+            "handoff_state": None,
+        }
+        if outcome is not None:
+            payload["outcome"] = outcome
+        self.write_json(attempt / "ATTEMPT.json", payload)
+        return attempt
+
+    def test_v2_projection_ignores_stale_status_result_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = self.make_run(root, 2)
+            status_path = run / "tasks" / "T001" / "STATUS.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status["summary"] = "stale previous result"
+            status["evidence"] = {
+                "commands_run": ["stale command"],
+                "logs": [],
+                "passed": True,
+            }
+            self.write_json(status_path, status)
+            before = status_path.read_bytes()
+
+            with patch("collect_status.repo_root", return_value=root):
+                report = collect("run", 24)
+
+            task = report["tasks"][0]
+            projection = task["status_projection"]
+            self.assertEqual("", task["summary"])
+            self.assertEqual("none", task["summary_relation"])
+            self.assertEqual("unpublished", projection["publication"]["state"])
+            self.assertFalse(
+                projection["compatibility"]["status_summary_authoritative"]
+            )
+            self.assertFalse(
+                projection["compatibility"]["status_evidence_authoritative"]
+            )
+            self.assertNotIn("stale previous result", render_summary(report))
+            self.assertIn("publication=unpublished", render_human(report))
+            self.assertIn("evidence=no", render_human(report))
+            self.assertEqual(before, status_path.read_bytes())
+
+    def test_v2_projection_attributes_current_and_previous_publications(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, status, commit, _binding = self.make_published_task(
+                root,
+                profile="direct",
+                state="approved",
+            )
+            status["summary"] = "stale STATUS summary"
+            self.write_json(task / "STATUS.json", status)
+
+            current = resolve_status_projection(task, status).projection
+            self.assertEqual("published", current["publication"]["state"])
+            self.assertEqual("A001", current["publication"]["attempt_id"])
+            self.assertEqual("current", current["display"]["summary_relation"])
+            self.assertEqual(
+                "Frozen collect-status fixture.",
+                current["display"]["summary"],
+            )
+
+            self.add_attempt(task, "A002", commit)
+            status.update(state="running", current_attempt_id="A002")
+            self.write_json(task / "STATUS.json", status)
+            before = {
+                path.relative_to(task): path.read_bytes()
+                for path in task.rglob("*")
+                if path.is_file()
+            }
+
+            resumed = resolve_status_projection(task, status).projection
+            self.assertEqual("unpublished", resumed["publication"]["state"])
+            self.assertEqual("A002", resumed["publication"]["attempt_id"])
+            self.assertEqual(
+                "A001", resumed["previous_publication"]["attempt_id"]
+            )
+            self.assertEqual("previous", resumed["display"]["summary_relation"])
+            self.assertEqual("A001", resumed["display"]["summary_attempt_id"])
+            self.assertEqual(
+                "Frozen collect-status fixture.",
+                resumed["display"]["summary"],
+            )
+            card = render_task_card(
+                task.parent.parent,
+                {
+                    "task_id": "T001",
+                    "state": "running",
+                    "owner": "worker",
+                    "current_attempt_id": "A002",
+                    "summary": resumed["display"]["summary"],
+                    "summary_relation": resumed["display"]["summary_relation"],
+                    "summary_attempt_id": resumed["display"]["summary_attempt_id"],
+                    "status_projection": resumed,
+                    "artifact_resolution": {
+                        "valid": True,
+                        "protocol": "v2",
+                        "artifact_refs": {},
+                    },
+                },
+            )
+            self.assertIn("Previous A001:", card)
+            self.assertNotIn("stale STATUS summary", card)
+            after = {
+                path.relative_to(task): path.read_bytes()
+                for path in task.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(before, after)
+
+            historical_path = task / "attempts" / "A001" / "ATTEMPT.json"
+            historical = json.loads(historical_path.read_text(encoding="utf-8"))
+            historical.update(state="invalid_handoff", handoff_valid=False)
+            self.write_json(historical_path, historical)
+            rejected_history = resolve_status_projection(task, status).projection
+            self.assertIsNone(rejected_history["previous_publication"])
+            self.assertEqual("none", rejected_history["display"]["summary_relation"])
+
+    def test_v2_projection_never_promotes_rejected_or_invalid_publication(self):
+        for publication_state in ("rejected", "invalid"):
+            with self.subTest(publication_state=publication_state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                task, status, commit, _binding = self.make_published_task(
+                    root,
+                    profile="direct",
+                    state="approved",
+                )
+                if publication_state == "invalid":
+                    attempt = self.add_attempt(
+                        task,
+                        "A002",
+                        commit,
+                        state="completed",
+                    )
+                    status.update(
+                        state="verified",
+                        previous_state="running",
+                        current_attempt_id="A002",
+                    )
+                    self.write_json(
+                        attempt / "runtime" / "HANDOFF_READY.json",
+                        {"schema_version": 2},
+                    )
+                else:
+                    self.add_attempt(
+                        task,
+                        "A002",
+                        commit,
+                        state="invalid_handoff",
+                        outcome="timed_out_unfinalized",
+                    )
+                    status.update(
+                        state="blocked",
+                        previous_state="running",
+                        current_attempt_id="A002",
+                        blocker_type="budget",
+                        blocking_reason="attempt timed out",
+                    )
+                self.write_json(task / "STATUS.json", status)
+
+                projection = resolve_status_projection(task, status).projection
+                self.assertEqual(
+                    publication_state,
+                    projection["publication"]["state"],
+                )
+                self.assertFalse(projection["publication"]["valid"])
+                self.assertFalse(
+                    projection["publication"]["evidence"]["available"]
+                )
+                self.assertEqual(
+                    "A001", projection["previous_publication"]["attempt_id"]
+                )
+                self.assertEqual(
+                    "previous", projection["display"]["summary_relation"]
+                )
+
+    def test_legacy_projection_preserves_status_or_task_root_handoff_summary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            task = Path(temporary) / "tasks" / "T001"
+            task.mkdir(parents=True)
+            status = {
+                "task_id": "T001",
+                "artifact_protocol_version": 1,
+                "state": "pending",
+                "summary": "legacy STATUS summary",
+            }
+            self.write_json(task / "STATUS.json", status)
+            self.write_json(
+                task / "HANDOFF.json",
+                {"_template": False, "summary": "legacy handoff summary"},
+            )
+
+            projection = resolve_status_projection(task, status).projection
+            self.assertEqual("legacy-v1", projection["protocol"])
+            self.assertEqual(
+                "legacy STATUS summary", projection["display"]["summary"]
+            )
+            self.assertEqual(
+                "legacy_status_or_handoff",
+                projection["display"]["summary_relation"],
+            )
+            self.assertTrue(
+                projection["compatibility"]["status_summary_authoritative"]
+            )
 
     def test_v2_pending_task_is_explicitly_unpublished_not_legacy(self):
         with tempfile.TemporaryDirectory() as temporary:
