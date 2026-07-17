@@ -67,6 +67,8 @@ Each backend definition has two separate sections.
 
 It also declares `usage_observability.machine` and `usage_observability.human`: the exact normalized metrics that adapter can extract from structured events. This is a capability contract, not a best-effort hint. A strategy hard budget that names an undeclared metric is rejected before dispatch.
 
+The contract describes public adapter output, not private backend session files. For example, Codex machine mode declares only terminal `input_tokens` and `output_tokens`; one `turn.completed` event is not treated as a count of the backend's internal model calls, and token totals are not reinterpreted as context-window occupancy.
+
 ### Capabilities
 
 Capabilities describe facts about the installed adapter. They do not grant

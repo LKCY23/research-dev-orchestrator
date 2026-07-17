@@ -83,7 +83,7 @@ dispatcher exit code; it must not overwrite a later coordinator-owned state.
 
 `workflow_carried_forward` is also a dispatch event. It identifies `source_attempt_id`, `source_workflow_id`, the target `workflow_id`, and `checkpoint_sha256`; it may satisfy target workflow dependencies exactly like `workflow_completed`.
 
-Attempt-local `runtime/USAGE.ndjson` is a separate high-volume ledger, not part of the run timeline. Each normalized `model_usage` record includes a stable source event when available, per-turn values, cumulative totals, and `no_progress_turns`. Hard failures are also written to `runtime/VIOLATIONS.ndjson` as `resource_budget_exceeded`.
+Attempt-local `runtime/USAGE.ndjson` is a separate high-volume ledger, not part of the run timeline. Each normalized `model_usage` record includes a stable source event when available, the metrics actually observed on that event, cumulative totals, and `no_progress_turns`. Codex terminal metrics that were not observed are JSON `null`, not zero. Hard failures are written to `runtime/VIOLATIONS.ndjson` as `resource_budget_exceeded`; a declared hard metric missing from the terminal stream is `usage_observation_missing`.
 
 `dispatch_lock_removed` records a user-approved recovery action that removed a stale `.dispatch-lock`. It must include `task_id`, should include `attempt_id` when known, and should include `reason` plus a diagnostics `snapshot` path.
 

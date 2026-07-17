@@ -179,6 +179,21 @@ class BackendGovernanceTests(unittest.TestCase):
         with self.assertRaisesRegex(BackendGovernanceError, "not observable"):
             require_resource_observability(profile, "human")
 
+    def test_codex_only_declares_public_terminal_token_metrics(self):
+        profile = self.compile_codex()
+        self.assertEqual(
+            ["input_tokens", "output_tokens"],
+            profile["usage_observability"]["machine"],
+        )
+        profile["resource_budget"] = {"max_input_tokens": 1000}
+        require_resource_observability(profile, "machine")
+        profile["resource_budget"] = {"max_model_turns": 2}
+        with self.assertRaisesRegex(BackendGovernanceError, "model_turns"):
+            require_resource_observability(profile, "machine")
+        profile["resource_budget"] = {"max_context_tokens": 1000}
+        with self.assertRaisesRegex(BackendGovernanceError, "context_tokens"):
+            require_resource_observability(profile, "machine")
+
     def test_materialize_writes_attempt_local_settings_and_hooks(self):
         runtime = self.root / "attempt" / "runtime"
         result = materialize_backend_profile(self.compile(), runtime)

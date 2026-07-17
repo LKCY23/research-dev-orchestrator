@@ -11,7 +11,7 @@ native_parallel_agent_limit = true
 native_agent_depth_limit = true
 
 [usage_observability]
-machine = ["model_turns", "input_tokens", "output_tokens", "context_tokens"]
+machine = ["input_tokens", "output_tokens"]
 human = []
 
 [governance]

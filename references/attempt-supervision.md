@@ -70,9 +70,11 @@ failures from being reported as task implementation failures.
   source and activates a final deadline equal to the original execution
   deadline plus 90 seconds by default, so early entry never shortens the
   attempt and entry near cutoff still receives the full grace.
-- Resource usage: structured model turns are normalized to `runtime/USAGE.ndjson`; configured turn/token/cost/context and no-progress limits terminate the attempt with exit 125.
+- Resource usage: structured public backend events are normalized to `runtime/USAGE.ndjson`; configured observable limits terminate the attempt with exit 125. Codex's terminal-only adapter reports a metric that was absent from its event stream as missing, never as numeric zero.
 
 Resource limits are enabled only when explicitly present in the approved strategy. Backend definitions declare metric observability separately for `machine` and `human`; dispatch fails closed if a hard metric is unavailable. OpenCode's session event stream supports this in both modes. Other interactive TUI modes currently reject model-usage budgets because their adapters do not expose a reliable structured stream.
+
+Codex machine mode exposes `input_tokens` and `output_tokens` on its public terminal `turn.completed` JSONL event; its cached-input subset is retained as supplemental per-event data. It does not expose internal model-call count, context-window occupancy, or cost there, so RDO does not declare or synthesize those metrics. After a valid handoff freezes the candidate, the machine supervisor continues revalidating the publication/source while draining for that terminal event for at most five seconds (configurable only within a hard 30-second ceiling). It then performs the normal bounded process-tree cleanup. If the event is absent, the attempt records the metrics as missing; a configured Codex token limit fails closed because its required observation was unavailable.
 
 Claude Code or another backend may expose an inner tool timeout. That timeout
 is advisory only. Protocol safety comes from the attempt supervisor and the

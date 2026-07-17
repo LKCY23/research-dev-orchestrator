@@ -20,6 +20,14 @@ def _number(mapping: dict[str, Any], *keys: str) -> float:
     return 0.0
 
 
+def _observed_number(mapping: dict[str, Any], *keys: str) -> tuple[float | None, bool]:
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            return float(value), True
+    return None, False
+
+
 def _event_id(payload: dict[str, Any], info: dict[str, Any]) -> str:
     for mapping in (info, payload.get("message") or {}, payload.get("item") or {}, payload):
         if isinstance(mapping, dict):
@@ -31,7 +39,12 @@ def _event_id(payload: dict[str, Any], info: dict[str, Any]) -> str:
 
 
 def normalize_usage_event(backend: str, payload: Any) -> dict[str, Any] | None:
-    """Return one completed model-turn usage record, or a cost-only terminal record."""
+    """Return one public structured-usage observation.
+
+    Missing metrics remain ``None``. In particular, Codex's public JSONL
+    ``turn.completed`` event reports terminal token totals but does not expose
+    internal model-call count or context-window occupancy.
+    """
     if not isinstance(payload, dict):
         return None
     event_type = str(payload.get("type") or "")
@@ -59,10 +72,11 @@ def normalize_usage_event(backend: str, payload: Any) -> dict[str, Any] | None:
             return {
                 "event_id": _event_id(payload, info) or "terminal-result",
                 "source_event": event_type,
-                "model_turns": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "context_tokens": 0,
+                "observed_metrics": ["cost_usd"],
+                "model_turns": None,
+                "input_tokens": None,
+                "output_tokens": None,
+                "context_tokens": None,
                 "cost_usd": cost,
             }
         return None
@@ -77,6 +91,32 @@ def normalize_usage_event(backend: str, payload: Any) -> dict[str, Any] | None:
         if isinstance(candidate, dict):
             usage = candidate
             break
+    if backend == "codex":
+        input_tokens, input_observed = _observed_number(
+            usage, "input_tokens", "inputTokens", "prompt_tokens", "input"
+        )
+        output_tokens, output_observed = _observed_number(
+            usage, "output_tokens", "outputTokens", "completion_tokens", "output"
+        )
+        cached_tokens, cached_observed = _observed_number(
+            usage, "cached_input_tokens", "cache_read_input_tokens", "cache_read_tokens"
+        )
+        observed_metrics = []
+        if input_observed:
+            observed_metrics.append("input_tokens")
+        if output_observed:
+            observed_metrics.append("output_tokens")
+        return {
+            "event_id": _event_id(payload, info) or "terminal-turn",
+            "source_event": event_type,
+            "observed_metrics": observed_metrics,
+            "model_turns": None,
+            "input_tokens": int(input_tokens) if input_observed else None,
+            "output_tokens": int(output_tokens) if output_observed else None,
+            "cached_input_tokens": int(cached_tokens) if cached_observed else None,
+            "context_tokens": None,
+            "cost_usd": None,
+        }
     cache = usage.get("cache") if isinstance(usage.get("cache"), dict) else {}
     input_tokens = _number(usage, "input_tokens", "inputTokens", "prompt_tokens", "input")
     output_tokens = _number(usage, "output_tokens", "outputTokens", "completion_tokens", "output")
@@ -90,6 +130,9 @@ def normalize_usage_event(backend: str, payload: Any) -> dict[str, Any] | None:
     return {
         "event_id": _event_id(payload, info),
         "source_event": event_type,
+        "observed_metrics": [
+            "model_turns", "input_tokens", "output_tokens", "context_tokens", "cost_usd"
+        ],
         "model_turns": 1,
         "input_tokens": int(input_tokens),
         "output_tokens": int(output_tokens),
@@ -107,6 +150,15 @@ class UsageSupervisor:
         self.budget = dict(budget)
         self.started = time.monotonic()
         self.seen: set[str] = set()
+        self.source_events: set[str] = set()
+        # Codex is the first adapter with an explicit public terminal-only
+        # observation contract. Preserve the established eager-zero summaries
+        # of other adapters until their telemetry contracts are redesigned.
+        self.observed_metrics: set[str] = (
+            set()
+            if backend == "codex"
+            else {"model_turns", "input_tokens", "output_tokens", "cost_usd", "context_tokens"}
+        )
         self.totals: dict[str, float] = {
             "model_turns": 0,
             "input_tokens": 0,
@@ -144,6 +196,30 @@ class UsageSupervisor:
         with (self.runtime / name).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
+    def _reported_totals(self) -> dict[str, float | None]:
+        return {
+            "model_turns": (
+                self.totals["model_turns"]
+                if "model_turns" in self.observed_metrics else None
+            ),
+            "input_tokens": (
+                self.totals["input_tokens"]
+                if "input_tokens" in self.observed_metrics else None
+            ),
+            "output_tokens": (
+                self.totals["output_tokens"]
+                if "output_tokens" in self.observed_metrics else None
+            ),
+            "cost_usd": (
+                self.totals["cost_usd"]
+                if "cost_usd" in self.observed_metrics else None
+            ),
+            "max_context_tokens": (
+                self.totals["max_context_tokens"]
+                if "context_tokens" in self.observed_metrics else None
+            ),
+        }
+
     def _violate(self, field: str, observed: float, limit: float) -> str:
         reason = f"resource budget exceeded: {field} observed={observed:g} limit={limit:g}"
         if self.exceeded is None:
@@ -177,22 +253,30 @@ class UsageSupervisor:
                 return None
             if record["event_id"]:
                 self.seen.add(identity)
-            self.totals["model_turns"] += record["model_turns"]
-            self.totals["input_tokens"] += record["input_tokens"]
-            self.totals["output_tokens"] += record["output_tokens"]
-            self.totals["cost_usd"] += record["cost_usd"]
-            self.totals["max_context_tokens"] = max(
-                self.totals["max_context_tokens"], record["context_tokens"]
-            )
+            self.source_events.add(record["source_event"])
+            self.observed_metrics.update(record.get("observed_metrics", []))
+            for metric in ("model_turns", "input_tokens", "output_tokens", "cost_usd"):
+                value = record.get(metric)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    self.totals[metric] += value
+            context_tokens = record.get("context_tokens")
+            if isinstance(context_tokens, (int, float)) and not isinstance(context_tokens, bool):
+                self.totals["max_context_tokens"] = max(
+                    self.totals["max_context_tokens"], context_tokens
+                )
             progress = self._progress_signature()
             if progress != self.last_progress:
                 self.last_progress = progress
                 self.no_progress_turns = 0
             else:
-                self.no_progress_turns += int(record["model_turns"])
+                turns = record.get("model_turns")
+                if isinstance(turns, (int, float)) and not isinstance(turns, bool):
+                    self.no_progress_turns += int(turns)
             self._append("USAGE.ndjson", {
                 "at": utc_now(), "backend": self.backend, "event": "model_usage",
-                **record, "totals": dict(self.totals), "no_progress_turns": self.no_progress_turns,
+                **record,
+                "totals": self._reported_totals(),
+                "no_progress_turns": self.no_progress_turns,
             })
             checks = {
                 "max_model_turns": self.totals["model_turns"],
@@ -208,7 +292,49 @@ class UsageSupervisor:
                     return self._violate(field, observed, float(limit))
             return None
 
+    def saw_source_event(self, *event_types: str) -> bool:
+        with self.lock:
+            return any(event_type in self.source_events for event_type in event_types)
+
+    def require_budget_observations(self) -> str | None:
+        """Fail closed when configured usage limits lack a terminal observation."""
+
+        field_metrics = {
+            "max_model_turns": "model_turns",
+            "max_input_tokens": "input_tokens",
+            "max_output_tokens": "output_tokens",
+            "max_cost_usd": "cost_usd",
+            "max_context_tokens": "context_tokens",
+            "max_no_progress_turns": "model_turns",
+        }
+        with self.lock:
+            if self.exceeded:
+                return self.exceeded
+            missing = sorted({
+                metric
+                for field, metric in field_metrics.items()
+                if field in self.budget and metric not in self.observed_metrics
+            })
+            if not missing:
+                return None
+            reason = "required usage observation missing: " + ", ".join(missing)
+            self.exceeded = reason
+            self._append("VIOLATIONS.ndjson", {
+                "at": utc_now(),
+                "backend": self.backend,
+                "event": "usage_observation_missing",
+                "hard": True,
+                "reason": reason,
+                "metrics": missing,
+            })
+            return reason
+
     def summary(self) -> dict[str, Any]:
         with self.lock:
-            return {"totals": dict(self.totals), "no_progress_turns": self.no_progress_turns,
-                    "budget_exceeded": self.exceeded}
+            return {
+                "totals": self._reported_totals(),
+                "observed_metrics": sorted(self.observed_metrics),
+                "source_events": sorted(self.source_events),
+                "no_progress_turns": self.no_progress_turns,
+                "budget_exceeded": self.exceeded,
+            }

@@ -594,6 +594,8 @@ def collect_attempt_metrics(task_dir: Path) -> tuple[list[dict[str, Any]], dict[
     violations: list[dict[str, Any]] = []
     ready_times: list[float] = []
     usage_observability: set[str] = set()
+    usage_declared_attempts: dict[str, set[str]] = {}
+    usage_observed_attempts: dict[str, set[str]] = {}
     context_attempt_ids: list[str] = []
     context_declared_attempts: list[str] = []
     context_initialized_attempts: list[str] = []
@@ -607,7 +609,12 @@ def collect_attempt_metrics(task_dir: Path) -> tuple[list[dict[str, Any]], dict[
         context_attempt_ids.append(attempt_id)
         supervisor_path = attempt_dir / "supervisor-result.json"
         supervisor = json_load(supervisor_path) if supervisor_path.is_file() else {}
-        usage = (supervisor.get("usage") or {}).get("totals") or {}
+        usage_summary = supervisor.get("usage") or {}
+        usage = usage_summary.get("totals") or {}
+        usage_observation_state_present = "observed_metrics" in usage_summary
+        observed_usage = {
+            str(item) for item in (usage_summary.get("observed_metrics") or [])
+        }
         elapsed = supervisor.get("elapsed_seconds")
         if not isinstance(elapsed, (int, float)):
             start, end = parse_iso(metadata.get("started_at")), parse_iso(metadata.get("ended_at"))
@@ -624,9 +631,21 @@ def collect_attempt_metrics(task_dir: Path) -> tuple[list[dict[str, Any]], dict[
         backend_profile_path = runtime / "BACKEND_PROFILE.json"
         backend_profile = json_load(backend_profile_path) if backend_profile_path.is_file() else {}
         runtime_mode = str((metadata.get("runtime") or {}).get("io_mode") or "machine")
-        observed = (backend_profile.get("usage_observability") or {}).get(runtime_mode) or []
-        if isinstance(observed, list):
-            usage_observability.update(str(item) for item in observed)
+        declared_usage = (
+            (backend_profile.get("usage_observability") or {}).get(runtime_mode) or []
+        )
+        if isinstance(declared_usage, list):
+            if (
+                not usage_observation_state_present
+                and metadata.get("backend_id") != "codex"
+            ):
+                observed_usage.update(str(item) for item in declared_usage)
+            for item in declared_usage:
+                metric = str(item)
+                usage_observability.add(metric)
+                usage_declared_attempts.setdefault(metric, set()).add(attempt_id)
+                if metric in observed_usage:
+                    usage_observed_attempts.setdefault(metric, set()).add(attempt_id)
         adapter = (backend_profile.get("context_access") or {}).get("adapter") or {}
         telemetry_declared = (
             isinstance(adapter, dict)
@@ -746,9 +765,26 @@ def collect_attempt_metrics(task_dir: Path) -> tuple[list[dict[str, Any]], dict[
         "max_context_tokens": "context_tokens",
     }
     for output_name, declared_name in usage_name_map.items():
-        if declared_name not in usage_observability:
+        declared_attempts = usage_declared_attempts.get(declared_name, set())
+        observed_attempts = usage_observed_attempts.get(declared_name, set())
+        if (
+            declared_name not in usage_observability
+            or declared_attempts != observed_attempts
+        ):
             totals[output_name] = None
     totals["coverage"] = sorted(usage_observability)
+    totals["observed"] = sorted(
+        metric
+        for metric, declared_attempts in usage_declared_attempts.items()
+        if declared_attempts == usage_observed_attempts.get(metric, set())
+    )
+    totals["missing_attempts"] = {
+        metric: sorted(
+            declared_attempts - usage_observed_attempts.get(metric, set())
+        )
+        for metric, declared_attempts in sorted(usage_declared_attempts.items())
+        if declared_attempts != usage_observed_attempts.get(metric, set())
+    }
     return attempts, {
         "usage": totals,
         "context": context_metrics,

@@ -132,6 +132,7 @@ def main() -> int:
     parser.add_argument("--task-dir", default="")
     parser.add_argument("--attempt-id", default="")
     parser.add_argument("--handoff-grace-seconds", type=float, default=0.5)
+    parser.add_argument("--codex-terminal-event-grace-seconds", type=float, default=5.0)
     parser.add_argument("--finalization-path", default="")
     parser.add_argument("--finalization-timeout-seconds", type=float, default=90.0)
     parser.add_argument("--deadline-path", default="")
@@ -150,6 +151,12 @@ def main() -> int:
         raise SystemExit("startup and attempt timeouts must be positive")
     if not math.isfinite(args.handoff_grace_seconds) or args.handoff_grace_seconds < 0:
         raise SystemExit("handoff grace seconds must be finite and non-negative")
+    if (
+        not math.isfinite(args.codex_terminal_event_grace_seconds)
+        or args.codex_terminal_event_grace_seconds < 0
+        or args.codex_terminal_event_grace_seconds > 30
+    ):
+        raise SystemExit("Codex terminal event grace seconds must be between 0 and 30")
     if (
         not math.isfinite(args.finalization_timeout_seconds)
         or args.finalization_timeout_seconds <= 0
@@ -419,6 +426,9 @@ def main() -> int:
     publication_requested = False
     publication_was_accepted = False
     publication_deadline: float | None = None
+    codex_terminal_event_deadline: float | None = None
+    codex_terminal_event_wait_started: float | None = None
+    codex_terminal_event_wait_elapsed: float | None = None
     last_state_write = 0.0
     cleanup_observation: dict[str, Any] = {"verified": True, "reason": None}
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
@@ -572,12 +582,26 @@ def main() -> int:
                     publication_deadline = (
                         time.monotonic() + args.handoff_grace_seconds
                     )
+                    codex_terminal_event_deadline = time.monotonic() + max(
+                        args.handoff_grace_seconds,
+                        args.codex_terminal_event_grace_seconds,
+                    )
+                    if args.backend == "codex":
+                        codex_terminal_event_wait_started = time.monotonic()
                 if publication_deadline is not None and time.monotonic() >= publication_deadline:
-                    break
+                    waiting_for_codex_terminal_event = bool(
+                        args.backend == "codex"
+                        and not usage.saw_source_event("turn.completed", "turn_completed")
+                        and codex_terminal_event_deadline is not None
+                        and time.monotonic() < codex_terminal_event_deadline
+                    )
+                    if not waiting_for_codex_terminal_event:
+                        break
             elif publication_requested:
                 # A mutation during the grace interval revokes the stop signal.
                 publication_requested = False
                 publication_deadline = None
+                codex_terminal_event_deadline = None
             timeout_phase = deadline.observe(
                 finalization_epoch,
                 enforce_timeout=not publication_requested,
@@ -586,9 +610,45 @@ def main() -> int:
                 timed_out = True
                 break
 
+        # A short-lived process may exit after writing its terminal JSONL event
+        # but before the selector loop sees the final pipe bytes. Drain only
+        # already-readable output; inherited pipes must not extend the bound.
+        if process.poll() is not None:
+            drain_deadline = time.monotonic() + 0.2
+            while selector.get_map() and time.monotonic() < drain_deadline:
+                events = selector.select(timeout=0.02)
+                if not events:
+                    continue
+                for key, _ in events:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    transcript.write(chunk)
+                    transcript.flush()
+                    os.write(1, chunk)
+                    startup_output.extend(chunk)
+                    if len(startup_output) > 65536:
+                        del startup_output[:-65536]
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        try:
+                            usage_payload = json.loads(line)
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            usage_payload = None
+                        if usage.observe(usage_payload):
+                            budget_exceeded = True
+
         # Catch a marker published immediately before a natural worker exit and
         # revalidate after any grace-period output has been flushed.
         if buffer:
+            try:
+                usage_payload = json.loads(buffer)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                usage_payload = None
+            if usage.observe(usage_payload):
+                budget_exceeded = True
             evidence = startup_event(args.backend, buffer)
             progress = worker_progress_event(args.backend, buffer)
             if evidence and startup["state"] != "worker_started":
@@ -607,6 +667,11 @@ def main() -> int:
                     "event": progress,
                 }
                 atomic_json(startup_path, startup)
+        if codex_terminal_event_wait_started is not None:
+            codex_terminal_event_wait_elapsed = max(
+                0.0,
+                time.monotonic() - codex_terminal_event_wait_started,
+            )
         if args.finalization_path:
             deadline.observe(
                 finalization_epoch_from_path(
@@ -624,6 +689,12 @@ def main() -> int:
         timed_out = timed_out or timeout_phase is not None
         stopped_after_publication = publication_was_accepted
         final_publication_valid = publication_is_valid()
+        if (
+            args.backend == "codex"
+            and publication_was_accepted
+            and usage.require_budget_observations()
+        ):
+            budget_exceeded = True
         if args.finalization_path:
             deadline.observe(
                 finalization_epoch_from_path(
@@ -855,6 +926,17 @@ def main() -> int:
         if budget_exceeded
         else "completed"
     )
+    codex_terminal_event_drain = (
+        {
+            "limit_seconds": args.codex_terminal_event_grace_seconds,
+            "elapsed_seconds": round(codex_terminal_event_wait_elapsed or 0.0, 6),
+            "terminal_event_observed": usage.saw_source_event(
+                "turn.completed", "turn_completed"
+            ),
+        }
+        if codex_terminal_event_wait_started is not None
+        else None
+    )
     atomic_json(state_path, {
         "state": state,
         "worker_pid": process.pid,
@@ -884,6 +966,7 @@ def main() -> int:
         "deadline_sha256": deadline_sha256,
         "active_deadline_at_epoch": deadline.active_deadline_epoch(),
         "usage": usage.summary(),
+        "codex_terminal_event_drain": codex_terminal_event_drain,
     })
     atomic_json(supervisor_path, {
         "exit_code": exit_code,
@@ -929,6 +1012,7 @@ def main() -> int:
         "strategy_sha256": args.strategy_sha256 or None,
         "backend_session_id": observed_session_id or None,
         "usage": usage.summary(),
+        "codex_terminal_event_drain": codex_terminal_event_drain,
     })
     return exit_code
 

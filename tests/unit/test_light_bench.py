@@ -356,6 +356,65 @@ class LightBenchTests(unittest.TestCase):
             self.assertFalse(context["telemetry_initialized"])
             self.assertIsNone(context["access_checks"])
 
+    def test_declared_but_missing_usage_event_is_not_reported_as_zero(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary) / "attempts" / "A001"
+            runtime = attempt / "runtime"
+            runtime.mkdir(parents=True)
+            (attempt / "ATTEMPT.json").write_text(
+                json.dumps({"attempt_id": "A001", "runtime": {"io_mode": "machine"}}),
+                encoding="utf-8",
+            )
+            (attempt / "supervisor-result.json").write_text(json.dumps({
+                "usage": {
+                    "totals": {"input_tokens": None, "output_tokens": None},
+                    "observed_metrics": [],
+                },
+            }), encoding="utf-8")
+            (runtime / "BACKEND_PROFILE.json").write_text(json.dumps({
+                "usage_observability": {
+                    "machine": ["input_tokens", "output_tokens"],
+                },
+            }), encoding="utf-8")
+            _, metrics = bench.collect_attempt_metrics(Path(temporary))
+            usage = metrics["usage"]
+            self.assertIsNone(usage["input_tokens"])
+            self.assertIsNone(usage["output_tokens"])
+            self.assertEqual([], usage["observed"])
+            self.assertEqual(
+                {"input_tokens": ["A001"], "output_tokens": ["A001"]},
+                usage["missing_attempts"],
+            )
+
+    def test_observed_usage_event_is_aggregated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary) / "attempts" / "A001"
+            runtime = attempt / "runtime"
+            runtime.mkdir(parents=True)
+            (attempt / "ATTEMPT.json").write_text(
+                json.dumps({"attempt_id": "A001", "runtime": {"io_mode": "machine"}}),
+                encoding="utf-8",
+            )
+            (attempt / "supervisor-result.json").write_text(json.dumps({
+                "usage": {
+                    "totals": {"input_tokens": 32161, "output_tokens": 47},
+                    "observed_metrics": ["input_tokens", "output_tokens"],
+                },
+            }), encoding="utf-8")
+            (runtime / "BACKEND_PROFILE.json").write_text(json.dumps({
+                "usage_observability": {
+                    "machine": ["input_tokens", "output_tokens"],
+                },
+            }), encoding="utf-8")
+            _, metrics = bench.collect_attempt_metrics(Path(temporary))
+            usage = metrics["usage"]
+            self.assertEqual(32161, usage["input_tokens"])
+            self.assertEqual(47, usage["output_tokens"])
+            self.assertEqual(
+                ["input_tokens", "output_tokens"], usage["observed"]
+            )
+            self.assertEqual({}, usage["missing_attempts"])
+
     def test_one_missing_attempt_makes_context_aggregate_incomplete(self):
         with tempfile.TemporaryDirectory() as temporary:
             task = Path(temporary)

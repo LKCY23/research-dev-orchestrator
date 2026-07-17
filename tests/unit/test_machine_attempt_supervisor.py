@@ -105,6 +105,8 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
         protocol_version: int = 2,
         timeout: float = 2,
         handoff_grace: float = 0.05,
+        backend: str = "claude-code",
+        codex_terminal_event_grace: float | None = None,
     ) -> list[str]:
         prompt = root / "prompt.md"
         prompt.write_text("work\n", encoding="utf-8")
@@ -113,11 +115,11 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             if protocol_version == 2
             else attempt / "COMPLETION.json"
         )
-        return [
+        command = [
             sys.executable,
             str(SUPERVISOR),
             "--backend",
-            "claude-code",
+            backend,
             "--argv-json",
             json.dumps(worker_argv),
             "--cwd",
@@ -158,6 +160,12 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             "--deadline-reminder-seconds",
             "0.1",
         ]
+        if codex_terminal_event_grace is not None:
+            command.extend([
+                "--codex-terminal-event-grace-seconds",
+                str(codex_terminal_event_grace),
+            ])
+        return command
 
     def test_backend_session_id_decoders(self):
         self.assertEqual(
@@ -815,6 +823,115 @@ class MachineAttemptSupervisorTests(unittest.TestCase):
             self.assertFalse(any(pid_alive(pid) for pid in payload["observed_pids"]))
             state = json.loads((attempt / "runtime" / "supervisor.json").read_text())
             self.assertEqual("handoff_ready", state["state"])
+
+    def test_codex_ready_drains_delayed_public_terminal_usage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root)
+            worker = root / "worker.py"
+            worker.write_text(textwrap.dedent("""
+                import json
+                import time
+
+                time.sleep(0.2)
+                print(json.dumps({
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 32161,
+                        "cached_input_tokens": 1920,
+                        "output_tokens": 47,
+                    },
+                }), flush=True)
+                time.sleep(30)
+            """), encoding="utf-8")
+            result = subprocess.run(
+                self.publication_command(
+                    root,
+                    task,
+                    attempt,
+                    [sys.executable, str(worker)],
+                    backend="codex",
+                    codex_terminal_event_grace=0.6,
+                ),
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertEqual(32161, payload["usage"]["totals"]["input_tokens"])
+            self.assertEqual(47, payload["usage"]["totals"]["output_tokens"])
+            self.assertIsNone(payload["usage"]["totals"]["model_turns"])
+            self.assertIsNone(payload["usage"]["totals"]["max_context_tokens"])
+            self.assertEqual(
+                ["input_tokens", "output_tokens"],
+                payload["usage"]["observed_metrics"],
+            )
+            drain = payload["codex_terminal_event_drain"]
+            self.assertTrue(drain["terminal_event_observed"])
+            self.assertGreaterEqual(drain["elapsed_seconds"], 0.05)
+            self.assertLess(drain["elapsed_seconds"], 0.6)
+
+    def test_codex_terminal_drain_is_bounded_when_event_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root)
+            result = subprocess.run(
+                self.publication_command(
+                    root,
+                    task,
+                    attempt,
+                    ["/bin/sh", "-c", "sleep 30 & wait"],
+                    backend="codex",
+                    codex_terminal_event_grace=0.2,
+                ),
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertTrue(payload["publication_requested"])
+            self.assertIsNone(payload["usage"]["totals"]["input_tokens"])
+            self.assertEqual([], payload["usage"]["observed_metrics"])
+            drain = payload["codex_terminal_event_drain"]
+            self.assertFalse(drain["terminal_event_observed"])
+            self.assertGreaterEqual(drain["elapsed_seconds"], 0.15)
+            self.assertLess(drain["elapsed_seconds"], 0.5)
+
+    def test_codex_terminal_drain_rejects_publication_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt = self.make_v2_publication(root)
+            marker = attempt / "runtime" / "HANDOFF_READY.json"
+            worker = [
+                sys.executable,
+                "-c",
+                (
+                    "import os,pathlib,time; "
+                    f"p=pathlib.Path({str(marker)!r}); "
+                    "time.sleep(.2); q=p.with_name('replacement-ready.json'); "
+                    "q.write_bytes(p.read_bytes()); os.replace(q,p)"
+                ),
+            ]
+            result = subprocess.run(
+                self.publication_command(
+                    root,
+                    task,
+                    attempt,
+                    worker,
+                    backend="codex",
+                    handoff_grace=0.05,
+                    codex_terminal_event_grace=0.6,
+                ),
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertEqual(125, result.returncode, result.stderr)
+            payload = json.loads((attempt / "supervisor-result.json").read_text())
+            self.assertFalse(payload["publication_requested"])
+            self.assertTrue(payload["publication_invalidated"])
 
     def test_ready_replacement_during_shutdown_invalidates_machine_publication(self):
         with tempfile.TemporaryDirectory() as temporary:
