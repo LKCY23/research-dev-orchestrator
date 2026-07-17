@@ -77,9 +77,12 @@ Resource limits are enabled only when explicitly present in the approved strateg
 Codex machine mode exposes `input_tokens` and `output_tokens` on its public terminal `turn.completed` JSONL event; its cached-input subset is retained as supplemental per-event data. It does not expose internal model-call count, context-window occupancy, or cost there, so RDO does not declare or synthesize those metrics. After a valid handoff freezes the candidate, the machine supervisor continues revalidating the publication/source while draining for that terminal event for at most five seconds (configurable only within a hard 30-second ceiling). It then performs the normal bounded process-tree cleanup. If the event is absent, the attempt records the metrics as missing; a configured Codex token limit fails closed because its required observation was unavailable.
 
 Claude Code or another backend may expose an inner tool timeout. That timeout
-is advisory only. Protocol safety comes from the attempt supervisor and the
-shared process-group supervision used by `rdo exec`, `rdo check`, and canonical
-merge checks.
+is advisory only. Protocol safety comes from RDO-owned supervision. In machine
+mode, `rdo check` launches the frozen command inside the worker sandbox but
+delegates process observation and cleanup proof to an attempt-local broker
+served by the outer attempt supervisor. Human/manual execution retains the
+local command supervisor. `rdo exec` and canonical merge checks continue to
+use direct process-group supervision.
 
 ## Termination
 
@@ -97,7 +100,9 @@ be normalized to success while any survivor remains.
 
 Cleanup covers the supervised process group, discoverable descendants, and
 processes that retain the inherited RDO supervision-token lineage, including
-commands launched by nested `rdo check` supervisors. This is
+commands launched through the machine-mode `rdo check` broker. The broker does
+not accept or execute argv: `rdo check` still selects the exact frozen command,
+and the broker issues only a one-use process token plus a cleanup receipt. This is
 deterministic cleanup for cooperative tool processes, not hostile process
 containment. A process that deliberately detaches and strips identifying
 environment may evade userspace discovery; a hard guarantee requires an

@@ -26,8 +26,11 @@ rdo finalize --attempt-dir <path> --state verified|review|blocked --summary <tex
 
 Workers may submit artifacts and runtime events, but may not approve strategy, mutate `STATUS.json`, or merge.
 `rdo check` selects exact `argv`, `cwd`, and timeout from the attempt's frozen
-acceptance contract and appends a structured supervised record. Free text and
-`rdo exec --acceptance` cannot satisfy a v2 acceptance gate.
+acceptance contract and appends a structured supervised record. In machine
+mode the command remains inside the worker sandbox while the outer attempt
+supervisor supplies the process-cleanup receipt; it never accepts arbitrary
+argv from the broker protocol. Free text and `rdo exec --acceptance` cannot
+satisfy a v2 acceptance gate.
 
 `rdo finalization begin` explicitly freezes a Direct/Delegated source tree once
 implementation, ordinary testing, and remediation are complete. Required

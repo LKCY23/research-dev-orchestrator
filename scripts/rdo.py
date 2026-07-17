@@ -35,6 +35,7 @@ from artifact_bundle import (
     validate_task_inputs_binding,
 )
 from artifact_resolver import ArtifactResolutionError, require_current_bundle
+from check_broker import broker_directory_for_attempt, run_brokered
 from completion import write_completion
 from protocol import (
     ARTIFACT_PROTOCOL_VERSION,
@@ -358,14 +359,33 @@ def _check_command_locked(args: argparse.Namespace) -> int:
     started_at = utc_now()
     try:
         with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
-            result = run_supervised(
-                definition["argv"],
-                timeout_seconds=float(definition["timeout_seconds"]),
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-            )
+            try:
+                broker = broker_directory_for_attempt(attempt)
+            except RuntimeError as exc:
+                raise SystemExit(str(exc)) from exc
+            if broker is not None:
+                result = run_brokered(
+                    broker,
+                    attempt_id=binding.attempt_id,
+                    task_id=binding.task_id,
+                    task_inputs_sha256=binding.task_inputs_sha256,
+                    check_id=str(definition["id"]),
+                    argv=definition["argv"],
+                    timeout_seconds=float(definition["timeout_seconds"]),
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                )
+            else:
+                result = run_supervised(
+                    definition["argv"],
+                    timeout_seconds=float(definition["timeout_seconds"]),
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                )
         exit_code = result.exit_code
         timed_out = result.timed_out
         elapsed_seconds = result.elapsed_seconds

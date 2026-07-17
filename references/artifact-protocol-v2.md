@@ -159,6 +159,7 @@ attempts/<attempt-id>/
     ├── HANDOFF_READY.json
     ├── ARTIFACT_LOCK
     ├── COMMANDS.ndjson
+    ├── check-broker/
     ├── transcript.log
     ├── worktree-before.json
     └── worktree-after.json
@@ -169,6 +170,7 @@ attempts/<attempt-id>/
 | `ATTEMPT.json` | Canonical attempt identity/runtime metadata; input binding is only a `TASK_INPUTS.json` ref and digest | Dispatcher creates it; protocol code advances attempt metadata |
 | `TASK_INPUTS.json` | Derived immutable snapshot of canonical task inputs and resolved commits | Dispatcher publishes it before launch |
 | `runtime/COMMANDS.ndjson` | Append-only raw supervised-command facts, including before/after semantic source digests | `rdo check` appends records before or during finalization |
+| `runtime/check-broker/` | Ephemeral request, one-use supervision lease, and cleanup receipt transport; not evidence | Machine attempt supervisor creates one instance per launch and serves it only for that worker lifetime |
 | `runtime/ARTIFACT_LOCK` | Internal process lock; not evidence | Shared by supervised command writers and held exclusively by finalization so no command can append after publication |
 | `runtime/DEADLINE.json` | Create-once attempt execution deadline shared by backend resume fallback | Supervisor creates it before worker launch |
 | `runtime/finalization-worktree.json` | Create-once full semantic source snapshot at finalize-only entry | RDO publishes it before the finalization marker |

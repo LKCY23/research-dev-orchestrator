@@ -14,9 +14,11 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import rdo
 from artifact_bundle import artifact_binding, file_sha256, load_bundle, load_command_records
+from check_broker import BrokeredCommandResult
 from strategy import DEFAULT_EXECUTION_POLICY
 from supervisor import load_or_create_attempt_deadline
 from task_contract import (
@@ -417,6 +419,31 @@ No additional background is needed.
             log = fixture.attempt / record[f"{prefix}_ref"]
             self.assertTrue(log.is_file())
             self.assertEqual(file_sha256(log), record[f"{prefix}_sha256"])
+
+    def test_check_uses_declared_machine_supervision_broker(self) -> None:
+        fixture = self.make_fixture()
+        broker = fixture.attempt / "runtime" / "check-broker" / "instance"
+        with (
+            patch.object(rdo, "broker_directory_for_attempt", return_value=broker),
+            patch.object(
+                rdo,
+                "run_brokered",
+                return_value=BrokeredCommandResult(
+                    exit_code=0,
+                    child_exit_code=0,
+                    timed_out=False,
+                    elapsed_seconds=0.01,
+                    surviving_pids=(),
+                    cleanup_verified=True,
+                    cleanup_failure_reason=None,
+                ),
+            ) as execute,
+        ):
+            self.assertEqual(0, self.check(fixture, "unit"))
+        execute.assert_called_once()
+        record = load_command_records(fixture.attempt)[0].payload
+        self.assertTrue(record["cleanup_verified"])
+        self.assertEqual([], record["surviving_processes"])
 
     def test_finalize_requires_all_checks_required_outputs_and_a_clean_commit(self) -> None:
         checks = [self.command("unit"), self.command("smoke")]

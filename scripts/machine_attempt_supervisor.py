@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from backend_startup import classify_startup_failure
+from check_broker import CheckBrokerServer
 from completion import (
     inspect_candidate_source_head,
     inspect_candidate_source_state,
@@ -338,6 +339,11 @@ def main() -> int:
     observed_session_id = ""
     env = os.environ.copy()
     env.update(environment)
+    check_broker: CheckBrokerServer | None = None
+    if args.artifact_protocol_version == 2:
+        attempt_path = Path(args.task_dir) / "attempts" / args.attempt_id
+        check_broker = CheckBrokerServer(attempt_path / "runtime", args.attempt_id)
+        env.update(check_broker.environment())
     env, supervision_token = supervision_environment(env)
     stdin_spec: int = subprocess.DEVNULL if args.prompt_transport == "arg" else subprocess.PIPE
     deadline_payload = load_or_create_attempt_deadline(
@@ -494,6 +500,7 @@ def main() -> int:
                         atomic_json(startup_path, startup)
                 if budget_exceeded:
                     break
+            table: dict[int, tuple[int, int]] | None = None
             try:
                 table = _process_table()
                 current, current_pgids = current_termination_targets(
@@ -507,6 +514,8 @@ def main() -> int:
                 termination_pgids = current_pgids
             except (OSError, subprocess.SubprocessError):
                 pass
+            if check_broker is not None:
+                check_broker.poll(process.pid, table)
             elapsed = time.monotonic() - started_monotonic
             finalization_epoch = (
                 finalization_epoch_from_path(
@@ -735,6 +744,11 @@ def main() -> int:
         publication_unaccepted = bool(
             final_publication_valid and not publication_requested
         )
+        if check_broker is not None:
+            check_broker.close(
+                process.pid,
+                reason="attempt_supervisor_stopped",
+            )
         try:
             table = _process_table()
             current, current_pgids = current_termination_targets(
