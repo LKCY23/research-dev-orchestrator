@@ -192,6 +192,8 @@ The public method is `Queue.cancel(job_id, reason=None) -> Job`. A supplied reas
 must be a non-empty string after trimming. Cancellation does not consume an
 attempt. Scheduler needs no special branch when leasing already filters on the
 queued state, but its tests should demonstrate cancelled work is never handled.
+Cancelling a leased, succeeded, or dead job raises
+`InvalidStateTransitionError` and leaves the durable snapshot unchanged.
 
 ## 10. Observability
 
@@ -207,9 +209,10 @@ they need lifecycle details.
 ## 11. Error Handling
 
 InvalidJobError identifies invalid API values and corrupt serialized records.
-JobNotFoundError identifies unknown ids. LeaseError identifies wrong ownership,
-wrong source state, or an expired claim. ConflictError identifies a stale store
-revision. These errors do not mutate state.
+JobNotFoundError identifies unknown ids. InvalidStateTransitionError identifies
+an operation that is not legal from the current lifecycle state. LeaseError is
+reserved for lease ownership, validity, and expiry failures. ConflictError
+identifies a stale store revision. These errors do not mutate state.
 
 Scheduler catches Exception from handlers because handler failures are the work
 being modeled. It does not catch BaseException. Errors from queue operations are
@@ -322,9 +325,9 @@ visible test. Rows restate identifiers and expected categories, not source code.
 | A085 | queued job | cancel without reason | cancelled with stable reason |
 | A086 | queued job | cancel with spaced reason | cancelled with trimmed reason |
 | A087 | cancelled job | cancel again | idempotent terminal result |
-| A088 | leased job | cancel | rejected without mutation |
-| A089 | succeeded job | cancel | rejected without mutation |
-| A090 | dead job | cancel | rejected without mutation |
+| A088 | leased job | cancel | InvalidStateTransitionError without mutation |
+| A089 | succeeded job | cancel | InvalidStateTransitionError without mutation |
+| A090 | dead job | cancel | InvalidStateTransitionError without mutation |
 | A091 | cancelled job | serialize and reload | cancelled state preserved |
 | A092 | cancelled and queued jobs | stats | cancelled counted separately |
 | A093 | cancelled job | stats total | included in total |

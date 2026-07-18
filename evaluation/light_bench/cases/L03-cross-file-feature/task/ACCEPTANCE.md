@@ -22,13 +22,17 @@
 
 ## Behavioral Checks
 
-- Cancelling queued work produces a terminal cancelled Job, completion time,
-  stable default reason, and no attempt increment.
-- A non-empty supplied reason is trimmed; blank reasons are rejected.
-- Repeating cancellation is idempotent, while leased, succeeded, and dead jobs
-  reject cancellation without mutation.
-- Cancelled state survives JsonStore round trips, is counted separately, is
-  included in total, and is never leased or dispatched.
+- A084: cancelled work is never leased or dispatched.
+- A085: an omitted reason stores `cancelled`.
+- A086: a supplied non-empty reason is trimmed.
+- A087: repeated cancellation returns the unchanged cancelled Job.
+- A088, A089, A090: cancelling leased, succeeded, or dead work raises
+  `InvalidStateTransitionError` without mutation.
+- A091: cancelled state survives a JsonStore round trip.
+- A092, A093: statistics count cancelled separately and include it in total.
+- A094, A095: cancellation does not increment attempts and records the Queue
+  clock as `completed_at`.
+- A096: a blank reason raises `InvalidJobError` and leaves the job queued.
 
 ## Merge Preconditions
 

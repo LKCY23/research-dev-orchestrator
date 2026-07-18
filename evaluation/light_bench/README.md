@@ -23,6 +23,19 @@ commit. A worker therefore cannot recover the answer from a parent commit.
 Visible tests and task acceptance are available to the worker; the external
 verifier is deterministic but is not a hostile security boundary.
 
+New or materially revised cases use case schema v2. Their manifest versions a
+public contract, names the normative design requirement IDs, and declares which
+IDs have visible-test and hidden-verifier coverage. `validate` rejects a case
+when the design rows, `ACCEPTANCE.md`, visible setup patch, and verifier do not
+trace to the same declared requirements. This is deterministic traceability,
+not a claim that string matching can judge semantic adequacy.
+
+Schema-v2 cases also carry calibration patches. A golden implementation must
+pass, while labelled mutants must fail and identify the expected requirement
+IDs. Live `run` and `ab` execute this preflight before creating an output run or
+calling a model. Failure is reported as `benchmark_invalid`; it is never counted
+as an implementation or protocol failure.
+
 ## Commands
 
 Validate every manifest, task packet, setup patch, and initially failing
@@ -121,6 +134,12 @@ Hard pass requires:
 - the profile reaches `verified` for Direct or `review` for Delegated/Full;
 - changed paths stay within the case expectation;
 - dispatch succeeds without a hard governance violation.
+
+Completed result records carry the case contract version/digest. Failed samples
+are classified as `implementation_failure` only when dispatch and protocol
+completion succeeded but the verifier rejected the implementation; other
+worker/lifecycle failures are `protocol_failure`. `completed` means all hard
+pass conditions held.
 
 If outer-timeout cleanup fails or reports surviving worker PIDs, the current
 sample is saved as failed and the whole run stops immediately; later samples

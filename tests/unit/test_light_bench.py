@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import json
 import os
@@ -99,6 +100,27 @@ class LightBenchTests(unittest.TestCase):
         for case in cases.values():
             self.assertEqual([], bench.validate_case_files(case))
             self.assertTrue(case.digest)
+
+    def test_schema_v2_contract_is_traceable_and_calibrated(self):
+        case = bench.discover_cases()["L03-cross-file-feature"]
+        self.assertEqual(2, case.schema_version)
+        self.assertEqual(1, case.contract["version"])
+        self.assertEqual([], bench.validate_contract_governance(case))
+        self.assertEqual([], bench.validate_case_calibration(case))
+        self.assertRegex(case.contract_digest or "", r"^[0-9a-f]{64}$")
+
+        changed = copy.deepcopy(case.payload)
+        changed["contract"]["version"] = 2
+        revised = bench.BenchCase(case.path, changed)
+        self.assertNotEqual(case.contract_digest, revised.contract_digest)
+
+    def test_invalid_contract_is_rejected_before_worker_start(self):
+        case = bench.discover_cases()["L03-cross-file-feature"]
+        invalid_payload = copy.deepcopy(case.payload)
+        invalid_payload["contract"]["coverage"]["hidden"].append("A999")
+        invalid = bench.BenchCase(case.path, invalid_payload)
+        with self.assertRaisesRegex(ValueError, "benchmark_invalid"):
+            bench.require_valid_cases([invalid])
 
     def test_setup_patch_is_the_only_initial_commit_and_verifier_fails(self):
         case = bench.discover_cases()["L01-located-fix"]
@@ -489,6 +511,7 @@ class LightBenchTests(unittest.TestCase):
                     model_label="fake-model",
                 )
         self.assertFalse(result["outcome"]["passed"])
+        self.assertEqual("protocol_failure", result["outcome"]["failure_kind"])
         self.assertFalse(result["outcome"]["timed_out_worker_cleanup_ok"])
         self.assertTrue(result["outcome"]["benchmark_abort_required"])
         self.assertEqual(125, result["outcome"]["verifier_exit_code"])

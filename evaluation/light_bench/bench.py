@@ -28,7 +28,9 @@ CASES_ROOT = BENCH_ROOT / "cases"
 PRESETS_PATH = BENCH_ROOT / "presets.json"
 PROFILES = {"direct", "delegated", "full"}
 TASK_INPUTS = ("TASK.md", "CONTEXT.md", "ACCEPTANCE.md", "EXECUTION_POLICY.json")
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
+CASE_SCHEMA_VERSIONS = {1, 2}
+REQUIREMENT_ID_RE = re.compile(r"A[0-9]{3}")
 
 
 def utc_now() -> str:
@@ -238,6 +240,44 @@ class BenchCase:
         return value
 
     @property
+    def schema_version(self) -> int:
+        return int(self.payload.get("schema_version", 1))
+
+    @property
+    def contract(self) -> dict[str, Any] | None:
+        value = self.payload.get("contract")
+        return value if isinstance(value, dict) else None
+
+    def bench_path(self, raw: str) -> Path:
+        path = (BENCH_ROOT / raw).resolve()
+        path.relative_to(BENCH_ROOT)
+        return path
+
+    @property
+    def contract_digest(self) -> str | None:
+        if self.schema_version < 2 or self.contract is None:
+            return None
+        source = self.bench_path(str(self.contract["source"]))
+        requirements = set(str(item) for item in self.contract["requirements"])
+        source_rows = [
+            line.strip()
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if (match := re.match(r"^\|\s*(A[0-9]{3})\s*\|", line))
+            and match.group(1) in requirements
+        ]
+        payload = {
+            "contract": self.contract,
+            "source_rows": source_rows,
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @property
     def digest(self) -> str:
         digest = hashlib.sha256()
         for root in (self.fixture, self.path):
@@ -254,7 +294,12 @@ def load_case(path: Path) -> BenchCase:
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"{path}: missing case fields {missing}")
+    schema_version = payload.get("schema_version", 1)
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise ValueError(f"{path}: schema_version must be an integer")
     case = BenchCase(path.resolve(), payload)
+    if case.schema_version not in CASE_SCHEMA_VERSIONS:
+        raise ValueError(f"{path}: unsupported schema_version {case.schema_version}")
     if not case.case_id or any(profile not in PROFILES for profile in case.profiles):
         raise ValueError(f"{path}: invalid id or profiles")
     if len(set(case.profiles)) != len(case.profiles):
@@ -330,7 +375,198 @@ def validate_case_files(case: BenchCase) -> list[str]:
             errors.append("execution policy must be an object")
     except (OSError, json.JSONDecodeError) as exc:
         errors.append(f"execution policy is invalid: {exc}")
+    if case.schema_version >= 2:
+        errors.extend(validate_contract_governance(case))
     return errors
+
+
+def _string_ids(value: Any, label: str, errors: list[str]) -> list[str]:
+    if not isinstance(value, list) or not value:
+        errors.append(f"{label} must be a non-empty array")
+        return []
+    ids = [str(item) for item in value]
+    if any(REQUIREMENT_ID_RE.fullmatch(item) is None for item in ids):
+        errors.append(f"{label} contains an invalid requirement id")
+    if len(set(ids)) != len(ids):
+        errors.append(f"{label} contains duplicate requirement ids")
+    return ids
+
+
+def validate_contract_governance(case: BenchCase) -> list[str]:
+    """Validate the public contract, visible tests, oracle, and calibrations."""
+
+    errors: list[str] = []
+    contract = case.contract
+    if contract is None:
+        return ["schema v2 requires a contract object"]
+    version = contract.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        errors.append("contract.version must be a positive integer")
+    requirements = _string_ids(contract.get("requirements"), "contract.requirements", errors)
+    requirement_set = set(requirements)
+    source_raw = contract.get("source")
+    source: Path | None = None
+    if not isinstance(source_raw, str) or not source_raw:
+        errors.append("contract.source must be a bench-relative path")
+    else:
+        try:
+            source = case.bench_path(source_raw)
+        except ValueError:
+            errors.append("contract.source escapes the bench root")
+        if source is not None and not source.is_file():
+            errors.append("contract.source is missing")
+    source_ids: set[str] = set()
+    if source is not None and source.is_file():
+        source_ids = {
+            match.group(1)
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if (match := re.match(r"^\|\s*(A[0-9]{3})\s*\|", line))
+        }
+        missing = sorted(requirement_set - source_ids)
+        if missing:
+            errors.append(f"contract requirements missing from source: {missing}")
+    coverage = contract.get("coverage")
+    visible: list[str] = []
+    hidden: list[str] = []
+    if not isinstance(coverage, dict):
+        errors.append("contract.coverage must be an object")
+    else:
+        visible = _string_ids(coverage.get("visible"), "contract.coverage.visible", errors)
+        hidden = _string_ids(coverage.get("hidden"), "contract.coverage.hidden", errors)
+        unknown = sorted((set(visible) | set(hidden)) - requirement_set)
+        uncovered = sorted(requirement_set - (set(visible) | set(hidden)))
+        if unknown:
+            errors.append(f"coverage references undeclared requirements: {unknown}")
+        if uncovered:
+            errors.append(f"contract requirements lack visible/hidden coverage: {uncovered}")
+    try:
+        acceptance_text = (case.task_dir / "ACCEPTANCE.md").read_text(encoding="utf-8")
+        acceptance_ids = set(REQUIREMENT_ID_RE.findall(acceptance_text))
+        missing = sorted(requirement_set - acceptance_ids)
+        if missing:
+            errors.append(f"ACCEPTANCE.md omits contract requirements: {missing}")
+    except OSError:
+        pass
+    try:
+        setup_text = case.setup_patch.read_text(encoding="utf-8")
+        setup_ids = set(REQUIREMENT_ID_RE.findall(setup_text))
+        missing = sorted(set(visible) - setup_ids)
+        if missing:
+            errors.append(f"visible tests omit declared coverage ids: {missing}")
+    except OSError:
+        pass
+    verifier_path = case.path / "verify.py"
+    try:
+        verifier_text = verifier_path.read_text(encoding="utf-8")
+        verifier_ids = set(REQUIREMENT_ID_RE.findall(verifier_text))
+        missing = sorted(set(hidden) - verifier_ids)
+        if missing:
+            errors.append(f"verifier omits declared hidden coverage ids: {missing}")
+    except OSError:
+        errors.append("schema v2 verifier file is missing")
+
+    calibrations = case.payload.get("calibration")
+    if not isinstance(calibrations, list) or len(calibrations) < 2:
+        errors.append("schema v2 requires golden and negative calibration scenarios")
+        return errors
+    scenario_ids: set[str] = set()
+    expected_exits: set[int] = set()
+    for scenario in calibrations:
+        if not isinstance(scenario, dict):
+            errors.append("calibration scenario must be an object")
+            continue
+        scenario_id = scenario.get("id")
+        if not isinstance(scenario_id, str) or not scenario_id or scenario_id in scenario_ids:
+            errors.append("calibration ids must be non-empty and unique")
+        else:
+            scenario_ids.add(scenario_id)
+        expected_exit = scenario.get("expected_exit")
+        if (
+            not isinstance(expected_exit, int)
+            or isinstance(expected_exit, bool)
+            or expected_exit not in {0, 1}
+        ):
+            errors.append(f"calibration {scenario_id!r} expected_exit must be 0 or 1")
+        else:
+            expected_exits.add(expected_exit)
+        patches = scenario.get("patches")
+        if not isinstance(patches, list) or not patches:
+            errors.append(f"calibration {scenario_id!r} patches must be non-empty")
+        else:
+            for raw in patches:
+                try:
+                    path = case.bench_path(str(raw))
+                    path.relative_to(case.path)
+                except ValueError:
+                    errors.append(f"calibration {scenario_id!r} patch escapes the case")
+                    continue
+                if not path.is_file():
+                    errors.append(f"calibration {scenario_id!r} patch is missing: {raw}")
+        expected_requirements = scenario.get("expected_requirements")
+        if not isinstance(expected_requirements, list) or any(
+            str(item) not in requirement_set for item in expected_requirements
+        ):
+            errors.append(
+                f"calibration {scenario_id!r} expected_requirements must reference the contract"
+            )
+        elif expected_exit == 1 and not expected_requirements:
+            errors.append(
+                f"calibration {scenario_id!r} must name the requirement its mutant violates"
+            )
+    if 0 not in expected_exits or not any(code != 0 for code in expected_exits):
+        errors.append("calibration must include one passing golden and one rejected mutant")
+    return errors
+
+
+def validate_case_calibration(case: BenchCase) -> list[str]:
+    if case.schema_version < 2:
+        return []
+    failures: list[str] = []
+    for scenario in case.payload["calibration"]:
+        scenario_id = str(scenario["id"])
+        with tempfile.TemporaryDirectory(
+            prefix=f"rdo-light-bench-{case.case_id}-{scenario_id}-"
+        ) as temporary:
+            try:
+                repo, _ = prepare_repo(case, Path(temporary))
+                for raw in scenario["patches"]:
+                    patch_path = case.bench_path(str(raw))
+                    require_success(
+                        git(
+                            repo,
+                            "apply",
+                            "--unidiff-zero",
+                            "--whitespace=nowarn",
+                            str(patch_path),
+                        ),
+                        f"apply calibration {scenario_id}",
+                    )
+                result = run_capture(
+                    verifier_argv(case, repo),
+                    cwd=repo,
+                    timeout=float(case.verifier.get("timeout_seconds") or 60),
+                )
+                expected_exit = int(scenario["expected_exit"])
+                if result.returncode != expected_exit:
+                    failures.append(
+                        f"calibration {scenario_id!r} returned {result.returncode}, "
+                        f"expected {expected_exit}: {(result.stderr or result.stdout).strip()}"
+                    )
+                observed_requirements = set(
+                    REQUIREMENT_ID_RE.findall(result.stdout + "\n" + result.stderr)
+                )
+                missing = [
+                    str(item)
+                    for item in scenario["expected_requirements"]
+                    if str(item) not in observed_requirements
+                ]
+                if missing:
+                    failures.append(
+                        f"calibration {scenario_id!r} did not identify requirements {missing}"
+                    )
+            except Exception as exc:
+                failures.append(f"calibration {scenario_id!r} failed: {exc}")
+    return failures
 
 
 def command_validate(args: argparse.Namespace) -> int:
@@ -353,6 +589,11 @@ def command_validate(args: argparse.Namespace) -> int:
                         f"{case.case_id}: initial verifier returned {result.returncode}, expected {expected}; "
                         f"{(result.stderr or result.stdout).strip()}"
                     )
+                if case.schema_version >= 2:
+                    failures.extend(
+                        f"{case.case_id}: {item}"
+                        for item in validate_case_calibration(case)
+                    )
             except Exception as exc:  # validation should report all cases
                 failures.append(f"{case.case_id}: {exc}")
     if failures:
@@ -360,6 +601,22 @@ def command_validate(args: argparse.Namespace) -> int:
         return 1
     print(f"validated {len(selected)} light-bench case(s)")
     return 0
+
+
+def require_valid_cases(cases: Iterable[BenchCase]) -> None:
+    """Fail before any model call when a selected benchmark case is invalid."""
+
+    failures: list[str] = []
+    unique = {case.case_id: case for case in cases}
+    for case in unique.values():
+        case_failures = validate_case_files(case)
+        if not case_failures:
+            case_failures.extend(validate_case_calibration(case))
+        failures.extend(f"{case.case_id}: {item}" for item in case_failures)
+    if failures:
+        raise ValueError(
+            "benchmark_invalid; no worker was started:\n" + "\n".join(failures)
+        )
 
 
 class GitChangeWatcher:
@@ -971,6 +1228,18 @@ def run_one(
         and dispatch_ok
         and metrics["violations"]["hard"] == 0
     )
+    failure_kind = (
+        "completed"
+        if hard_pass
+        else "implementation_failure"
+        if (
+            dispatch_ok
+            and protocol_valid
+            and terminal_correct
+            and verifier_result.returncode != 0
+        )
+        else "protocol_failure"
+    )
     lifecycle_elapsed = round(time.monotonic() - lifecycle_started_monotonic, 6)
     runner_elapsed = round(time.monotonic() - runner_started_monotonic, 6)
     first_change_seconds = (
@@ -997,6 +1266,10 @@ def run_one(
             "id": case.case_id,
             "title": case.payload.get("title") or case.case_id,
             "digest": case.digest,
+            "contract_version": (
+                case.contract.get("version") if case.contract is not None else None
+            ),
+            "contract_digest": case.contract_digest,
             "profile": profile,
             "repetition": repetition,
         },
@@ -1019,6 +1292,7 @@ def run_one(
         },
         "outcome": {
             "passed": hard_pass,
+            "failure_kind": failure_kind,
             "verifier_passed": verifier_result.returncode == 0,
             "verifier_exit_code": verifier_result.returncode,
             "protocol_valid": protocol_valid,
@@ -1083,6 +1357,10 @@ def command_list(args: argparse.Namespace) -> int:
                 "title": case.payload.get("title") or case.case_id,
                 "profiles": list(case.profiles),
                 "description": case.payload.get("description") or "",
+                "contract_version": (
+                    case.contract.get("version") if case.contract is not None else None
+                ),
+                "contract_digest": case.contract_digest,
             }
             for case in cases.values()
         ], indent=2))
@@ -1163,6 +1441,7 @@ def prepare_output_root(
 def command_run(args: argparse.Namespace) -> int:
     cases = discover_cases()
     matrix = selected_matrix(args, cases)
+    require_valid_cases(case for case, _profile in matrix)
     rdo_root = Path(args.rdo_root).resolve()
     if not (rdo_root / "scripts" / "dispatch_agent.sh").is_file():
         raise ValueError(f"not an RDO root: {rdo_root}")
@@ -1211,6 +1490,7 @@ def command_ab(args: argparse.Namespace) -> int:
         raise ValueError("A/B requires a non-empty --model-label")
     cases = discover_cases()
     matrix = selected_matrix(args, cases)
+    require_valid_cases(case for case, _profile in matrix)
     roots = {
         "baseline": Path(args.baseline_rdo).resolve(),
         "candidate": Path(args.candidate_rdo).resolve(),

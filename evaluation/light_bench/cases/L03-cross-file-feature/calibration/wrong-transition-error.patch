@@ -1,0 +1,12 @@
+diff --git a/src/miniqueue/queue.py b/src/miniqueue/queue.py
+--- a/src/miniqueue/queue.py
++++ b/src/miniqueue/queue.py
+@@ -125,7 +125,7 @@ class Queue:
+             if job.state is JobState.CANCELLED:
+                 return job.clone()
+             if job.state is not JobState.QUEUED:
+-                raise InvalidStateTransitionError(
++                raise LeaseError(
+                     f"cannot cancel job {job.job_id!r} from state {job.state.value!r}"
+                 )
+             job.state = JobState.CANCELLED

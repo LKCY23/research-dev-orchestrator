@@ -1,0 +1,11 @@
+diff --git a/src/miniqueue/queue.py b/src/miniqueue/queue.py
+--- a/src/miniqueue/queue.py
++++ b/src/miniqueue/queue.py
+@@ -122,6 +122,7 @@ class Queue:
+         def mutate(snapshot: QueueSnapshot) -> Job:
+             job = self._require_job(snapshot, job_id)
+             if job.state is JobState.CANCELLED:
++                job.last_error = normalized_reason
+                 return job.clone()
+             if job.state is not JobState.QUEUED:
+                 raise InvalidStateTransitionError(
