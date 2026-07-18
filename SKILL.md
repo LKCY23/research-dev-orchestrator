@@ -17,10 +17,15 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
   freeze `TASK.md`, `CONTEXT.md`, `ACCEPTANCE.md`, and
   `EXECUTION_POLICY.json` before any attempt, lock, worktree, or running-state
   mutation. Recognized v1 runs use only the explicit legacy decoder.
-- Run required acceptance commands through `rdo check`; legacy `rdo exec --acceptance`,
-  free-text command claims, and task-root handoff/evidence files
-  cannot satisfy a v2 gate.
-- Execution workers commit task changes on their assigned branch and leave the worktree clean before final handoff.
+- Execution workers finish implementation and review, commit task changes on
+  their assigned branch, and leave the worktree clean before `rdo check`.
+- Run required acceptance commands through `rdo check`; each v2 record binds
+  the exact clean candidate commit/tree. Legacy `rdo exec --acceptance`,
+  free-text command claims, and task-root handoff/evidence files cannot satisfy
+  a v2 gate.
+- Finalization begins only after acceptance and output gates pass. It freezes
+  that checked candidate; checks, commits, and source changes are forbidden
+  afterward.
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.

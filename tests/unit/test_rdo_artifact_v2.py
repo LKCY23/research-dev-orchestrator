@@ -424,6 +424,11 @@ No additional background is needed.
         self.assertEqual("required_commands", record["category"])
         self.assertEqual("unit", record["check_id"])
         self.assertEqual(0, record["exit_code"])
+        self.assertEqual(fixture.source_commit, record["source_commit"])
+        self.assertEqual(
+            git(fixture.worktree, "rev-parse", f"{fixture.source_commit}^{{tree}}"),
+            record["source_tree"],
+        )
         self.assertFalse(record["timed_out"])
         self.assertEqual([], record["surviving_processes"])
         self.assertEqual(
@@ -460,6 +465,27 @@ No additional background is needed.
         self.assertTrue(record["cleanup_verified"])
         self.assertEqual([], record["surviving_processes"])
 
+    def test_check_requires_a_clean_commit_and_rejects_source_mutation(self) -> None:
+        dirty = self.make_fixture()
+        (dirty.worktree / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(SystemExit, "committed and clean"):
+            self.check(dirty, "unit")
+        self.assertFalse((dirty.attempt / "runtime" / "COMMANDS.ndjson").exists())
+
+        mutating = self.make_fixture(
+            required_commands=[
+                self.command(
+                    "unit",
+                    "from pathlib import Path; Path('generated.tmp').write_text('late')",
+                )
+            ]
+        )
+        self.assertEqual(126, self.check(mutating, "unit"))
+        records = load_command_records(mutating.attempt)
+        self.assertEqual(1, len(records))
+        self.assertFalse(records[0].payload["source_unchanged"])
+        self.assertEqual(126, records[0].payload["exit_code"])
+
     def test_finalize_requires_all_checks_required_outputs_and_a_clean_commit(self) -> None:
         checks = [self.command("unit"), self.command("smoke")]
         fixture = self.make_fixture(required_commands=checks)
@@ -479,8 +505,8 @@ No additional background is needed.
 
     def test_direct_finalize_publishes_verified_self_review_and_digest_closure(self) -> None:
         fixture = self.make_fixture(profile="direct")
-        self.assertEqual(0, self.begin_finalization(fixture))
         self.assertEqual(0, self.check(fixture, "unit"))
+        self.assertEqual(0, self.begin_finalization(fixture))
         marker = fixture.attempt / "runtime" / "FINALIZATION.json"
         snapshot = fixture.attempt / "runtime" / "finalization-worktree.json"
         self.assertTrue(marker.is_file())
@@ -523,28 +549,18 @@ No additional background is needed.
         with self.assertRaisesRegex(SystemExit, "handoff is already published"):
             self.check(fixture, "unit")
 
-    def test_finalization_snapshot_allows_commit_but_rejects_later_source_edits(self) -> None:
-        commit_only = self.make_fixture(profile="direct")
-        (commit_only.worktree / "change.txt").write_text(
-            "task change before finalization\n",
-            encoding="utf-8",
-        )
-        self.assertEqual(0, self.begin_finalization(commit_only))
-        self.assertEqual(0, self.check(commit_only, "unit"))
-        marker_before = (
-            commit_only.attempt / "runtime" / "FINALIZATION.json"
-        ).read_bytes()
-        git(commit_only.worktree, "add", ".")
-        git(commit_only.worktree, "commit", "-m", "commit frozen finalization tree")
-        self.assertEqual(0, self.finalize(commit_only, "verified"))
-        self.assertEqual(
-            marker_before,
-            (commit_only.attempt / "runtime" / "FINALIZATION.json").read_bytes(),
-        )
+    def test_finalization_freezes_the_checked_commit_and_rejects_later_commits(self) -> None:
+        commit_drift = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.check(commit_drift, "unit"))
+        self.assertEqual(0, self.begin_finalization(commit_drift))
+        git(commit_drift.worktree, "commit", "--allow-empty", "-m", "illegal empty commit")
+        with self.assertRaisesRegex(SystemExit, "candidate commit changed"):
+            self.finalize(commit_drift, "verified")
+        self.assertFalse((commit_drift.attempt / "HANDOFF.json").exists())
 
         content_drift = self.make_fixture(profile="direct")
-        self.assertEqual(0, self.begin_finalization(content_drift))
         self.assertEqual(0, self.check(content_drift, "unit"))
+        self.assertEqual(0, self.begin_finalization(content_drift))
         (content_drift.worktree / "result.txt").write_text(
             "changed during grace\n",
             encoding="utf-8",
@@ -556,8 +572,8 @@ No additional background is needed.
         self.assertFalse((content_drift.attempt / "HANDOFF.json").exists())
 
         mode_drift = self.make_fixture(profile="direct")
-        self.assertEqual(0, self.begin_finalization(mode_drift))
         self.assertEqual(0, self.check(mode_drift, "unit"))
+        self.assertEqual(0, self.begin_finalization(mode_drift))
         result = mode_drift.worktree / "result.txt"
         result.chmod(result.stat().st_mode | 0o111)
         git(mode_drift.worktree, "add", "result.txt")
@@ -573,10 +589,16 @@ No additional background is needed.
             "implementation after baseline check\n",
             encoding="utf-8",
         )
-        self.assertEqual(0, self.begin_finalization(fixture))
-        self.assertEqual(0, self.check(fixture, "unit"))
+        with self.assertRaisesRegex(SystemExit, "committed and clean"):
+            self.begin_finalization(fixture)
+        self.assertFalse((fixture.attempt / "runtime" / "FINALIZATION.json").exists())
         git(fixture.worktree, "add", ".")
         git(fixture.worktree, "commit", "-m", "implementation after baseline")
+        with self.assertRaisesRegex(SystemExit, "no exact record"):
+            self.begin_finalization(fixture)
+        self.assertFalse((fixture.attempt / "runtime" / "FINALIZATION.json").exists())
+        self.assertEqual(0, self.check(fixture, "unit"))
+        self.assertEqual(0, self.begin_finalization(fixture))
         self.assertEqual(0, self.finalize(fixture, "verified"))
 
     def test_baseline_check_is_not_reused_for_a_different_final_tree(self) -> None:
@@ -586,11 +608,22 @@ No additional background is needed.
             "implementation after baseline check\n",
             encoding="utf-8",
         )
-        self.assertEqual(0, self.begin_finalization(fixture))
         git(fixture.worktree, "add", ".")
         git(fixture.worktree, "commit", "-m", "unchecked final implementation")
         with self.assertRaisesRegex(SystemExit, "no exact record"):
-            self.finalize(fixture, "verified")
+            self.begin_finalization(fixture)
+        self.assertFalse((fixture.attempt / "runtime" / "FINALIZATION.json").exists())
+
+    def test_check_record_is_bound_to_exact_commit_even_when_tree_is_unchanged(self) -> None:
+        fixture = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.check(fixture, "unit"))
+        git(fixture.worktree, "commit", "--allow-empty", "-m", "same tree new commit")
+        with self.assertRaisesRegex(SystemExit, "no exact record"):
+            self.begin_finalization(fixture)
+        self.assertFalse((fixture.attempt / "runtime" / "FINALIZATION.json").exists())
+        self.assertEqual(0, self.check(fixture, "unit"))
+        self.assertEqual(0, self.begin_finalization(fixture))
+        self.assertEqual(0, self.finalize(fixture, "verified"))
 
     def test_symlink_retarget_after_finalization_is_source_drift(self) -> None:
         fixture = self.make_fixture(profile="direct")
@@ -598,8 +631,10 @@ No additional background is needed.
         (fixture.worktree / "same-b.txt").write_text("same\n", encoding="utf-8")
         link = fixture.worktree / "current.txt"
         link.symlink_to("same-a.txt")
-        self.assertEqual(0, self.begin_finalization(fixture))
+        git(fixture.worktree, "add", ".")
+        git(fixture.worktree, "commit", "-m", "add symlink fixture")
         self.assertEqual(0, self.check(fixture, "unit"))
+        self.assertEqual(0, self.begin_finalization(fixture))
         link.unlink()
         link.symlink_to("same-b.txt")
         git(fixture.worktree, "add", ".")
@@ -635,7 +670,21 @@ No additional background is needed.
 
     def test_blocked_finalize_rejects_source_drift_after_entry(self) -> None:
         fixture = self.make_fixture(profile="direct")
-        self.assertEqual(0, self.begin_finalization(fixture))
+        with rdo.attempt_artifact_lock(fixture.attempt, exclusive=True):
+            attempt, task, status, metadata, binding = rdo._require_attempt_ownership(
+                fixture.attempt,
+                allow_ready=False,
+            )
+            rdo._start_finalization_locked(
+                attempt,
+                task,
+                status,
+                metadata,
+                binding,
+                require_deadline=True,
+                require_completion_gate=False,
+                require_acceptance_gate=False,
+            )
         (fixture.worktree / "result.txt").write_text(
             "changed after finalization\n",
             encoding="utf-8",
@@ -648,7 +697,7 @@ No additional background is needed.
                 blocking_reason="cannot finish",
             )
 
-    def test_full_final_workflow_creates_deadline_bound_marker(self) -> None:
+    def test_full_final_workflow_gates_acceptance_before_finalize_freezes(self) -> None:
         from tests.unit.test_strategy import strategy_payload
 
         fixture = self.make_fixture(profile="full")
@@ -691,6 +740,20 @@ No additional background is needed.
                 ),
             )
         self.assertEqual(0, self.check(fixture, "unit"))
+        (fixture.worktree / "result.txt").unlink()
+        git(fixture.worktree, "add", "-A")
+        git(fixture.worktree, "commit", "-m", "temporarily remove required output")
+        self.assertEqual(0, self.check(fixture, "unit"))
+        with self.assertRaisesRegex(SystemExit, "required outputs are missing"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rdo.workflow_action(
+                    argparse.Namespace(workflow_action="complete", **workflow_args)
+                )
+        self.assertFalse((fixture.attempt / "runtime" / "FINALIZATION.json").exists())
+        (fixture.worktree / "result.txt").write_text("done\n", encoding="utf-8")
+        git(fixture.worktree, "add", "result.txt")
+        git(fixture.worktree, "commit", "-m", "restore required output")
+        self.assertEqual(0, self.check(fixture, "unit"))
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(
                 0,
@@ -698,6 +761,8 @@ No additional background is needed.
                     argparse.Namespace(workflow_action="complete", **workflow_args)
                 ),
             )
+        self.assertFalse((fixture.attempt / "runtime" / "FINALIZATION.json").exists())
+        self.assertEqual(0, self.finalize(fixture, "review"))
         marker = json.loads(
             (fixture.attempt / "runtime" / "FINALIZATION.json").read_text()
         )
@@ -709,13 +774,15 @@ No additional background is needed.
             + deadline["finalization_grace_seconds"],
             marker["deadline_at_epoch"],
         )
-        self.assertEqual(0, self.finalize(fixture, "review"))
 
     def test_repeated_finalization_begin_is_idempotent(self) -> None:
         fixture = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.check(fixture, "unit"))
         self.assertEqual(0, self.begin_finalization(fixture))
         marker = fixture.attempt / "runtime" / "FINALIZATION.json"
         original = marker.read_bytes()
+        with self.assertRaisesRegex(SystemExit, "forbidden after candidate-bound"):
+            self.check(fixture, "unit")
         self.assertEqual(0, self.begin_finalization(fixture))
         self.assertEqual(original, marker.read_bytes())
 

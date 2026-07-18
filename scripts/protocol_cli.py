@@ -957,7 +957,7 @@ def _v2_log_binding_valid(attempt_dir: Path, record: Mapping[str, Any], prefix: 
 def _v2_finalization_binding(
     attempt_dir: Path,
     bundle: Any,
-) -> tuple[list[str], str | None, float | None]:
+) -> tuple[list[str], str | None, float | None, str | None, str | None]:
     """Independently validate the immutable source/deadline freeze."""
 
     from strategy import canonical_digest
@@ -979,7 +979,7 @@ def _v2_finalization_binding(
         reasons.append(
             f"EVIDENCE.json is missing finalization artifacts: {missing}"
         )
-        return reasons, None, None
+        return reasons, None, None, None, None
     try:
         snapshot_path = safe_ref(
             attempt_dir,
@@ -991,7 +991,7 @@ def _v2_finalization_binding(
         marker = load_json(marker_path)
         deadline = validate_attempt_deadline_payload(load_json(deadline_path))
     except (ArtifactBundleError, OSError, ValueError, json.JSONDecodeError) as exc:
-        return [f"finalization artifacts are invalid: {exc}"], None, None
+        return [f"finalization artifacts are invalid: {exc}"], None, None, None, None
     binding = bundle.task_inputs_binding
     if (
         not isinstance(snapshot, dict)
@@ -1006,6 +1006,8 @@ def _v2_finalization_binding(
         frozen_entries_sha256 = None
     else:
         frozen_entries_sha256 = str(snapshot["entries_sha256"])
+    frozen_source_commit: str | None = None
+    frozen_source_tree: str | None = None
     expected_marker = {
         "schema_version": 2,
         "artifact_protocol_version": 2,
@@ -1033,6 +1035,27 @@ def _v2_finalization_binding(
             reasons.append("FINALIZATION.json source snapshot digest is invalid")
         if marker.get("deadline_sha256") != file_sha256(deadline_path):
             reasons.append("FINALIZATION.json deadline digest is invalid")
+        candidate_identity_version = marker.get("candidate_identity_version")
+        if candidate_identity_version is not None:
+            source_commit = marker.get("source_commit")
+            source_tree = marker.get("source_tree")
+            if (
+                candidate_identity_version != 1
+                or snapshot.get("candidate_identity_version") != 1
+                or not isinstance(source_commit, str)
+                or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_commit)
+                is None
+                or not isinstance(source_tree, str)
+                or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_tree)
+                is None
+                or snapshot.get("source_commit") != source_commit
+                or snapshot.get("source_tree") != source_tree
+                or bundle.handoff.get("source_commit") != source_commit
+            ):
+                reasons.append("FINALIZATION.json candidate commit/tree binding is invalid")
+            else:
+                frozen_source_commit = source_commit
+                frozen_source_tree = source_tree
         grace = marker.get("grace_seconds")
         marker_deadline = marker.get("deadline_at_epoch")
         if (
@@ -1051,8 +1074,12 @@ def _v2_finalization_binding(
             > 1e-6
         ):
             reasons.append("FINALIZATION.json deadline arithmetic is invalid")
-    return reasons, frozen_entries_sha256, (
-        float(marker_started) if marker_started is not None else None
+    return (
+        reasons,
+        frozen_entries_sha256,
+        float(marker_started) if marker_started is not None else None,
+        frozen_source_commit,
+        frozen_source_tree,
     )
 
 
@@ -1068,7 +1095,13 @@ def _v2_acceptance_reasons(
     """Independently enforce frozen checks/outputs after bundle publication."""
 
     reasons: list[str] = []
-    finalization_reasons, frozen_entries_sha256, marker_started = (
+    (
+        finalization_reasons,
+        frozen_entries_sha256,
+        marker_started,
+        frozen_source_commit,
+        frozen_source_tree,
+    ) = (
         _v2_finalization_binding(attempt_dir, bundle)
     )
     reasons.extend(finalization_reasons)
@@ -1125,6 +1158,14 @@ def _v2_acceptance_reasons(
                 and record.get("source_after_entries_sha256")
                 == frozen_entries_sha256
                 and record.get("source_unchanged") is True
+                and (
+                    frozen_source_commit is None
+                    or record.get("source_commit") == frozen_source_commit
+                )
+                and (
+                    frozen_source_tree is None
+                    or record.get("source_tree") == frozen_source_tree
+                )
                 and (
                     "finalization_started_at_epoch" not in record
                     or marker_started is not None
@@ -1546,7 +1587,13 @@ def _validate_v2_handoff(
         if phase not in {"planning", "execution"}:
             reasons.append("blocked handoff requires an active planning or execution attempt")
         if bundle is not None:
-            finalization_reasons, _frozen_sha, _marker_started = (
+            (
+                finalization_reasons,
+                _frozen_sha,
+                _marker_started,
+                _frozen_commit,
+                _frozen_tree,
+            ) = (
                 _v2_finalization_binding(attempt_dir, bundle)
             )
             reasons.extend(finalization_reasons)

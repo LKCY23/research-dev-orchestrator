@@ -445,6 +445,9 @@ def validate_command_record(
     ):
         if field in record:
             _require_sha256(record[field], f"{label}.{field}")
+    for field in ("source_commit", "source_tree"):
+        if field in record:
+            _require_full_commit(record[field], f"{label}.{field}")
     if "source_unchanged" in record and not isinstance(
         record["source_unchanged"],
         bool,
@@ -723,6 +726,8 @@ def build_evidence(
             "source_after_entries_sha256",
             "source_snapshot_entries_sha256",
             "source_unchanged",
+            "source_commit",
+            "source_tree",
             "cleanup_verified",
             "cleanup_failure_reason",
         ):
@@ -1051,6 +1056,8 @@ def _validate_evidence(
         expected_fields = (
             "category",
             "check_id",
+            "source_commit",
+            "source_tree",
             "acceptance_contract_sha256",
             "argv",
             "cwd",

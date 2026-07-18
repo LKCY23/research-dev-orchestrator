@@ -146,12 +146,13 @@ session. When the worker exits, times out, or publishes a valid handoff marker,
 supervision quiesces the process group, records the outcome, and exits.
 
 Finalization grace is independent deadline time, but it is not additional
-implementation time. At entry RDO publishes immutable
-`runtime/finalization-worktree.json` and `runtime/FINALIZATION.json`. The worker
-may add or repeat exact required-check records, commit the already-frozen tree,
-and call `rdo finalize`. A required-check record qualifies only when its
-before/after semantic source digest equals the frozen snapshot, so a stale
-baseline pass cannot validate later code. Workflow activity and `rdo exec` are
-rejected; any persistent content, path, symlink target/kind, or mode drift
-makes finalization fail. If complete process cleanup cannot be verified,
-dispatch fails closed and retains its execution lock.
+implementation or verification time. Before entry, the worker commits a clean
+candidate and completes exact `rdo check` records; each record binds the Git
+commit, tree, and semantic source identity. Only after every required record
+and output matches does RDO publish immutable
+`runtime/finalization-worktree.json` and `runtime/FINALIZATION.json`. During
+grace, the worker may only publish the handoff through `rdo finalize`; checks,
+commits, workflow activity, `rdo exec`, and source changes are rejected. A
+stale baseline pass therefore cannot validate later code, and a failed
+preflight leaves no finalization marker. If complete process cleanup cannot be
+verified, dispatch fails closed and retains its execution lock.

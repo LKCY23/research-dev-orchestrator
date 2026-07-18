@@ -297,6 +297,25 @@ def _command_cwd(worktree: Path, relative: str) -> Path:
     return candidate
 
 
+def _candidate_source_identity(
+    worktree: Path,
+    *,
+    expected_branch: str,
+) -> dict[str, Any]:
+    """Return the exact clean Git candidate that acceptance is allowed to prove."""
+
+    require_clean_task_worktree(worktree, expected_branch)
+    source_commit = git_output(worktree, "rev-parse", "HEAD")
+    source_tree = git_output(worktree, "rev-parse", f"{source_commit}^{{tree}}")
+    entries = _semantic_worktree_entries(worktree)
+    return {
+        "source_commit": source_commit,
+        "source_tree": source_tree,
+        "entries": entries,
+        "entries_sha256": canonical_digest(entries),
+    }
+
+
 def _append_command_record(path: Path, record: dict[str, Any]) -> None:
     """Append one complete NDJSON record with a single O_APPEND write."""
 
@@ -353,6 +372,7 @@ def _check_command_locked(args: argparse.Namespace) -> int:
     worktree = _worktree_for_attempt(metadata)
     finalization_marker: dict[str, Any] | None = None
     frozen_entries_sha256: str | None = None
+    candidate_requires_clean = True
     if (attempt / FINALIZATION_REF).exists():
         finalization_marker = _validate_finalization_marker(
             attempt,
@@ -360,6 +380,10 @@ def _check_command_locked(args: argparse.Namespace) -> int:
             attempt_id=binding.attempt_id,
             task_inputs_sha256=binding.task_inputs_sha256,
         )
+        if finalization_marker.get("candidate_identity_version") == 1:
+            raise SystemExit(
+                "rdo check is forbidden after candidate-bound finalization starts"
+            )
         _validate_finalization_source_unchanged(
             attempt,
             worktree,
@@ -367,6 +391,27 @@ def _check_command_locked(args: argparse.Namespace) -> int:
         )
         snapshot = load_json(attempt / FINALIZATION_SNAPSHOT_REF)
         frozen_entries_sha256 = str(snapshot["entries_sha256"])
+        candidate = {
+            "source_commit": snapshot.get("source_commit"),
+            "source_tree": snapshot.get("source_tree"),
+            "entries": snapshot.get("entries"),
+            "entries_sha256": frozen_entries_sha256,
+        }
+        # Compatibility for a v2 attempt that entered finalization before
+        # candidate-bound checks were introduced. Its selector continues to
+        # use the frozen semantic entries only.
+        candidate_requires_clean = False
+        candidate["source_commit"] = git_output(worktree, "rev-parse", "HEAD")
+        candidate["source_tree"] = git_output(
+            worktree,
+            "rev-parse",
+            f"{candidate['source_commit']}^{{tree}}",
+        )
+    else:
+        candidate = _candidate_source_identity(
+            worktree,
+            expected_branch=str(status.get("branch") or ""),
+        )
     source_before = _semantic_worktree_entries(worktree)
     source_before_sha256 = canonical_digest(source_before)
     cwd = _command_cwd(worktree, definition["cwd"])
@@ -424,19 +469,37 @@ def _check_command_locked(args: argparse.Namespace) -> int:
 
     source_after = _semantic_worktree_entries(worktree)
     source_after_sha256 = canonical_digest(source_after)
-    source_unchanged = source_before == source_after
-    if finalization_marker is not None:
-        source_unchanged = bool(
-            source_unchanged
-            and source_before_sha256 == frozen_entries_sha256
-            and source_after_sha256 == frozen_entries_sha256
+    try:
+        source_after_commit = git_output(worktree, "rev-parse", "HEAD")
+        source_after_tree = git_output(
+            worktree,
+            "rev-parse",
+            f"{source_after_commit}^{{tree}}",
         )
-        if not source_unchanged:
-            with stderr_path.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    "source tree changed while a finalize-only acceptance check ran\n"
-                )
-            exit_code = 126
+        if candidate_requires_clean:
+            require_clean_task_worktree(
+                worktree,
+                str(status.get("branch") or ""),
+            )
+        source_after_clean = True
+    except SystemExit:
+        source_after_commit = None
+        source_after_tree = None
+        source_after_clean = False
+    source_unchanged = bool(
+        source_before == source_after
+        and source_before_sha256 == candidate["entries_sha256"]
+        and source_after_sha256 == candidate["entries_sha256"]
+        and source_after_commit == candidate["source_commit"]
+        and source_after_tree == candidate["source_tree"]
+        and source_after_clean
+    )
+    if not source_unchanged:
+        with stderr_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "acceptance command changed the clean candidate source identity\n"
+            )
+        exit_code = 126
 
     finished_at_epoch = time.time()
     record: dict[str, Any] = {
@@ -469,6 +532,8 @@ def _check_command_locked(args: argparse.Namespace) -> int:
         "source_before_entries_sha256": source_before_sha256,
         "source_after_entries_sha256": source_after_sha256,
         "source_unchanged": source_unchanged,
+        "source_commit": candidate["source_commit"],
+        "source_tree": candidate["source_tree"],
     }
     if finalization_marker is not None:
         record["finalization_started_at_epoch"] = finalization_marker[
@@ -2273,6 +2338,8 @@ def select_required_check_records(
     binding: Any,
     *,
     expected_source_entries_sha256: str | None = None,
+    expected_source_commit: str | None = None,
+    expected_source_tree: str | None = None,
 ) -> tuple[list[Any], list[str]]:
     """Select one exact successful record for every frozen required check."""
 
@@ -2283,9 +2350,16 @@ def select_required_check_records(
     acceptance_sha256 = binding.task_inputs["inputs"]["acceptance"]["sha256"]
     marker_path = attempt / FINALIZATION_REF
     marker: dict[str, Any] | None = None
-    if not marker_path.exists() and expected_source_entries_sha256 is None:
+    if not marker_path.exists() and any(
+        value is None
+        for value in (
+            expected_source_entries_sha256,
+            expected_source_commit,
+            expected_source_tree,
+        )
+    ):
         return [], [
-            "required acceptance checks are not bound to the final source tree"
+            "required acceptance checks are not bound to an exact clean candidate commit"
         ]
     if marker_path.exists():
         try:
@@ -2297,10 +2371,14 @@ def select_required_check_records(
             )
             snapshot = load_json(attempt / FINALIZATION_SNAPSHOT_REF)
             frozen_entries_sha256 = snapshot["entries_sha256"]
+            frozen_source_commit = snapshot.get("source_commit")
+            frozen_source_tree = snapshot.get("source_tree")
         except (OSError, ValueError, SystemExit) as exc:
             return [], [f"finalization source binding is invalid: {exc}"]
     else:
         frozen_entries_sha256 = expected_source_entries_sha256
+        frozen_source_commit = expected_source_commit
+        frozen_source_tree = expected_source_tree
     selected: list[Any] = []
     reasons: list[str] = []
     for definition in contract.get("required_commands", []):
@@ -2323,6 +2401,14 @@ def select_required_check_records(
                 and payload.get("source_after_entries_sha256")
                 == frozen_entries_sha256
                 and payload.get("source_unchanged") is True
+                and (
+                    frozen_source_commit is None
+                    or payload.get("source_commit") == frozen_source_commit
+                )
+                and (
+                    frozen_source_tree is None
+                    or payload.get("source_tree") == frozen_source_tree
+                )
                 and (
                     "finalization_started_at_epoch" not in payload
                     or marker is not None
@@ -2407,12 +2493,37 @@ def completion_gate_reasons(
                     expected_attempt_id=attempt.name,
                 )
                 contract = _validate_frozen_sources(attempt, task, binding)
+                metadata = load_json(attempt / "ATTEMPT.json")
+                candidate = _candidate_source_identity(
+                    _worktree_for_attempt(metadata),
+                    expected_branch=str(status.get("branch") or ""),
+                )
                 _selected, check_reasons = select_required_check_records(
                     attempt,
                     contract,
                     binding,
+                    expected_source_entries_sha256=candidate["entries_sha256"],
+                    expected_source_commit=candidate["source_commit"],
+                    expected_source_tree=candidate["source_tree"],
                 )
                 reasons.extend(check_reasons)
+                missing_outputs = _required_outputs_exist(
+                    _worktree_for_attempt(metadata),
+                    contract,
+                )
+                if missing_outputs:
+                    reasons.append(f"required outputs are missing: {missing_outputs}")
+                else:
+                    try:
+                        build_required_output_bindings(
+                            _worktree_for_attempt(metadata),
+                            str(candidate["source_commit"]),
+                            list(contract.get("required_outputs", [])),
+                        )
+                    except ArtifactBundleError as exc:
+                        reasons.append(
+                            f"required outputs are not bound to source_commit: {exc}"
+                        )
             except (ArtifactBundleError, SystemExit) as exc:
                 reasons.append(f"acceptance evidence is invalid: {exc}")
         else:
@@ -2687,9 +2798,9 @@ def _emit_deadline_notice(attempt: Path) -> None:
         "phase": phase,
         "remaining_seconds": round(remaining, 3),
         "required_action": (
-            "freeze source and finalize or publish blocked"
+            "commit a clean candidate, run required checks, then finalize or publish blocked"
             if phase == "execution"
-            else "only checks, commit, handoff, or finalize are allowed"
+            else "only handoff publication through rdo finalize is allowed"
         ),
     }
     print(
@@ -2704,9 +2815,14 @@ def _finalization_snapshot_payload(
     task_id: str,
     attempt_id: str,
     worktree: Path,
+    candidate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    entries = _semantic_worktree_entries(worktree)
-    return {
+    entries = (
+        list(candidate["entries"])
+        if candidate is not None
+        else _semantic_worktree_entries(worktree)
+    )
+    payload = {
         "schema_version": 2,
         "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
         "task_id": task_id,
@@ -2715,6 +2831,13 @@ def _finalization_snapshot_payload(
         "file_count": len(entries),
         "entries": entries,
     }
+    if candidate is not None:
+        payload.update(
+            candidate_identity_version=1,
+            source_commit=candidate["source_commit"],
+            source_tree=candidate["source_tree"],
+        )
+    return payload
 
 
 def _validate_finalization_marker(
@@ -2784,6 +2907,21 @@ def _validate_finalization_marker(
         != canonical_digest(snapshot.get("entries"))
     ):
         raise SystemExit("finalization source snapshot is invalid")
+    candidate_identity_version = marker.get("candidate_identity_version")
+    if candidate_identity_version is not None:
+        if candidate_identity_version != 1:
+            raise SystemExit("finalization candidate identity version is unsupported")
+        if snapshot.get("candidate_identity_version") != 1:
+            raise SystemExit("finalization source snapshot is missing candidate identity")
+        source_commit = marker.get("source_commit")
+        source_tree = marker.get("source_tree")
+        if (
+            not isinstance(source_commit, str)
+            or not isinstance(source_tree, str)
+            or snapshot.get("source_commit") != source_commit
+            or snapshot.get("source_tree") != source_tree
+        ):
+            raise SystemExit("finalization candidate commit/tree binding is invalid")
     try:
         snapshot_ctime = float(
             snapshot_path.stat(follow_symlinks=False).st_ctime
@@ -2840,6 +2978,7 @@ def _start_finalization_locked(
     *,
     require_deadline: bool,
     require_completion_gate: bool = True,
+    require_acceptance_gate: bool = True,
 ) -> dict[str, Any]:
     """Atomically freeze the source tree and enter one non-resettable grace."""
 
@@ -2865,6 +3004,41 @@ def _start_finalization_locked(
         if reasons:
             raise SystemExit("finalization entry gate failed: " + "; ".join(reasons))
 
+    worktree = _worktree_for_attempt(metadata)
+    candidate: dict[str, Any] | None = None
+    if require_acceptance_gate:
+        candidate = _candidate_source_identity(
+            worktree,
+            expected_branch=str(status.get("branch") or ""),
+        )
+        contract = _validate_frozen_sources(attempt, task, binding)
+        _selected, acceptance_reasons = select_required_check_records(
+            attempt,
+            contract,
+            binding,
+            expected_source_entries_sha256=candidate["entries_sha256"],
+            expected_source_commit=candidate["source_commit"],
+            expected_source_tree=candidate["source_tree"],
+        )
+        if acceptance_reasons:
+            raise SystemExit(
+                "finalization entry acceptance gate failed: "
+                + "; ".join(acceptance_reasons)
+            )
+        missing_outputs = _required_outputs_exist(worktree, contract)
+        if missing_outputs:
+            raise SystemExit(f"required outputs are missing: {missing_outputs}")
+        try:
+            build_required_output_bindings(
+                worktree,
+                str(candidate["source_commit"]),
+                list(contract.get("required_outputs", [])),
+            )
+        except ArtifactBundleError as exc:
+            raise SystemExit(
+                f"required outputs are not bound to source_commit: {exc}"
+            ) from exc
+
     deadline, deadline_sha256 = _load_attempt_deadline(attempt)
     if require_deadline and deadline is None:
         raise SystemExit("finalization entry requires runtime/DEADLINE.json")
@@ -2877,11 +3051,11 @@ def _start_finalization_locked(
         if deadline is not None
         else DEFAULT_FINALIZATION_GRACE_SECONDS
     )
-    worktree = _worktree_for_attempt(metadata)
     snapshot = _finalization_snapshot_payload(
         task_id=str(status.get("task_id")),
         attempt_id=attempt.name,
         worktree=worktree,
+        candidate=candidate,
     )
     try:
         snapshot_sha256 = publish_json_once(
@@ -2915,18 +3089,23 @@ def _start_finalization_locked(
             "deadline_ref": ATTEMPT_DEADLINE_REF if deadline is not None else None,
             "deadline_sha256": deadline_sha256,
             "allowed_actions": [
-                "required rdo check records",
-                "git commit",
-                "handoff",
                 "rdo finalize",
             ],
             "forbidden_actions": [
                 "production file edits",
                 "workflow activity",
                 "rdo exec",
+                "rdo check",
+                "git commit",
                 "implementation expansion",
             ],
         }
+        if candidate is not None:
+            marker.update(
+                candidate_identity_version=1,
+                source_commit=candidate["source_commit"],
+                source_tree=candidate["source_tree"],
+            )
         publish_json_once(marker_path, marker)
     except ArtifactBundleError as exc:
         raise SystemExit(f"cannot enter finalization: {exc}") from exc
@@ -2951,6 +3130,17 @@ def _validate_finalization_source_unchanged(
             "task worktree changed after finalization started; "
             "start a new attempt for further implementation"
         )
+    if marker.get("candidate_identity_version") == 1:
+        source_commit = git_output(worktree, "rev-parse", "HEAD")
+        source_tree = git_output(worktree, "rev-parse", f"{source_commit}^{{tree}}")
+        if (
+            source_commit != marker.get("source_commit")
+            or source_tree != marker.get("source_tree")
+        ):
+            raise SystemExit(
+                "task candidate commit changed after finalization started; "
+                "start a new attempt for further implementation"
+            )
 
 
 def finalization_action(args: argparse.Namespace) -> int:
@@ -3028,17 +3218,11 @@ def _workflow_action_locked(args: argparse.Namespace) -> int:
         completed_after = completed | {args.workflow_id}
         required = {item["workflow_id"] for item in strategy["workflows"] if item["required"]}
         if required.issubset(completed_after):
-            status_path = task / "STATUS.json"
-            task_status = load_json(status_path) if status_path.exists() else None
-            v2_execution = bool(
-                isinstance(task_status, dict)
-                and task_protocol(task, task_status) == ARTIFACT_PROTOCOL_VERSION
-            )
             reasons = completion_gate_reasons(
                 attempt,
                 strategy,
                 completing_workflow=args.workflow_id,
-                include_acceptance=not v2_execution,
+                include_acceptance=True,
             )
             if reasons:
                 raise SystemExit("workflow completion gate failed: " + "; ".join(reasons))
@@ -3073,26 +3257,10 @@ def _workflow_action_locked(args: argparse.Namespace) -> int:
         if required.issubset(completed_after):
             status_path = task / "STATUS.json"
             status = load_json(status_path) if status_path.exists() else None
-            if (
+            if not (
                 isinstance(status, dict)
                 and task_protocol(task, status) == ARTIFACT_PROTOCOL_VERSION
             ):
-                owned_attempt, owned_task, status, metadata, binding = (
-                    _require_attempt_ownership(
-                        attempt,
-                        allow_ready=False,
-                    )
-                )
-                _start_finalization_locked(
-                    owned_attempt,
-                    owned_task,
-                    status,
-                    metadata,
-                    binding,
-                    require_deadline=True,
-                    require_completion_gate=True,
-                )
-            else:
                 marker = runtime / "FINALIZATION.json"
                 if not marker.exists():
                     write_json(
@@ -3355,6 +3523,7 @@ def _finalize_v2_locked(args: argparse.Namespace) -> int:
             binding,
             require_deadline=True,
             require_completion_gate=False,
+            require_acceptance_gate=False,
         )
         _validate_finalization_source_unchanged(
             attempt,
@@ -3369,57 +3538,8 @@ def _finalize_v2_locked(args: argparse.Namespace) -> int:
         if status.get("state") != "running":
             raise SystemExit(f"{args.state} finalization requires running state")
         if not (attempt / FINALIZATION_REF).exists():
-            # Compatibility path: do not freeze an attempt merely because
-            # finalize was called too early.  First prove that the current
-            # clean source tree already has matching acceptance records and
-            # outputs; only then create the immutable marker.
-            require_clean_task_worktree(
-                worktree,
-                str(status.get("branch") or ""),
-            )
-            prospective_commit = git_output(worktree, "rev-parse", "HEAD")
-            prospective_entries_sha256 = canonical_digest(
-                _semantic_worktree_entries(worktree)
-            )
-            _prospective_selected, prospective_reasons = (
-                select_required_check_records(
-                    attempt,
-                    contract,
-                    binding,
-                    expected_source_entries_sha256=prospective_entries_sha256,
-                )
-            )
-            if prospective_reasons:
-                raise SystemExit(
-                    "acceptance gate failed: " + "; ".join(prospective_reasons)
-                )
-            prospective_missing_outputs = _required_outputs_exist(worktree, contract)
-            if prospective_missing_outputs:
-                raise SystemExit(
-                    f"required outputs are missing: {prospective_missing_outputs}"
-                )
-            try:
-                build_required_output_bindings(
-                    worktree,
-                    prospective_commit,
-                    list(contract.get("required_outputs", [])),
-                )
-            except ArtifactBundleError as exc:
-                raise SystemExit(
-                    f"required outputs are not bound to source_commit: {exc}"
-                ) from exc
-            if profile == "full":
-                strategy = _bound_strategy_for_attempt(task, attempt, metadata)
-                workflow_reasons = completion_gate_reasons(
-                    attempt,
-                    strategy,
-                    include_acceptance=False,
-                )
-                if workflow_reasons:
-                    raise SystemExit(
-                        "handoff completion gate failed: "
-                        + "; ".join(workflow_reasons)
-                    )
+            # Entry itself performs every recoverable preflight before it
+            # publishes either create-once finalization artifact.
             finalization_marker = _start_finalization_locked(
                 attempt,
                 task,
