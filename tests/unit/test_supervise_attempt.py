@@ -11,6 +11,7 @@ from pathlib import Path
 
 from artifact_bundle import publish_bundle
 from completion import write_completion
+from process_test_support import require_process_integration
 from supervisor import load_or_create_attempt_deadline, pid_alive
 from supervise_attempt import _human_usage_receipt
 from task_contract import TASK_INPUT_FILENAMES, build_task_inputs_payload
@@ -21,6 +22,10 @@ SUPERVISOR = ROOT / "scripts" / "supervise_attempt.py"
 
 
 class InteractiveAttemptSupervisorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if self._testMethodName != "test_human_usage_receipt_projects_cost_overage":
+            require_process_integration()
+
     def write_json(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")

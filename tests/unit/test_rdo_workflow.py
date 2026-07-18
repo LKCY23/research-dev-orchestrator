@@ -125,23 +125,78 @@ class WorkflowCompletionGateTests(unittest.TestCase):
             runtime = attempt / "runtime"
             reviews = runtime / "reviews"
             reviews.mkdir(parents=True)
+            started_at = rdo.utc_now()
             (reviews / "one.md").write_text("No findings.\n")
             (reviews / "two.md").write_text("One minor finding.\n")
             with (runtime / "BACKEND_EVENTS.ndjson").open("w") as handle:
-                handle.write(json.dumps({"event": "subagent_started", "session_id": "reviewer-1"}) + "\n")
-                handle.write(json.dumps({"event": "backend_agent_started", "agent_id": "reviewer-2"}) + "\n")
+                handle.write(json.dumps({"at": started_at, "event": "subagent_started", "session_id": "reviewer-1"}) + "\n")
+                handle.write(json.dumps({"at": started_at, "event": "backend_agent_started", "agent_id": "reviewer-2"}) + "\n")
+                stopped_at = rdo.utc_now()
+                handle.write(json.dumps({"at": stopped_at, "event": "subagent_stopped", "session_id": "reviewer-1"}) + "\n")
+                handle.write(json.dumps({"at": stopped_at, "event": "backend_agent_stopped", "agent_id": "reviewer-2"}) + "\n")
             definition = {"review": {"mode": "independent", "required_reviewers": 2}}
             evidence = rdo.independent_review_evidence(attempt, definition, [
                 f"reviewer-1={reviews / 'one.md'}",
                 f"reviewer-2={reviews / 'two.md'}",
-            ])
+            ], workflow_id="WF-review", instance_id="I001", workflow_started_at=started_at)
             self.assertEqual({item["reviewer_id"] for item in evidence}, {"reviewer-1", "reviewer-2"})
-            with self.assertRaisesRegex(SystemExit, "not observed"):
+            self.assertTrue(all(item["receipt_ref"] for item in evidence))
+            (runtime / "WORKFLOWS.ndjson").write_text(
+                json.dumps(
+                    {
+                        "event": "workflow_completed",
+                        "workflow_id": "WF-review",
+                        "instance_id": "I001",
+                        "reviews": evidence,
+                    }
+                ) + "\n",
+                encoding="utf-8",
+            )
+            refs = rdo._reviewer_evidence_refs(attempt)
+            self.assertEqual(2, len(refs))
+            self.assertTrue(all(item["receipt_sha256"] for item in refs))
+            linked = reviews / "linked.md"
+            linked.symlink_to(reviews / "one.md")
+            with self.assertRaisesRegex(SystemExit, "must not traverse symlinks"):
+                rdo.independent_review_evidence(
+                    attempt,
+                    {"review": {"mode": "independent", "required_reviewers": 1}},
+                    [f"reviewer-1={linked}"],
+                    workflow_id="WF-review",
+                    instance_id="I-symlink",
+                    workflow_started_at=started_at,
+                )
+            with self.assertRaisesRegex(SystemExit, "no completed lifecycle|not observed"):
                 rdo.independent_review_evidence(
                     attempt, definition, [
                         f"reviewer-1={reviews / 'one.md'}",
                         f"fake={reviews / 'two.md'}",
-                    ]
+                    ], workflow_id="WF-review", instance_id="I002", workflow_started_at=started_at
+                )
+
+    def test_independent_review_rejects_artifact_created_after_reviewer_stopped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary) / "A001"
+            reviews = attempt / "runtime" / "reviews"
+            reviews.mkdir(parents=True)
+            started_at = "2026-07-18T00:00:00Z"
+            stopped_at = "2026-07-18T00:00:01Z"
+            (attempt / "runtime" / "BACKEND_EVENTS.ndjson").write_text(
+                json.dumps({"at": started_at, "event": "subagent_started", "session_id": "reviewer-1"}) + "\n" +
+                json.dumps({"at": stopped_at, "event": "subagent_stopped", "session_id": "reviewer-1"}) + "\n",
+                encoding="utf-8",
+            )
+            artifact = reviews / "late.md"
+            artifact.write_text("Written by the primary worker later.\n", encoding="utf-8")
+            definition = {"review": {"mode": "independent", "required_reviewers": 1}}
+            with self.assertRaisesRegex(SystemExit, "not written during"):
+                rdo.independent_review_evidence(
+                    attempt,
+                    definition,
+                    [f"reviewer-1={artifact}"],
+                    workflow_id="WF-review",
+                    instance_id="I001",
+                    workflow_started_at=started_at,
                 )
 
     def test_completed_review_evidence_digest_cannot_drift_before_finalize(self):

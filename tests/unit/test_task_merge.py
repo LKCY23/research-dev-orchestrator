@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from collect_status import validate_merged_task
+from process_test_support import require_process_integration
 from rdo import task_merge, task_review
 from worktree_fingerprint import fingerprint
 
@@ -237,6 +238,7 @@ class TaskMergeTests(unittest.TestCase):
             self.merge()
 
     def test_failed_post_merge_verification_is_recorded_as_merged(self):
+        require_process_integration()
         result = self.merge(verify_command=["python3 -c 'raise SystemExit(3)'"])
         self.assertEqual(result, 1)
         self.assertEqual(json.loads((self.task / "STATUS.json").read_text())["state"], "merged")
@@ -245,6 +247,7 @@ class TaskMergeTests(unittest.TestCase):
         self.assertEqual(event["verification"]["results"][0]["exit_code"], 3)
 
     def test_timed_out_post_merge_verification_kills_descendants(self):
+        require_process_integration()
         helper = self.task / "logs" / "spawn-descendant.py"
         helper.write_text(
             "import pathlib, subprocess, sys, time\n"

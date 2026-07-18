@@ -39,6 +39,17 @@ class RdoArtifactV2Tests(unittest.TestCase):
     task_id = "T101-v2"
     attempt_id = "A001"
 
+    def setUp(self) -> None:
+        # These are artifact/FSM tests, not process-supervision integration.
+        # Keep command execution real while replacing host process discovery;
+        # the real ps/signal boundary is covered by process smoke tests.
+        process_table = patch("supervisor._process_table", return_value={})
+        tagged = patch("supervisor.tagged_processes", return_value=set())
+        process_table.start()
+        tagged.start()
+        self.addCleanup(process_table.stop)
+        self.addCleanup(tagged.stop)
+
     def write_json(self, path: Path, payload: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

@@ -135,7 +135,17 @@ The coordinator approves the explicit source-to-target mapping. At dispatch, RDO
 
 Acceptance command records are deliberately attempt-local. A strategy whose required workflows are all `reuse` is rejected when `acceptance_commands_pass=true`; at least one required workflow must remain or use `revalidate` to produce current acceptance evidence.
 
-An independent review workflow must declare `kind: "review"` and `review: {"mode": "independent", "required_reviewers": N}`. It must use read-only `native_subagents` with `max_agents >= N`. Each reviewer writes a non-empty artifact under `runtime/reviews/`; completion supplies `--review-evidence REVIEWER_ID=ARTIFACT_PATH`. RDO accepts completion only when the reviewer IDs are distinct and appear in backend lifecycle events. A primary worker cannot declare its own scan to be independent review.
+An independent review workflow must declare `kind: "review"` and `review:
+{"mode": "independent", "required_reviewers": N}`. It must use read-only
+`native_subagents` with `max_agents >= N`. Each reviewer writes a non-empty
+artifact under `runtime/reviews/`; completion supplies `--review-evidence
+REVIEWER_ID=ARTIFACT_PATH`. RDO accepts completion only when every distinct
+reviewer has a completed backend lifecycle contained inside that exact review
+workflow instance and the artifact was written inside the lifecycle interval.
+The deterministic workflow gate publishes an immutable reviewer receipt that
+binds both lifecycle event digests and the artifact digest. Final evidence
+retains the workflow/instance/receipt closure. Merely starting a subagent and
+then having the primary worker create an artifact does not satisfy this gate.
 
 Non-acceptance workflow commands run through `rdo exec` are bounded and
 audited as workflow activity. Required acceptance commands run only through

@@ -173,6 +173,49 @@ def _load_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return payload, None
 
 
+def load_attempt_tmux_identity(
+    attempt_dir: Path,
+    *,
+    run_id: str,
+    task_id: str,
+    attempt_id: str,
+    session_name: str,
+) -> dict[str, Any]:
+    """Load one exact dispatch-time tmux identity receipt."""
+
+    payload, error = _load_object(attempt_dir / TMUX_IDENTITY_REF)
+    if error or payload is None:
+        raise TmuxLifecycleError(error or "tmux identity receipt is unavailable")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("run_id") != run_id
+        or payload.get("task_id") != task_id
+        or payload.get("attempt_id") != attempt_id
+        or payload.get("session_name") != session_name
+        or not isinstance(payload.get("session_id"), str)
+        or not payload.get("session_id")
+        or not isinstance(payload.get("created_at_epoch"), int)
+        or isinstance(payload.get("created_at_epoch"), bool)
+    ):
+        raise TmuxLifecycleError("tmux identity receipt does not match its attempt")
+    return {
+        "session_id": payload["session_id"],
+        "created_at_epoch": payload["created_at_epoch"],
+        "session_name": session_name,
+    }
+
+
+def revalidate_live_tmux_identity(expected: dict[str, Any]) -> dict[str, Any]:
+    """Fail closed unless the receipt still names the same live session."""
+
+    observed = inspect_live_tmux_session(str(expected["session_id"]))
+    if observed is None:
+        raise TmuxLifecycleError("tmux session from the dispatch receipt is no longer live")
+    if observed != expected:
+        raise TmuxLifecycleError("live tmux identity does not match the dispatch receipt")
+    return observed
+
+
 def _safe_text(path: Path) -> str | None:
     if not path.is_file() or path.is_symlink():
         return None
@@ -251,29 +294,18 @@ def _attempt_reference(
     active = bool(is_current and task_state in _ACTIVE_TASK_STATES)
     cleanup_verified, cleanup_reason = _cleanup_evidence(attempt_dir)
     transcript = _transcript_ref(attempt_dir)
-    tmux_identity, tmux_identity_error = _load_object(
-        attempt_dir / TMUX_IDENTITY_REF
-    )
     expected_identity: dict[str, Any] | None = None
-    if tmux_identity is not None:
-        if (
-            tmux_identity.get("schema_version") == 1
-            and tmux_identity.get("run_id") == run_id
-            and tmux_identity.get("task_id") == task_id
-            and tmux_identity.get("attempt_id") == attempt_id
-            and tmux_identity.get("session_name") == session_name
-            and isinstance(tmux_identity.get("session_id"), str)
-            and tmux_identity.get("session_id")
-            and isinstance(tmux_identity.get("created_at_epoch"), int)
-            and not isinstance(tmux_identity.get("created_at_epoch"), bool)
-        ):
-            expected_identity = {
-                "session_id": tmux_identity["session_id"],
-                "created_at_epoch": tmux_identity["created_at_epoch"],
-                "session_name": session_name,
-            }
-        else:
-            tmux_identity_error = "tmux identity receipt does not match its attempt"
+    tmux_identity_error: str | None = None
+    try:
+        expected_identity = load_attempt_tmux_identity(
+            attempt_dir,
+            run_id=run_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            session_name=session_name,
+        )
+    except TmuxLifecycleError as exc:
+        tmux_identity_error = str(exc)
 
     reasons = list(identity_reasons)
     if lock_matches and not active:

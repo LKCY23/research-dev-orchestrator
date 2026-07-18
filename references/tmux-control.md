@@ -29,10 +29,12 @@ separate actions. Recognized legacy-v0.5/v1 attempts use their historical
 With `RDO_TMUX_KEEP_SESSION=1`, the runner leaves a login shell in the pane after
 the worker process has been quiesced, so an attached observer can still inspect
 the attempt. Otherwise dispatch cleans up the tmux session after validation.
-When a session is created, dispatch best-effort records its tmux ID, name, and
-creation time in attempt-local `runtime/TMUX_SESSION.json`. This receipt binds
-later lifecycle cleanup to the created session instead of trusting a reusable
-session name.
+Dispatch creates the tmux session in a parked state, durably records its tmux
+ID, name, and creation time in attempt-local `runtime/TMUX_SESSION.json`, and
+only then starts the worker in that session. A new-protocol attempt fails
+startup and closes the parked session when this receipt cannot be written.
+Later lifecycle cleanup and worker control bind to the receipt instead of
+trusting a reusable session name.
 
 ## Lifecycle Inventory And Prune
 
@@ -70,11 +72,17 @@ tmux send-keys -t "$session" -l "$message"
 tmux send-keys -t "$session" Enter
 ```
 
-Use `rdo worker message` instead. Its result distinguishes `submitted` or `queued` from `acted_on`; pane echo alone cannot prove that a worker executed an instruction.
+Use `rdo worker message` instead. Immediately before submission it requires the
+current attempt, dispatch lock, receipt ID/name/creation time, and live tmux
+identity to agree, then targets the stable tmux ID. Its result distinguishes
+`submitted` or `queued` from `acted_on`; pane echo alone cannot prove that a
+worker executed an instruction.
 
 ## Interrupt And Terminate
 
-- `rdo worker interrupt` sends `Ctrl-C` to the pane. It may stop only the foreground tool.
+- `rdo worker interrupt` performs the same identity revalidation as `message`
+  and sends `Ctrl-C` to the receipt-bound pane. It may stop only the foreground
+  tool.
 - `rdo worker terminate` acts only while the attempt supervisor reports
   `running`. It revalidates the live worker PID, dedicated PGID, and inherited
   supervision token before signalling, then verifies descendant cleanup.

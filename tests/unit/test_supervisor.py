@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from process_test_support import require_process_integration
 from supervisor import (
     AttemptDeadline,
     audit_supervision_token,
@@ -23,6 +24,29 @@ from supervisor import (
 
 
 class SupervisorTests(unittest.TestCase):
+    _PROCESS_INTEGRATION_TESTS = {
+        "test_current_termination_cleans_a_live_token_bound_process_group",
+        "test_timeout_kills_descendants",
+        "test_completion_signal_quiesces_worker_and_normalizes_exit",
+        "test_natural_parent_exit_cleans_reparented_setsid_child",
+        "test_finalization_timeout_stops_worker",
+        "test_finalization_entry_before_hard_deadline_gets_full_grace",
+        "test_finalization_entry_is_latched_and_cannot_be_reset",
+        "test_early_finalization_does_not_shorten_remaining_attempt_time",
+        "test_publication_grace_crossing_deadline_remains_successful",
+        "test_natural_exit_near_deadline_is_not_retroactively_timed_out",
+        "test_small_deadline_overrun_is_not_accepted_as_success",
+        "test_result_keeps_the_deadline_digest_loaded_before_worker_spawn",
+        "test_state_contains_structured_deadline_reminder",
+        "test_signal_handler_cannot_spawn_an_escaping_detached_child",
+        "test_nested_supervision_preserves_outer_cleanup_token",
+        "test_unavailable_process_table_is_reported_as_unverified_cleanup",
+    }
+
+    def setUp(self) -> None:
+        if self._testMethodName in self._PROCESS_INTEGRATION_TESTS:
+            require_process_integration()
+
     def test_read_only_token_audit_reports_current_identities(self):
         table = {41001: (1, 41001), 41002: (41001, 41001)}
         with (

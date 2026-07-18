@@ -14,6 +14,8 @@ import time
 import unittest
 from pathlib import Path
 
+from process_test_support import require_process_integration
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -763,6 +765,7 @@ class ProtocolCliV2Tests(unittest.TestCase):
         self.assertIn("--finalization-timeout-seconds 90", supervisor)
 
     def test_full_dispatch_rejects_worker_replacement_of_frozen_approved_strategy(self) -> None:
+        require_process_integration()
         from tests.unit.test_strategy import strategy_payload
 
         self.set_task_profile("full")

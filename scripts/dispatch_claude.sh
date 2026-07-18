@@ -103,6 +103,33 @@ cleanup_attempt_processes() {
   return "${cleanup_code}"
 }
 
+write_tmux_identity_startup_failure() {
+  local detail="$1"
+  python3 - "${ATTEMPT_DIR}/runtime/STARTUP.json" "${detail}" <<'PY'
+import json
+import os
+import pathlib
+import sys
+from datetime import datetime, timezone
+
+path = pathlib.Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+payload = {
+    "mode": "human",
+    "state": "tui_startup_failed",
+    "failed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "failure": {
+        "code": "tmux_identity_receipt_failed",
+        "message": sys.argv[2],
+    },
+    "startup_evidence": {"event": "tmux_identity_receipt_failed"},
+}
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+}
+
 run_tmux_worker_once() {
   TMUX_WORKER_LAUNCHED=0
   EXIT_CODE_FILE="${ATTEMPT_DIR}/exit_code"
@@ -131,17 +158,37 @@ import sys
 print("exec " + shlex.quote(sys.argv[1]))
 PY
 )"
-  tmux new-session -d -s "${TMUX_SESSION}" "${TMUX_COMMAND}"
-  TMUX_WORKER_LAUNCHED=1
-  python3 "${SCRIPT_DIR}/tmux_lifecycle.py" record \
+  # Create the tmux identity before starting the worker. This prevents a new
+  # protocol attempt from running without a durable receipt for later control.
+  tmux new-session -d -s "${TMUX_SESSION}" "sleep 2147483647"
+  set +e
+  TMUX_RECEIPT_ERROR="$(python3 "${SCRIPT_DIR}/tmux_lifecycle.py" record \
     --output "${ATTEMPT_DIR}/runtime/TMUX_SESSION.json" \
     --run-id "${RUN_ID}" \
     --task-id "${TASK_ID}" \
     --attempt-id "${ATTEMPT_ID}" \
-    --session-name "${TMUX_SESSION}" >/dev/null 2>&1 || true
-  if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
-    tmux pipe-pane -o -t "${TMUX_SESSION}" "cat >> '${TRANSCRIPT_PATH}'" || true
+    --session-name "${TMUX_SESSION}" 2>&1 >/dev/null)"
+  TMUX_RECEIPT_CODE=$?
+  set -e
+  if [[ "${TMUX_RECEIPT_CODE}" -ne 0 ]]; then
+    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+    set +e
+    write_tmux_identity_startup_failure "${TMUX_RECEIPT_ERROR:-tmux identity receipt could not be persisted}"
+    set -e
+    return 125
   fi
+  TMUX_SESSION_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["session_id"])' "${ATTEMPT_DIR}/runtime/TMUX_SESSION.json")"
+  if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
+    tmux pipe-pane -o -t "${TMUX_SESSION_ID}" "cat >> '${TRANSCRIPT_PATH}'" || true
+  fi
+  if ! tmux respawn-pane -k -t "${TMUX_SESSION_ID}" "${TMUX_COMMAND}"; then
+    tmux kill-session -t "${TMUX_SESSION_ID}" 2>/dev/null || true
+    set +e
+    write_tmux_identity_startup_failure "tmux could not start the worker in the receipt-bound session"
+    set -e
+    return 125
+  fi
+  TMUX_WORKER_LAUNCHED=1
   WAIT_START="$(date +%s)"
   while [[ ! -f "${EXIT_CODE_FILE}" ]]; do
     STARTUP_PROBE_MARKER="${ATTEMPT_DIR}/runtime/human-startup-probed"

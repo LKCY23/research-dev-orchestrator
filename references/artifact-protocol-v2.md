@@ -274,7 +274,17 @@ Its review-manifest shape is:
     {"ref": "runtime/commands/C001.stderr.log", "sha256": "<sha256>"}
   ],
   "artifacts": [],
-  "reviewer_evidence": []
+  "reviewer_evidence": [
+    {
+      "reviewer_id": "reviewer-1",
+      "workflow_id": "WF-review",
+      "instance_id": "WF-review-I001",
+      "ref": "runtime/reviews/reviewer-1.md",
+      "sha256": "<sha256>",
+      "receipt_ref": "runtime/reviewer-receipts/<sha256>.json",
+      "receipt_sha256": "<sha256>"
+    }
+  ]
 }
 ```
 
@@ -283,6 +293,13 @@ Only stable logs may be selected into `EVIDENCE.json`. In particular,
 worker finalization must not freeze its digest. The exact stdout/stderr logs
 created by completed `rdo check` records are stable and are the normal evidence
 log selection.
+
+Independent reviewer evidence additionally closes over an immutable lifecycle
+receipt. The receipt binds the exact review workflow and instance, reviewer
+start/stop event digests, artifact ref/digest, and artifact modification time.
+The workflow completion gate creates it only after observing a complete
+reviewer lifecycle within that workflow; bundle validation rechecks both the
+receipt digest and its semantic binding.
 
 `required_outputs` is distinct from generic attempt-local artifacts. Every
 required output must be a regular non-symlink file tracked by `source_commit`

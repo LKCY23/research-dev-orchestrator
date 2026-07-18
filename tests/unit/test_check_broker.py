@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from process_test_support import require_process_integration
 from check_broker import (
     BROKER_ATTEMPT_ENV,
     BROKER_DIR_ENV,
@@ -25,6 +26,10 @@ MACHINE_SUPERVISOR = ROOT / "scripts" / "machine_attempt_supervisor.py"
 
 
 class CheckBrokerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        if self._testMethodName != "test_declared_broker_identity_mismatch_fails_closed":
+            require_process_integration()
+
     def run_with_broker(
         self,
         argv: list[str],

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from artifact_bundle import publish_bundle
 from completion import write_completion
+from process_test_support import require_process_integration
 from machine_attempt_supervisor import (
     session_id_from_event,
     startup_event,
@@ -26,6 +27,16 @@ SUPERVISOR = ROOT / "scripts" / "machine_attempt_supervisor.py"
 
 
 class MachineAttemptSupervisorTests(unittest.TestCase):
+    _PURE_UNIT_TESTS = {
+        "test_backend_session_id_decoders",
+        "test_backend_startup_event_decoders",
+        "test_codex_progress_requires_model_or_tool_output",
+    }
+
+    def setUp(self) -> None:
+        if self._testMethodName not in self._PURE_UNIT_TESTS:
+            require_process_integration()
+
     def write_json(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")

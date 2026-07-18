@@ -249,6 +249,11 @@ leaving the task permanently `running`.
 
 Do not use attempt state to represent task success. `completed` means the attempt completed protocol handoff, not that the task is approved or merged.
 
+A read-only post-task cleanup audit uses lifecycle terminality rather than
+success. Both `completed` and `invalid_handoff` attempts are eligible once the
+outer supervisor is terminal (`completed`, `timed_out`, or `cleanup_failed`).
+Active attempts and nonterminal/missing supervisor receipts remain ineligible.
+
 ## Handoff Fields
 
 `handoff_valid` must be:

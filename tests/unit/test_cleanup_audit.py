@@ -18,7 +18,14 @@ class CleanupAuditTests(unittest.TestCase):
         )
         self.assertIs(rdo.cleanup_audit, arguments.func)
 
-    def fixture(self, root: Path) -> Path:
+    def fixture(
+        self,
+        root: Path,
+        *,
+        attempt_state: str = "completed",
+        outcome: str = "completed",
+        supervisor_state: str = "completed",
+    ) -> Path:
         task = root / "tasks" / "T001"
         attempt = task / "attempts" / "A001"
         (attempt / "runtime").mkdir(parents=True)
@@ -37,7 +44,8 @@ class CleanupAuditTests(unittest.TestCase):
                 {
                     "task_id": "T001",
                     "attempt_id": "A001",
-                    "state": "completed",
+                    "state": attempt_state,
+                    "outcome": outcome,
                 }
             ),
             encoding="utf-8",
@@ -45,7 +53,7 @@ class CleanupAuditTests(unittest.TestCase):
         (attempt / "runtime" / "supervisor.json").write_text(
             json.dumps(
                 {
-                    "state": "completed",
+                    "state": supervisor_state,
                     "supervision_token": "a" * 32,
                     "cleanup_verified": True,
                     "cleanup_failure_reason": None,
@@ -139,7 +147,39 @@ class CleanupAuditTests(unittest.TestCase):
                 code, payload = self.run_audit(attempt)
             self.assertEqual(2, code)
             self.assertEqual("ineligible", payload["status"])
-            self.assertEqual("attempt_not_completed", payload["reason"])
+            self.assertEqual("attempt_not_terminal", payload["reason"])
+            inspect.assert_not_called()
+
+    def test_terminal_failed_attempts_are_eligible_for_leak_audit(self):
+        cases = (
+            ("startup_failed", "completed"),
+            ("timed_out_unfinalized", "timed_out"),
+            ("invalid_handoff", "cleanup_failed"),
+        )
+        for outcome, supervisor_state in cases:
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                attempt = self.fixture(
+                    Path(temporary),
+                    attempt_state="invalid_handoff",
+                    outcome=outcome,
+                    supervisor_state=supervisor_state,
+                )
+                with patch.object(
+                    rdo,
+                    "audit_supervision_token",
+                    return_value=SupervisionAuditResult(True, None, ()),
+                ):
+                    code, payload = self.run_audit(attempt)
+                self.assertEqual(0, code)
+                self.assertTrue(payload["eligible"])
+
+    def test_nonterminal_supervisor_state_is_ineligible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = self.fixture(Path(temporary), supervisor_state="process_started")
+            with patch.object(rdo, "audit_supervision_token") as inspect:
+                code, payload = self.run_audit(attempt)
+            self.assertEqual(2, code)
+            self.assertEqual("supervisor_not_terminal", payload["reason"])
             inspect.assert_not_called()
 
     def test_invalid_supervision_token_is_invalid_evidence(self):

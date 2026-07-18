@@ -162,6 +162,78 @@ class ArtifactBundleTests(unittest.TestCase):
             )
             self.assertEqual(bundle.ready_sha256, loaded.ready_sha256)
 
+    def test_reviewer_receipt_binds_workflow_artifact_and_backend_lifecycle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = self.make_attempt(Path(temporary))
+            artifact = attempt / "runtime" / "reviews" / "reviewer-1.md"
+            artifact.parent.mkdir()
+            artifact.write_text("No findings.\n", encoding="utf-8")
+            start = {
+                "at": "2026-07-18T00:00:00Z",
+                "event": "subagent_started",
+                "session_id": "reviewer-1",
+            }
+            stop = {
+                "at": "2026-07-18T00:00:01Z",
+                "event": "subagent_stopped",
+                "session_id": "reviewer-1",
+            }
+            events = attempt / "runtime" / "BACKEND_EVENTS.ndjson"
+            events.write_text(
+                json.dumps(start, sort_keys=True) + "\n" +
+                json.dumps(stop, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            artifact_ref = artifact.relative_to(attempt).as_posix()
+            artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+            event_digest = lambda value: hashlib.sha256(
+                json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            receipt_ref = "runtime/reviewer-receipts/reviewer-1.json"
+            receipt_sha = artifact_bundle.publish_json_once(
+                attempt / receipt_ref,
+                {
+                    "schema_version": 1,
+                    "artifact_protocol_version": 2,
+                    "receipt_type": "independent_review",
+                    "task_id": "T001",
+                    "attempt_id": "A001",
+                    "workflow_id": "WF-review",
+                    "instance_id": "WF-review-I001",
+                    "reviewer_id": "reviewer-1",
+                    "reviewer_started_at": start["at"],
+                    "reviewer_start_event_sha256": event_digest(start),
+                    "reviewer_stopped_at": stop["at"],
+                    "reviewer_stop_event_sha256": event_digest(stop),
+                    "artifact_ref": artifact_ref,
+                    "artifact_sha256": artifact_sha,
+                    "artifact_mtime_ns": artifact.stat().st_mtime_ns,
+                },
+            )
+            self.publish(
+                attempt,
+                reviewer_evidence=[
+                    {
+                        "reviewer_id": "reviewer-1",
+                        "workflow_id": "WF-review",
+                        "instance_id": "WF-review-I001",
+                        "ref": artifact_ref,
+                        "receipt_ref": receipt_ref,
+                        "receipt_sha256": receipt_sha,
+                    }
+                ],
+            )
+            self.assertEqual("reviewer-1", load_bundle(attempt).evidence["reviewer_evidence"][0]["reviewer_id"])
+
+            events.write_text(json.dumps(start, sort_keys=True) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(IntegrityError, "backend lifecycle event"):
+                load_bundle(attempt)
+
     def test_attempt_binds_exact_task_inputs_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             attempt = self.make_attempt(Path(temporary))

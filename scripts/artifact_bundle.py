@@ -755,7 +755,28 @@ def build_evidence(
         if key in reviewer_keys:
             raise IntegrityError("reviewer evidence must not contain duplicates")
         reviewer_keys.add(key)
-        normalized_reviewers.append({"reviewer_id": reviewer_id, **_artifact_descriptor(attempt_dir, ref)})
+        workflow_id = item.get("workflow_id")
+        instance_id = item.get("instance_id")
+        receipt_ref = item.get("receipt_ref")
+        receipt_sha256 = item.get("receipt_sha256")
+        if not all(
+            isinstance(value, str) and value
+            for value in (workflow_id, instance_id, receipt_ref, receipt_sha256)
+        ):
+            raise IntegrityError("reviewer evidence requires a workflow lifecycle receipt")
+        receipt = _artifact_descriptor(attempt_dir, receipt_ref)
+        if receipt["sha256"] != receipt_sha256:
+            raise IntegrityError("reviewer lifecycle receipt digest does not match")
+        normalized_reviewers.append(
+            {
+                "reviewer_id": reviewer_id,
+                "workflow_id": workflow_id,
+                "instance_id": instance_id,
+                **_artifact_descriptor(attempt_dir, ref),
+                "receipt_ref": receipt_ref,
+                "receipt_sha256": receipt_sha256,
+            }
+        )
 
     return {
         "schema_version": ARTIFACT_PROTOCOL_VERSION,
@@ -1073,6 +1094,91 @@ def _validate_evidence(
             _validate_descriptor(attempt_dir, descriptor, label)
             if field == "reviewer_evidence":
                 _require_non_empty_string(descriptor, "reviewer_id", label)
+                _require_non_empty_string(descriptor, "workflow_id", label)
+                _require_non_empty_string(descriptor, "instance_id", label)
+                receipt_ref = _require_non_empty_string(descriptor, "receipt_ref", label)
+                receipt_sha256 = _require_sha256(
+                    descriptor.get("receipt_sha256"),
+                    f"{label}.receipt_sha256",
+                )
+                receipt_path = safe_ref(attempt_dir, receipt_ref)
+                if file_sha256(receipt_path) != receipt_sha256:
+                    raise IntegrityError(f"{label}.receipt_sha256 does not match {receipt_ref}")
+                receipt = _load_json_ref(
+                    attempt_dir,
+                    receipt_ref,
+                    f"{label}.receipt",
+                )
+                expected_receipt = {
+                    "schema_version": 1,
+                    "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
+                    "receipt_type": "independent_review",
+                    "task_id": evidence.get("task_id"),
+                    "attempt_id": evidence.get("attempt_id"),
+                    "workflow_id": descriptor["workflow_id"],
+                    "instance_id": descriptor["instance_id"],
+                    "reviewer_id": descriptor["reviewer_id"],
+                    "artifact_ref": descriptor["ref"],
+                    "artifact_sha256": descriptor["sha256"],
+                }
+                if any(
+                    receipt.get(key) != value
+                    for key, value in expected_receipt.items()
+                ):
+                    raise IntegrityError(f"{label}.receipt does not match reviewer evidence")
+                for digest_field in (
+                    "reviewer_start_event_sha256",
+                    "reviewer_stop_event_sha256",
+                ):
+                    _require_sha256(
+                        receipt.get(digest_field),
+                        f"{label}.receipt.{digest_field}",
+                    )
+                events_path = safe_ref(attempt_dir, "runtime/BACKEND_EVENTS.ndjson")
+                try:
+                    backend_events = [
+                        json.loads(line)
+                        for line in events_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise IntegrityError(
+                        f"{label}.receipt backend lifecycle evidence is unreadable: {exc}"
+                    ) from exc
+                event_by_digest = {
+                    sha256_bytes(_canonical_bytes(event)): event
+                    for event in backend_events
+                    if isinstance(event, dict)
+                }
+                lifecycle_checks = (
+                    (
+                        "reviewer_start_event_sha256",
+                        "reviewer_started_at",
+                        {"subagent_started", "subagent-start", "backend_agent_started"},
+                    ),
+                    (
+                        "reviewer_stop_event_sha256",
+                        "reviewer_stopped_at",
+                        {"subagent_stopped", "subagent-stop", "backend_agent_stopped"},
+                    ),
+                )
+                for digest_field, time_field, allowed_events in lifecycle_checks:
+                    lifecycle_event = event_by_digest.get(receipt[digest_field])
+                    lifecycle_id = (
+                        lifecycle_event.get("session_id")
+                        or lifecycle_event.get("agent_id")
+                        if isinstance(lifecycle_event, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(lifecycle_event, dict)
+                        or lifecycle_event.get("event") not in allowed_events
+                        or lifecycle_event.get("at") != receipt.get(time_field)
+                        or lifecycle_id != descriptor["reviewer_id"]
+                    ):
+                        raise IntegrityError(
+                            f"{label}.receipt does not bind a matching backend lifecycle event"
+                        )
 
     log_descriptors = {
         item.get("ref"): item.get("sha256")

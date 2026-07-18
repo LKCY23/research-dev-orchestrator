@@ -30,6 +30,7 @@ from artifact_bundle import (
     load_command_records,
     publish_bundle,
     publish_json_once,
+    safe_ref,
     validate_artifact_binding,
     validate_required_output_bindings,
     validate_task_inputs_binding,
@@ -86,6 +87,8 @@ from tmux_lifecycle import (
     build_tmux_inventory,
     kill_live_tmux_session,
     list_live_tmux_sessions,
+    load_attempt_tmux_identity,
+    revalidate_live_tmux_identity,
 )
 from worktree_fingerprint import fingerprint
 
@@ -2425,26 +2428,127 @@ def completion_gate_reasons(
     return reasons
 
 
-def observed_reviewer_ids(attempt: Path) -> set[str]:
-    path = attempt / "runtime" / "BACKEND_EVENTS.ndjson"
-    if not path.exists():
-        return set()
-    reviewers: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
+def _reviewer_event_identity(record: dict[str, Any]) -> str | None:
+    identifier = record.get("session_id") or record.get("agent_id")
+    return identifier if isinstance(identifier, str) and identifier else None
+
+
+def _reviewer_lifecycle_receipt(
+    attempt: Path,
+    *,
+    workflow_id: str,
+    instance_id: str,
+    workflow_started_at: str,
+    reviewer_id: str,
+    artifact: Path,
+) -> dict[str, str]:
+    """Bind reviewer evidence to one completed backend lifecycle interval."""
+
+    workflow_start = parse_iso(workflow_started_at)
+    if workflow_start is None:
+        raise SystemExit("independent review workflow has an invalid start timestamp")
+    events_path = attempt / "runtime" / "BACKEND_EVENTS.ndjson"
+    if not events_path.is_file() or events_path.is_symlink():
+        raise SystemExit("independent review backend lifecycle evidence is unavailable")
+    active_start: dict[str, Any] | None = None
+    completed_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(f"independent review lifecycle evidence is unreadable: {exc}") from exc
+    for line in lines:
         if not line.strip():
             continue
-        record = json.loads(line)
-        if record.get("event") not in {"subagent_started", "subagent-start", "backend_agent_started"}:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"independent review lifecycle evidence is invalid: {exc}") from exc
+        if not isinstance(record, dict) or _reviewer_event_identity(record) != reviewer_id:
             continue
-        if record.get("event") == "subagent-start" and record.get("result") != "started":
+        observed_at = parse_iso(record.get("at"))
+        if observed_at is None:
             continue
-        identifier = record.get("session_id") or record.get("agent_id")
-        if isinstance(identifier, str) and identifier:
-            reviewers.add(identifier)
-    return reviewers
+        event_name = record.get("event")
+        started = event_name in {
+            "subagent_started",
+            "subagent-start",
+            "backend_agent_started",
+        } and not (event_name == "subagent-start" and record.get("result") != "started")
+        stopped = event_name in {
+            "subagent_stopped",
+            "subagent-stop",
+            "backend_agent_stopped",
+        } and not (event_name == "subagent-stop" and record.get("result") != "stopped")
+        if started:
+            active_start = record if observed_at >= workflow_start else None
+        elif stopped and active_start is not None:
+            started_at = parse_iso(active_start.get("at"))
+            if started_at is not None and observed_at >= started_at:
+                completed_pairs.append((active_start, record))
+            active_start = None
+    if not completed_pairs:
+        raise SystemExit(
+            f"reviewer {reviewer_id!r} has no completed lifecycle inside "
+            f"workflow instance {instance_id!r}"
+        )
+    start_event, stop_event = completed_pairs[-1]
+    start_at = parse_iso(start_event.get("at"))
+    stop_at = parse_iso(stop_event.get("at"))
+    assert start_at is not None and stop_at is not None
+    modified_at = artifact.stat(follow_symlinks=False).st_mtime
+    if modified_at < start_at.timestamp() - 1.0 or modified_at > stop_at.timestamp() + 1.0:
+        raise SystemExit(
+            f"review artifact for {reviewer_id!r} was not written during its "
+            "observed reviewer lifecycle"
+        )
+    artifact_ref = artifact.relative_to(attempt.resolve()).as_posix()
+    artifact_sha256 = file_sha256(artifact)
+    receipt_key = hashlib.sha256(
+        f"{workflow_id}\0{instance_id}\0{reviewer_id}".encode("utf-8")
+    ).hexdigest()
+    receipt_ref = f"runtime/reviewer-receipts/{receipt_key}.json"
+    receipt_path = attempt / receipt_ref
+    receipt = {
+        "schema_version": 1,
+        "artifact_protocol_version": ARTIFACT_PROTOCOL_VERSION,
+        "receipt_type": "independent_review",
+        "task_id": attempt.parent.parent.name,
+        "attempt_id": attempt.name,
+        "workflow_id": workflow_id,
+        "instance_id": instance_id,
+        "reviewer_id": reviewer_id,
+        "reviewer_started_at": start_event["at"],
+        "reviewer_start_event_sha256": canonical_digest(start_event),
+        "reviewer_stopped_at": stop_event["at"],
+        "reviewer_stop_event_sha256": canonical_digest(stop_event),
+        "artifact_ref": artifact_ref,
+        "artifact_sha256": artifact_sha256,
+        "artifact_mtime_ns": artifact.stat(follow_symlinks=False).st_mtime_ns,
+    }
+    try:
+        receipt_sha256 = publish_json_once(receipt_path, receipt)
+    except ArtifactBundleError as exc:
+        raise SystemExit(f"reviewer lifecycle receipt could not be published: {exc}") from exc
+    return {
+        "reviewer_id": reviewer_id,
+        "artifact": str(artifact),
+        "sha256": artifact_sha256,
+        "workflow_id": workflow_id,
+        "instance_id": instance_id,
+        "receipt_ref": receipt_ref,
+        "receipt_sha256": receipt_sha256,
+    }
 
 
-def independent_review_evidence(attempt: Path, definition: dict[str, Any], values: list[str]) -> list[dict[str, str]]:
+def independent_review_evidence(
+    attempt: Path,
+    definition: dict[str, Any],
+    values: list[str],
+    *,
+    workflow_id: str,
+    instance_id: str,
+    workflow_started_at: str,
+) -> list[dict[str, str]]:
     review = definition.get("review", {})
     if review.get("mode") != "independent":
         if values:
@@ -2456,23 +2560,34 @@ def independent_review_evidence(attempt: Path, definition: dict[str, Any], value
         reviewer, separator, raw_path = value.partition("=")
         if not separator or not reviewer or not raw_path:
             raise SystemExit("review evidence must use REVIEWER_ID=ARTIFACT_PATH")
-        artifact = Path(raw_path).resolve()
+        raw_artifact = Path(os.path.abspath(raw_path))
+        raw_evidence_root = Path(os.path.abspath(attempt / "runtime" / "reviews"))
+        if raw_evidence_root not in raw_artifact.parents:
+            raise SystemExit(f"review artifact must be under {raw_evidence_root}")
+        cursor = raw_artifact
+        while cursor != raw_evidence_root:
+            if cursor.is_symlink():
+                raise SystemExit(f"review artifact path must not traverse symlinks: {raw_artifact}")
+            cursor = cursor.parent
+        artifact = raw_artifact.resolve()
         if evidence_root not in artifact.parents:
             raise SystemExit(f"review artifact must be under {evidence_root}")
         if not artifact.is_file() or artifact.stat().st_size == 0:
             raise SystemExit(f"review artifact is missing or empty: {artifact}")
-        evidence.append({
-            "reviewer_id": reviewer,
-            "artifact": str(artifact),
-            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-        })
+        evidence.append(
+            _reviewer_lifecycle_receipt(
+                attempt,
+                workflow_id=workflow_id,
+                instance_id=instance_id,
+                workflow_started_at=workflow_started_at,
+                reviewer_id=reviewer,
+                artifact=artifact,
+            )
+        )
     reviewer_ids = [item["reviewer_id"] for item in evidence]
     required = int(review["required_reviewers"])
     if len(set(reviewer_ids)) < required:
         raise SystemExit(f"independent review requires {required} distinct reviewer artifacts")
-    unobserved = sorted(set(reviewer_ids) - observed_reviewer_ids(attempt))
-    if unobserved:
-        raise SystemExit(f"reviewers were not observed as backend agent instances: {unobserved}")
     return evidence
 
 
@@ -2909,7 +3024,7 @@ def _workflow_action_locked(args: argparse.Namespace) -> int:
     else:
         if args.instance_id not in active:
             raise SystemExit("completion requires an active workflow instance")
-        reviews = independent_review_evidence(attempt, definition, getattr(args, "review_evidence", []))
+        reviews = []
         completed_after = completed | {args.workflow_id}
         required = {item["workflow_id"] for item in strategy["workflows"] if item["required"]}
         if required.issubset(completed_after):
@@ -2936,6 +3051,15 @@ def _workflow_action_locked(args: argparse.Namespace) -> int:
         if elapsed > definition["budget"]["wall_seconds"]:
             timed_out = True
             name = "workflow_timed_out"
+    if name == "workflow_completed":
+        reviews = independent_review_evidence(
+            attempt,
+            definition,
+            getattr(args, "review_evidence", []),
+            workflow_id=args.workflow_id,
+            instance_id=args.instance_id,
+            workflow_started_at=str(active[args.instance_id].get("at")),
+        )
     record = {"at": utc_now(), "event": name, "workflow_id": args.workflow_id, "instance_id": args.instance_id, "attempt_id": attempt.name}
     if name == "workflow_completed" and reviews:
         record["reviews"] = reviews
@@ -3135,9 +3259,51 @@ def _reviewer_evidence_refs(attempt: Path) -> list[dict[str, str]]:
             declared_digest = review.get("sha256")
             if not isinstance(declared_digest, str) or file_sha256(resolved) != declared_digest:
                 raise SystemExit("reviewer evidence changed after workflow completion")
+            receipt_ref = review.get("receipt_ref")
+            receipt_digest = review.get("receipt_sha256")
+            workflow_id = review.get("workflow_id")
+            instance_id = review.get("instance_id")
+            if not all(
+                isinstance(value, str) and value
+                for value in (receipt_ref, receipt_digest, workflow_id, instance_id)
+            ):
+                raise SystemExit("reviewer evidence is missing its workflow lifecycle receipt")
+            try:
+                receipt_path = safe_ref(attempt, receipt_ref)
+            except ArtifactBundleError as exc:
+                raise SystemExit("reviewer lifecycle receipt must be a safe attempt-local ref") from exc
+            if (
+                not receipt_path.is_file()
+                or file_sha256(receipt_path) != receipt_digest
+            ):
+                raise SystemExit("reviewer lifecycle receipt changed after workflow completion")
+            receipt = load_json(receipt_path)
+            if not isinstance(receipt, dict):
+                raise SystemExit("reviewer lifecycle receipt must be a JSON object")
+            expected_receipt = {
+                "receipt_type": "independent_review",
+                "task_id": attempt.parent.parent.name,
+                "attempt_id": attempt.name,
+                "workflow_id": workflow_id,
+                "instance_id": instance_id,
+                "reviewer_id": reviewer_id,
+                "artifact_ref": ref,
+                "artifact_sha256": declared_digest,
+            }
+            if any(receipt.get(field) != value for field, value in expected_receipt.items()):
+                raise SystemExit("reviewer lifecycle receipt does not match workflow evidence")
             key = (reviewer_id, ref)
             if key not in seen:
-                result.append({"reviewer_id": reviewer_id, "ref": ref})
+                result.append(
+                    {
+                        "reviewer_id": reviewer_id,
+                        "ref": ref,
+                        "workflow_id": workflow_id,
+                        "instance_id": instance_id,
+                        "receipt_ref": receipt_ref,
+                        "receipt_sha256": receipt_digest,
+                    }
+                )
                 seen.add(key)
     return result
 
@@ -3694,15 +3860,16 @@ def cleanup_audit(args: argparse.Namespace) -> int:
         and metadata.get("attempt_id") == attempt.name
     )
     supervisor_state = supervisor.get("state") if isinstance(supervisor, dict) else None
-    supervisor_finished = bool(
-        isinstance(supervisor_state, str)
-        and supervisor_state
-        and supervisor_state != "running"
-    )
-    completed = bool(
+    attempt_terminal = metadata.get("state") in {"completed", "invalid_handoff"}
+    supervisor_terminal = supervisor_state in {
+        "completed",
+        "timed_out",
+        "cleanup_failed",
+    }
+    eligible = bool(
         identity_valid
-        and metadata.get("state") == "completed"
-        and supervisor_finished
+        and attempt_terminal
+        and supervisor_terminal
     )
     recorded_cleanup = (
         {
@@ -3719,22 +3886,22 @@ def cleanup_audit(args: argparse.Namespace) -> int:
         "task_id": task_id,
         "attempt_id": attempt.name,
         "audited_at": utc_now(),
-        "eligible": completed,
+        "eligible": eligible,
         "observation_scope": "current_token_visible_processes",
         "recorded_cleanup": recorded_cleanup,
         "live_processes": [],
     }
-    if not completed:
+    if not eligible:
         reason = (
             "attempt_identity_mismatch"
             if not identity_valid
             else "supervisor_state_missing"
             if not isinstance(supervisor, dict)
-            else "attempt_not_completed"
-            if metadata.get("state") != "completed"
+            else "attempt_not_terminal"
+            if not attempt_terminal
             else "supervisor_still_running"
             if supervisor_state == "running"
-            else "supervisor_state_invalid"
+            else "supervisor_not_terminal"
         )
         print(json.dumps({**base, "status": "ineligible", "reason": reason}, indent=2))
         return 2
@@ -3854,17 +4021,55 @@ def control(args: argparse.Namespace) -> int:
     attempt_id = status.get("current_attempt_id")
     lock = path / ".dispatch-lock"
     if args.worker_action in {"message", "interrupt"}:
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise SystemExit("worker control requires a current attempt identity")
+        attempt = path / "attempts" / attempt_id
+        metadata = load_json(attempt / "ATTEMPT.json")
+        runtime = metadata.get("runtime")
+        runtime = runtime if isinstance(runtime, dict) else {}
+        session = runtime.get("tmux_session")
+        if runtime.get("backend") != "tmux" or not isinstance(session, str) or not session:
+            raise SystemExit("worker control requires an active tmux attempt")
         session_file = lock / "tmux_session"
-        if not session_file.exists():
+        lock_attempt_file = lock / "attempt_id"
+        if not session_file.is_file() or not lock_attempt_file.is_file():
             raise SystemExit("worker control requires an active tmux session")
-        session = session_file.read_text().strip()
+        if (
+            session_file.read_text(encoding="utf-8").strip() != session
+            or lock_attempt_file.read_text(encoding="utf-8").strip() != attempt_id
+        ):
+            raise SystemExit("dispatch lock does not match the current tmux attempt")
+        try:
+            identity = load_attempt_tmux_identity(
+                attempt,
+                run_id=path.parent.parent.name,
+                task_id=str(status.get("task_id")),
+                attempt_id=attempt_id,
+                session_name=session,
+            )
+            revalidate_live_tmux_identity(identity)
+        except TmuxLifecycleError as exc:
+            raise SystemExit(str(exc)) from exc
+        target = str(identity["session_id"])
         if args.worker_action == "message":
-            subprocess.run(["tmux", "send-keys", "-t", session, "-l", args.text], check=True)
-            subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
-            name, result = "worker_instruction_submitted", {"status": "submitted", "session": session}
+            subprocess.run(["tmux", "send-keys", "-t", target, "-l", args.text], check=True)
+            try:
+                revalidate_live_tmux_identity(identity)
+            except TmuxLifecycleError as exc:
+                raise SystemExit(str(exc)) from exc
+            subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+            name, result = "worker_instruction_submitted", {
+                "status": "submitted",
+                "session": session,
+                "session_id": target,
+            }
         else:
-            subprocess.run(["tmux", "send-keys", "-t", session, "C-c"], check=True)
-            name, result = "worker_interrupted", {"status": "interrupt_sent", "session": session}
+            subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], check=True)
+            name, result = "worker_interrupted", {
+                "status": "interrupt_sent",
+                "session": session,
+                "session_id": target,
+            }
     else:
         metadata = path / "attempts" / str(attempt_id) / "runtime" / "supervisor.json"
         if not metadata.exists():

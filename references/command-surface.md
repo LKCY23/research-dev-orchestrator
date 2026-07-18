@@ -22,8 +22,11 @@ rdo task preview-prompt --task-dir <path>
 rdo tmux list [--repo-root <path>] [--run <run-id>] [--active]
 ```
 
-Cleanup audit is eligible only after the attempt and its outer supervisor have
-finished. It compares no historical PID or PGID as proof of ownership; it
+Cleanup audit is eligible after either a successful or failed attempt has a
+terminal `ATTEMPT.json` lifecycle and a terminal outer-supervisor receipt.
+This deliberately includes `startup_failed`, timeout, execution failure,
+invalid handoff, and cleanup-failure attempts. It compares no historical PID
+or PGID as proof of ownership; it
 reports only processes whose current userspace state exposes the attempt's
 supervision token lineage. A zero result is therefore
 `no_live_processes_observed`, not an absolute containment proof. The command
@@ -103,7 +106,13 @@ not perform coordinator review or a task-state transition.
 `rdo handoff`, task-root handoff/evidence, free-text command evidence, and
 `COMPLETION.json` remain legacy-v0.5/v1 compatibility surfaces only.
 
-`--review-evidence` is accepted only when completing a strategy-declared independent review workflow. Repeat it once per reviewer; artifacts must be non-empty files under the current attempt's `runtime/reviews/`, and reviewer IDs must match observed backend agent lifecycle events.
+`--review-evidence` is accepted only when completing a strategy-declared
+independent review workflow. Repeat it once per reviewer. Each reviewer must
+start after that workflow instance starts, stop before it completes, and write
+its non-empty artifact under `runtime/reviews/` during that observed lifecycle.
+RDO creates an immutable attempt-local reviewer receipt binding the workflow,
+instance, lifecycle events, reviewer ID, artifact ref, and digest; final
+evidence retains that receipt binding.
 
 Use them in either of these forms:
 

@@ -166,6 +166,9 @@ The unit and smoke commands run independently and capture verbose output in
 temporary logs. Failure diagnostics default to the last 80 lines and at most
 16 KiB; override those caps with `RDO_TEST_TAIL_LINES` and
 `RDO_TEST_TAIL_BYTES`. Use `run_all_tests.sh` only when both suites are required.
+Ordinary unit discovery is hermetic in restricted agent sandboxes: tests that
+require the host process table and real signal cleanup are explicitly skipped
+there and run by the smoke `test_process_integration.sh` boundary instead.
 
 ## Coordinator Intent Surface
 
