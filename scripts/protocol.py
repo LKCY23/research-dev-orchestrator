@@ -119,6 +119,7 @@ CORE_EVENTS = {
     "worker_instruction_submitted",
     "worker_interrupted",
     "worker_terminated",
+    "worker_termination_failed",
     "attempt_timed_out",
     "worker_blocked",
     "worker_review_ready",
@@ -130,6 +131,7 @@ CORE_EVENTS = {
     "codex_reviewed",
     "changes_requested",
     "task_approved",
+    "task_merge_applied",
     "task_merged",
     "task_failed",
     "experiment_recorded",
@@ -159,6 +161,7 @@ TASK_EVENTS = {
     "codex_reviewed",
     "changes_requested",
     "task_approved",
+    "task_merge_applied",
     "task_merged",
     "task_failed",
 }
@@ -184,6 +187,7 @@ ATTEMPT_EVENTS = {
     "worker_instruction_submitted",
     "worker_interrupted",
     "worker_terminated",
+    "worker_termination_failed",
 }
 
 TEMPLATE_MARKERS = {

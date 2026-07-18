@@ -70,7 +70,7 @@ from status_projection import resolve_status_projection
 from supervisor import (
     audit_supervision_token,
     run_supervised,
-    terminate_processes,
+    terminate_current_supervision,
     validate_attempt_deadline_payload,
 )
 from task_contract import (
@@ -1641,7 +1641,11 @@ def merge_source_commit(path: Path, status: dict[str, Any], root: Path) -> tuple
     return source_head, source_branch, target_branch
 
 
-def existing_task_merged_event(path: Path, commit: str | None = None) -> dict[str, Any] | None:
+def existing_task_event(
+    path: Path,
+    event_name: str,
+    commit: str | None = None,
+) -> dict[str, Any] | None:
     task_id = load_json(path / "STATUS.json").get("task_id")
     matches: list[dict[str, Any]] = []
     try:
@@ -1650,15 +1654,26 @@ def existing_task_merged_event(path: Path, commit: str | None = None) -> dict[st
             tolerate_interrupted_tail=True,
         )
     except EventJournalError as exc:
-        raise SystemExit(f"cannot read task_merged events: {exc}") from exc
+        raise SystemExit(f"cannot read {event_name} events: {exc}") from exc
     for record in records:
         if (
-            record.get("event") == "task_merged"
+            record.get("event") == event_name
             and record.get("task_id") == task_id
             and (commit is None or record.get("commit") == commit)
         ):
             matches.append(record)
     return matches[-1] if matches else None
+
+
+def existing_task_merged_event(path: Path, commit: str | None = None) -> dict[str, Any] | None:
+    return existing_task_event(path, "task_merged", commit)
+
+
+def existing_task_merge_applied_event(
+    path: Path,
+    commit: str | None = None,
+) -> dict[str, Any] | None:
+    return existing_task_event(path, "task_merge_applied", commit)
 
 
 def run_merge_verification(
@@ -1866,12 +1881,25 @@ def task_merge(args: argparse.Namespace) -> int:
                     f"expected commit {expected} does not match merged commit {source_commit}"
                 )
         target_head = git_output(target_worktree, "rev-parse", "HEAD")
-        if subprocess.run(
+        source_contained = subprocess.run(
             ["git", "merge-base", "--is-ancestor", source_commit, target_head],
             cwd=target_worktree,
             check=False,
-        ).returncode != 0:
-            raise SystemExit("task_merged event commit is not contained by the target branch")
+        ).returncode == 0
+        if not source_contained:
+            print(
+                json.dumps(
+                    {
+                        "state": status.get("state"),
+                        "merge_consistency": "inconsistent",
+                        "error": "recorded task merge is no longer contained by the target branch",
+                        "task_merged": recorded,
+                        "target_head": target_head,
+                    },
+                    indent=2,
+                )
+            )
+            return 1
         if status.get("state") != "merged":
             transition(path, "merged", "coordinator")
         print(json.dumps(recorded, indent=2))
@@ -1998,46 +2026,100 @@ def task_merge(args: argparse.Namespace) -> int:
         if git_output(task_worktree, "rev-parse", "HEAD") != source_commit:
             raise SystemExit("task branch changed while running pre-merge checks")
 
-    target_head = git_output(target_worktree, "rev-parse", "HEAD")
-    contains_source = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", source_commit, target_head],
-        cwd=target_worktree,
-        check=False,
-    ).returncode == 0
-    if not contains_source:
-        fast_forwardable = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", target_head, source_commit],
+    target_head_before_merge = git_output(target_worktree, "rev-parse", "HEAD")
+    applied = existing_task_merge_applied_event(path, source_commit)
+    if applied is not None:
+        if applied.get("source_branch") != source_branch:
+            raise SystemExit("task_merge_applied source branch does not match the task")
+        if applied.get("target_branch") != configured_target:
+            raise SystemExit("task_merge_applied target branch does not match RUN.json")
+        expected_merge_head = applied.get("target_head_after_merge")
+        if not isinstance(expected_merge_head, str) or not expected_merge_head:
+            raise SystemExit("task_merge_applied event is missing target_head_after_merge")
+        if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+            assert v2_bundle is not None
+            if (
+                applied.get("attempt_id") != str(status.get("current_attempt_id"))
+                or applied.get("artifact_binding") != artifact_binding(v2_bundle)
+            ):
+                raise SystemExit("task_merge_applied event no longer matches the approved artifacts")
+    else:
+        contains_source = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source_commit, target_head_before_merge],
             cwd=target_worktree,
             check=False,
         ).returncode == 0
-        if not fast_forwardable:
-            raise SystemExit("task commit cannot be fast-forward merged into the target branch")
-        merge = subprocess.run(
-            ["git", "merge", "--ff-only", source_commit],
-            cwd=target_worktree,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if merge.returncode != 0:
-            detail = merge.stderr.strip() or merge.stdout.strip()
-            raise SystemExit(f"git merge --ff-only failed: {detail}")
-        target_head = git_output(target_worktree, "rev-parse", "HEAD")
+        merge_mode = "already_contained" if contains_source else "fast_forward"
+        if not contains_source:
+            fast_forwardable = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", target_head_before_merge, source_commit],
+                cwd=target_worktree,
+                check=False,
+            ).returncode == 0
+            if not fast_forwardable:
+                raise SystemExit("task commit cannot be fast-forward merged into the target branch")
+            merge = subprocess.run(
+                ["git", "merge", "--ff-only", source_commit],
+                cwd=target_worktree,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if merge.returncode != 0:
+                detail = merge.stderr.strip() or merge.stdout.strip()
+                raise SystemExit(f"git merge --ff-only failed: {detail}")
+        expected_merge_head = git_output(target_worktree, "rev-parse", "HEAD")
         if subprocess.run(
-            ["git", "merge-base", "--is-ancestor", source_commit, target_head],
+            ["git", "merge-base", "--is-ancestor", source_commit, expected_merge_head],
             cwd=target_worktree,
             check=False,
         ).returncode != 0:
             raise SystemExit("target branch does not contain the task commit after merge")
+        application_payload: dict[str, Any] = {
+            "commit": source_commit,
+            "source_branch": source_branch,
+            "target_branch": target_branch,
+            "target_head_before_merge": target_head_before_merge,
+            "target_head_after_merge": expected_merge_head,
+            "mode": merge_mode,
+            "coordinator_id": args.coordinator,
+        }
+        if protocol_version == ARTIFACT_PROTOCOL_VERSION:
+            assert v2_bundle is not None
+            application_payload["attempt_id"] = str(status.get("current_attempt_id"))
+            application_payload["artifact_binding"] = artifact_binding(v2_bundle)
+        event(path, "task_merge_applied", "coordinator", **application_payload)
+        applied = application_payload
+
+    target_head_before_verification = git_output(target_worktree, "rev-parse", "HEAD")
+    target_branch_before_verification = git_output(
+        target_worktree,
+        "branch",
+        "--show-current",
+    )
+    source_contained_before_verification = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", source_commit, target_head_before_verification],
+        cwd=target_worktree,
+        check=False,
+    ).returncode == 0
+    pre_verification_integrity = bool(
+        target_head_before_verification == expected_merge_head
+        and target_branch_before_verification == configured_target
+        and source_contained_before_verification
+    )
 
     if protocol_version == ARTIFACT_PROTOCOL_VERSION:
         assert v2_contract is not None
-        post_merge_verification = run_canonical_merge_checks(
-            path,
-            target_worktree,
-            list(v2_contract.get("post_merge_commands", [])),
-            phase="post-merge",
-            attempt_id=str(status.get("current_attempt_id")),
+        post_merge_verification = (
+            run_canonical_merge_checks(
+                path,
+                target_worktree,
+                list(v2_contract.get("post_merge_commands", [])),
+                phase="post-merge",
+                attempt_id=str(status.get("current_attempt_id")),
+            )
+            if pre_verification_integrity
+            else None
         )
         target_clean = True
         try:
@@ -2046,20 +2128,35 @@ def task_merge(args: argparse.Namespace) -> int:
             target_clean = False
         verification = {
             "passed": (
-                (pre_merge_verification is None or pre_merge_verification["passed"])
+                pre_verification_integrity
+                and (pre_merge_verification is None or pre_merge_verification["passed"])
                 and (post_merge_verification is None or post_merge_verification["passed"])
                 and target_clean
             ),
             "pre_merge": pre_merge_verification,
             "post_merge": post_merge_verification,
+            "post_merge_skipped_reason": (
+                None
+                if pre_verification_integrity
+                else "target_changed_after_merge_application"
+            ),
             "target_clean": target_clean,
         }
     else:
-        verification = run_merge_verification(
-            path,
-            target_worktree,
-            list(args.verify_command),
-            float(args.verification_timeout),
+        verification = (
+            run_merge_verification(
+                path,
+                target_worktree,
+                list(args.verify_command),
+                float(args.verification_timeout),
+            )
+            if pre_verification_integrity
+            else {
+                "passed": False,
+                "results": [],
+                "log": None,
+                "post_merge_skipped_reason": "target_changed_after_merge_application",
+            }
         )
     target_head_after_verification = git_output(target_worktree, "rev-parse", "HEAD")
     target_branch_after_verification = git_output(
@@ -2072,43 +2169,51 @@ def task_merge(args: argparse.Namespace) -> int:
         cwd=target_worktree,
         check=False,
     ).returncode == 0
-    target_head_unchanged = target_head_after_verification == target_head
+    target_head_unchanged = target_head_after_verification == expected_merge_head
     target_branch_unchanged = target_branch_after_verification == configured_target
+    integrity_reasons: list[str] = []
+    if target_head_before_verification != expected_merge_head:
+        integrity_reasons.append("target_head_changed_after_merge_application")
+    if target_branch_before_verification != configured_target:
+        integrity_reasons.append("target_branch_changed_after_merge_application")
+    if not source_contained_before_verification:
+        integrity_reasons.append("source_commit_removed_after_merge_application")
+    if not target_head_unchanged:
+        integrity_reasons.append("target_head_changed_during_post_merge_verification")
+    if not target_branch_unchanged:
+        integrity_reasons.append("target_branch_changed_during_post_merge_verification")
+    if not source_still_contained:
+        integrity_reasons.append("source_commit_not_contained_after_post_merge_verification")
+    target_integrity = "consistent" if not integrity_reasons else "inconsistent"
     if verification is not None:
-        verification["target_head_before_verification"] = target_head
+        verification["merge_application_event"] = "task_merge_applied"
+        verification["expected_target_head"] = expected_merge_head
+        verification["target_head_before_verification"] = target_head_before_verification
         verification["target_head_after_verification"] = target_head_after_verification
         verification["target_head_unchanged"] = target_head_unchanged
         verification["target_branch_unchanged"] = target_branch_unchanged
         verification["source_commit_contained"] = source_still_contained
+        verification["target_integrity"] = target_integrity
+        verification["integrity_reasons"] = integrity_reasons
         verification["passed"] = bool(
             verification.get("passed")
+            and pre_verification_integrity
             and target_head_unchanged
             and target_branch_unchanged
             and source_still_contained
         )
-    if not target_head_unchanged or not target_branch_unchanged or not source_still_contained:
-        print(
-            json.dumps(
-                {
-                    "state": status.get("state"),
-                    "verification": verification,
-                    "error": "post-merge verification mutated the target branch",
-                },
-                indent=2,
-            )
-        )
-        return 1
     if verification is not None and protocol_version != ARTIFACT_PROTOCOL_VERSION:
         updated = load_json(path / "STATUS.json")
         evidence = updated.setdefault("evidence", {})
         commands_run = evidence.setdefault("commands_run", [])
-        for result in verification["results"]:
+        for result in verification.get("results", []):
             rendered = shlex.join(result["command"])
             if rendered not in commands_run:
                 commands_run.append(rendered)
         logs = evidence.setdefault("logs", [])
-        if verification["log"] not in logs:
-            logs.append(verification["log"])
+        verification_log = verification.get("log")
+        if isinstance(verification_log, str) and verification_log not in logs:
+            logs.append(verification_log)
         evidence["passed"] = verification["passed"]
         write_json(path / "STATUS.json", updated)
 
@@ -3497,8 +3602,8 @@ def execute_command(args: argparse.Namespace) -> int:
 
 
 def status_action(args: argparse.Namespace) -> int:
-    path = task_dir(args.task_dir)
-    status = load_json(path / "STATUS.json")
+    task_path = task_dir(args.task_dir)
+    status = load_json(task_path / "STATUS.json")
     attempt_id = status.get("current_attempt_id")
     payload: dict[str, Any] = {
         "projection": None,
@@ -3512,11 +3617,11 @@ def status_action(args: argparse.Namespace) -> int:
         "governance_violations": [],
     }
     if (
-        task_protocol(path, status) == ARTIFACT_PROTOCOL_VERSION
-        and (path / "EXECUTION_POLICY.json").is_file()
+        task_protocol(task_path, status) == ARTIFACT_PROTOCOL_VERSION
+        and (task_path / "EXECUTION_POLICY.json").is_file()
     ):
         try:
-            payload["task_budget"] = assess_task_budget(path)
+            payload["task_budget"] = assess_task_budget(task_path)
         except TaskBudgetError as exc:
             payload["task_budget"] = {
                 "enabled": True,
@@ -3528,7 +3633,7 @@ def status_action(args: argparse.Namespace) -> int:
                 },
             }
     if attempt_id:
-        attempt_dir = path / "attempts" / str(attempt_id)
+        attempt_dir = task_path / "attempts" / str(attempt_id)
         attempt_path = attempt_dir / "ATTEMPT.json"
         if attempt_path.exists():
             payload["attempt"] = load_json(attempt_path)
@@ -3541,18 +3646,22 @@ def status_action(args: argparse.Namespace) -> int:
             ("backend_profile", "BACKEND_PROFILE.json"),
             ("agents", "AGENTS.json"),
         ):
-            path = runtime_dir / filename
-            if path.exists():
-                payload[key] = load_json(path)
+            artifact_path = runtime_dir / filename
+            if artifact_path.exists():
+                payload[key] = load_json(artifact_path)
         for key, filename in (
             ("backend_events", "BACKEND_EVENTS.ndjson"),
             ("governance_violations", "VIOLATIONS.ndjson"),
         ):
-            path = runtime_dir / filename
-            if path.exists():
-                payload[key] = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+            artifact_path = runtime_dir / filename
+            if artifact_path.exists():
+                payload[key] = [
+                    json.loads(line)
+                    for line in artifact_path.read_text().splitlines()
+                    if line.strip()
+                ]
     payload["projection"] = resolve_status_projection(
-        path,
+        task_path,
         status,
         attempt=payload["attempt"],
     ).projection
@@ -3761,11 +3870,45 @@ def control(args: argparse.Namespace) -> int:
         if not metadata.exists():
             raise SystemExit("attempt supervisor metadata is unavailable")
         runtime = load_json(metadata)
-        survivors = terminate_processes(set(runtime.get("observed_pgids", [])), set(runtime.get("observed_pids", [])))
-        name, result = "worker_terminated", {"status": "terminated", "surviving_pids": list(survivors)}
+        if runtime.get("state") != "running":
+            termination = None
+            result = {
+                "status": "not_running",
+                "reason": "attempt supervisor is no longer running",
+                "supervisor_state": runtime.get("state"),
+                "surviving_pids": [],
+                "cleanup_verified": False,
+            }
+        else:
+            termination = terminate_current_supervision(
+                runtime.get("worker_pid"),
+                runtime.get("worker_pgid"),
+                runtime.get("worker_start_identity"),
+                runtime.get("supervision_token"),
+            )
+            result = {
+                "status": (
+                    "terminated"
+                    if termination.identity_verified and termination.cleanup_verified
+                    else "cleanup_failed"
+                    if termination.identity_verified
+                    else "identity_unverified"
+                ),
+                "reason": (
+                    termination.identity_failure_reason
+                    or termination.cleanup_failure_reason
+                ),
+                "root_running": termination.root_running,
+                "targeted_pids": list(termination.targeted_pids),
+                "targeted_pgids": list(termination.targeted_pgids),
+                "surviving_pids": list(termination.surviving_pids),
+                "cleanup_verified": termination.cleanup_verified,
+            }
+        succeeded = result["status"] == "terminated"
+        name = "worker_terminated" if succeeded else "worker_termination_failed"
     event(path, name, "coordinator", attempt_id=attempt_id, **result)
     print(json.dumps(result))
-    return 0
+    return 0 if args.worker_action != "terminate" or result["status"] == "terminated" else 1
 
 
 def build_parser() -> argparse.ArgumentParser:

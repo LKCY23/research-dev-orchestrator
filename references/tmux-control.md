@@ -75,7 +75,12 @@ Use `rdo worker message` instead. Its result distinguishes `submitted` or `queue
 ## Interrupt And Terminate
 
 - `rdo worker interrupt` sends `Ctrl-C` to the pane. It may stop only the foreground tool.
-- `rdo worker terminate` targets the recorded worker process group and verifies descendant cleanup.
+- `rdo worker terminate` acts only while the attempt supervisor reports
+  `running`. It revalidates the live worker PID, dedicated PGID, and inherited
+  supervision token before signalling, then verifies descendant cleanup.
+  Historical observed PID/PGID lists are never termination authority. Missing
+  identity, unavailable process inspection, or surviving processes return
+  non-zero and append `worker_termination_failed`.
 
 Never claim an attempt stopped after `Ctrl-C` without checking its process group. Never remove `.dispatch-lock` merely because a tmux pane disappeared.
 

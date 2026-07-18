@@ -18,7 +18,9 @@ Task state models task progress only. Worker/process lifecycle belongs in `ATTEM
 - `merged`: the approved branch commit is contained by the target branch and
   the post-merge result is recorded. This is an irreversible Git fact, not an
   assertion that post-merge verification passed; a failed v2 verification is
-  exposed to dependencies as `merged_unverified`.
+  exposed to dependencies as `merged_unverified`. If a post-merge command
+  changes target Git state, the historical application remains recorded and
+  dependency projection exposes `merge_inconsistent` until explicit repair.
 - `failed`: the coordinator determines the task should stop under current requirements.
 
 ## Writer Boundaries

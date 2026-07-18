@@ -716,7 +716,13 @@ def validate_merged_task(
             )
     verification = latest.get("verification")
     if isinstance(verification, dict) and verification.get("passed") is False:
-        warnings.append(f"{task_dir.name}: post-merge verification failed; create a repair task")
+        if verification.get("target_integrity") == "inconsistent":
+            warnings.append(
+                f"{task_dir.name}: target Git state changed during post-merge verification; "
+                "create a repair task"
+            )
+        else:
+            warnings.append(f"{task_dir.name}: post-merge verification failed; create a repair task")
     return violations, warnings
 
 

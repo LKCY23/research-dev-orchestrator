@@ -62,6 +62,18 @@ class SupervisionAuditResult:
     live_processes: tuple[tuple[int, int, int], ...]
 
 
+@dataclass(frozen=True)
+class SupervisionTerminationResult:
+    identity_verified: bool
+    identity_failure_reason: str | None
+    root_running: bool
+    targeted_pids: tuple[int, ...]
+    targeted_pgids: tuple[int, ...]
+    surviving_pids: tuple[int, ...]
+    cleanup_verified: bool
+    cleanup_failure_reason: str | None
+
+
 def _iso_from_epoch(value: float) -> str:
     return (
         datetime.fromtimestamp(value, timezone.utc)
@@ -908,6 +920,23 @@ def pid_alive(pid: int) -> bool:
     return bool(state) and not state.startswith("Z")
 
 
+def process_start_identity(pid: int) -> str:
+    """Return the kernel-reported process start timestamp used to detect PID reuse."""
+
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        raise ValueError("process pid must be an integer greater than one")
+    output = subprocess.check_output(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        text=True,
+        stderr=subprocess.DEVNULL,
+        timeout=PROCESS_SCAN_TIMEOUT_SECONDS,
+    )
+    identity = " ".join(output.split())
+    if not identity:
+        raise ProcessLookupError(pid)
+    return identity
+
+
 def _signal_groups(pgids: set[int], sig: signal.Signals) -> None:
     own_pgid = os.getpgrp()
     for pgid in sorted(pgids):
@@ -1059,6 +1088,101 @@ def terminate_processes(
     return tuple(sorted(final_pids))
 
 
+def terminate_current_supervision(
+    root_pid: int,
+    root_pgid: int,
+    root_start_identity: str,
+    supervision_token: str,
+    *,
+    grace_seconds: float = 2.0,
+) -> SupervisionTerminationResult:
+    """Terminate only a currently live worker whose launch identity still matches."""
+
+    def failed(reason: str, *, root_running: bool = False) -> SupervisionTerminationResult:
+        return SupervisionTerminationResult(
+            identity_verified=False,
+            identity_failure_reason=reason,
+            root_running=root_running,
+            targeted_pids=(),
+            targeted_pgids=(),
+            surviving_pids=(),
+            cleanup_verified=False,
+            cleanup_failure_reason=reason,
+        )
+
+    if (
+        not isinstance(root_pid, int)
+        or isinstance(root_pid, bool)
+        or root_pid <= 1
+        or not isinstance(root_pgid, int)
+        or isinstance(root_pgid, bool)
+        or root_pgid <= 1
+        or root_pgid != root_pid
+    ):
+        return failed("invalid_worker_process_identity")
+    if not isinstance(supervision_token, str) or not re.fullmatch(
+        r"[0-9a-f]{32}", supervision_token
+    ):
+        return failed("invalid_supervision_token")
+    if not isinstance(root_start_identity, str) or not root_start_identity.strip():
+        return failed("missing_worker_start_identity")
+
+    observation: dict[str, Any] = {"verified": True, "reason": None}
+    try:
+        table = _process_table()
+    except (OSError, subprocess.SubprocessError):
+        return failed("process_table_unavailable")
+    if root_pid not in table:
+        return failed("worker_root_not_running")
+    if table[root_pid][1] != root_pgid:
+        return failed("worker_root_pgid_mismatch", root_running=True)
+    try:
+        current_start_identity = process_start_identity(root_pid)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return failed("worker_start_identity_unavailable", root_running=True)
+    if current_start_identity != root_start_identity:
+        return failed("worker_root_pid_reused", root_running=True)
+
+    current_pids, current_pgids = current_termination_targets(
+        root_pid,
+        table,
+        supervision_token,
+        cleanup_observation=observation,
+    )
+    if not observation["verified"] or root_pid not in current_pids or root_pgid not in current_pgids:
+        return failed("worker_identity_changed_during_inspection", root_running=True)
+
+    observed_pids = set(current_pids)
+    observed_pgids = set(current_pgids)
+    survivors = terminate_processes(
+        current_pgids,
+        current_pids,
+        grace_seconds=grace_seconds,
+        root_pid=root_pid,
+        supervision_token=supervision_token,
+        observed_pids=observed_pids,
+        observed_pgids=observed_pgids,
+        cleanup_observation=observation,
+    )
+    cleanup_verified = bool(observation["verified"] and not survivors)
+    return SupervisionTerminationResult(
+        identity_verified=True,
+        identity_failure_reason=None,
+        root_running=True,
+        targeted_pids=tuple(sorted(current_pids)),
+        targeted_pgids=tuple(sorted(current_pgids)),
+        surviving_pids=survivors,
+        cleanup_verified=cleanup_verified,
+        cleanup_failure_reason=(
+            str(observation["reason"])
+            if observation["reason"] is not None
+            else "surviving_processes"
+            if survivors
+            else None
+        ),
+    )
+
+
 def reap_process(process: subprocess.Popen[Any], *, timeout_seconds: float = 2.0) -> int:
     """Bound parent reaping even when cleanup observations were incomplete."""
 
@@ -1110,6 +1234,10 @@ def run_supervised(
         start_new_session=True,
         env=child_environment,
     )
+    try:
+        worker_start_identity = process_start_identity(process.pid)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        worker_start_identity = None
     observed_pids: set[int] = {process.pid}
     observed_pgids: set[int] = {process.pid}
     termination_pids: set[int] = {process.pid}
@@ -1125,6 +1253,7 @@ def run_supervised(
                 "state": "running",
                 "worker_pid": process.pid,
                 "worker_pgid": process.pid,
+                "worker_start_identity": worker_start_identity,
                 "observed_pids": sorted(observed_pids),
                 "observed_pgids": sorted(observed_pgids),
                 "deadline_seconds": timeout_seconds,
@@ -1192,6 +1321,7 @@ def run_supervised(
                     "state": "running",
                     "worker_pid": process.pid,
                     "worker_pgid": process.pid,
+                    "worker_start_identity": worker_start_identity,
                     "observed_pids": sorted(observed_pids),
                     "observed_pgids": sorted(observed_pgids),
                     "deadline_seconds": timeout_seconds,
@@ -1333,6 +1463,7 @@ def run_supervised(
                 ),
                 "worker_pid": process.pid,
                 "worker_pgid": process.pid,
+                "worker_start_identity": worker_start_identity,
                 "observed_pids": sorted(observed_pids),
                 "observed_pgids": sorted(observed_pgids),
                 "surviving_pids": list(survivors),

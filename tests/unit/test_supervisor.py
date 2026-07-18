@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sys
 import subprocess
 import tempfile
@@ -14,7 +15,9 @@ from supervisor import (
     current_termination_targets,
     load_or_create_attempt_deadline,
     pid_alive,
+    process_start_identity,
     run_supervised,
+    terminate_current_supervision,
     terminate_processes,
 )
 
@@ -36,6 +39,94 @@ class SupervisorTests(unittest.TestCase):
         self.assertFalse(result.inspection_verified)
         self.assertEqual("process_table_unavailable", result.inspection_failure_reason)
         self.assertEqual((), result.live_processes)
+
+    def test_current_termination_refuses_a_historical_root_pid(self):
+        with (
+            patch("supervisor._process_table", return_value={52002: (1, 52002)}),
+            patch("supervisor.terminate_processes") as terminate,
+        ):
+            result = terminate_current_supervision(
+                52001,
+                52001,
+                "Sat Jul 18 13:56:49 2026",
+                "a" * 32,
+            )
+        self.assertFalse(result.identity_verified)
+        self.assertEqual("worker_root_not_running", result.identity_failure_reason)
+        terminate.assert_not_called()
+
+    def test_current_termination_rejects_a_reused_root_pid(self):
+        table = {52001: (1, 52001), 52002: (52001, 52001)}
+        with (
+            patch("supervisor._process_table", return_value=table),
+            patch(
+                "supervisor.process_start_identity",
+                return_value="Sat Jul 18 13:57:50 2026",
+            ),
+            patch("supervisor.terminate_processes") as terminate,
+        ):
+            result = terminate_current_supervision(
+                52001,
+                52001,
+                "Sat Jul 18 13:56:49 2026",
+                "a" * 32,
+            )
+        self.assertFalse(result.identity_verified)
+        self.assertEqual("worker_root_pid_reused", result.identity_failure_reason)
+        terminate.assert_not_called()
+
+    def test_current_termination_reports_survivors_as_cleanup_failure(self):
+        table = {52001: (1, 52001), 52002: (52001, 52001)}
+        with (
+            patch("supervisor._process_table", return_value=table),
+            patch(
+                "supervisor.process_start_identity",
+                return_value="Sat Jul 18 13:56:49 2026",
+            ),
+            patch("supervisor.tagged_processes", return_value={52001, 52002}),
+            patch("supervisor.terminate_processes", return_value=(52002,)) as terminate,
+        ):
+            result = terminate_current_supervision(
+                52001,
+                52001,
+                "Sat Jul 18 13:56:49 2026",
+                "a" * 32,
+            )
+        self.assertTrue(result.identity_verified)
+        self.assertFalse(result.cleanup_verified)
+        self.assertEqual((52002,), result.surviving_pids)
+        self.assertEqual("surviving_processes", result.cleanup_failure_reason)
+        _, kwargs = terminate.call_args
+        self.assertEqual(52001, kwargs["root_pid"])
+        self.assertEqual("a" * 32, kwargs["supervision_token"])
+
+    def test_current_termination_cleans_a_live_token_bound_process_group(self):
+        token = "c" * 32
+        environment = dict(os.environ)
+        environment["RDO_SUPERVISION_TOKEN"] = token
+        environment["RDO_SUPERVISION_TOKEN_LINEAGE"] = token
+        process = subprocess.Popen(
+            ["/bin/sh", "-c", "sleep 30 & wait"],
+            start_new_session=True,
+            env=environment,
+        )
+        try:
+            time.sleep(0.1)
+            start_identity = process_start_identity(process.pid)
+            result = terminate_current_supervision(
+                process.pid,
+                process.pid,
+                start_identity,
+                token,
+                grace_seconds=0.05,
+            )
+            self.assertTrue(result.identity_verified)
+            self.assertTrue(result.cleanup_verified)
+            self.assertEqual((), result.surviving_pids)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=2)
 
     def test_timeout_kills_descendants(self):
         result = run_supervised(

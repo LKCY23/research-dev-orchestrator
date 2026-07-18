@@ -225,8 +225,9 @@ actual execution mode and fallback.
 `rdo.py task merge` is the coordinator-owned merge mutation. It derives the
 approved source and run target from protocol state, permits only a clean
 fast-forward merge, verifies the exact source commit and v2 artifact binding,
-and reconciles Git ancestry with `STATUS.json` plus the existing `task_merged`
-event. V2 pre/post-merge commands come only from frozen `ACCEPTANCE.md`; an ad
+records `task_merge_applied` before fallible post-merge verification, and
+reconciles Git ancestry with `STATUS.json` plus the final `task_merged` event.
+V2 pre/post-merge commands come only from frozen `ACCEPTANCE.md`; an ad
 hoc verification command is a legacy-v0.5/v1 compatibility option. The command does
 not create a separate merge transaction artifact or call an internal FSM helper
 from ad hoc agent code.

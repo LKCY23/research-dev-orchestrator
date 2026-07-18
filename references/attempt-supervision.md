@@ -18,7 +18,10 @@ dispatch_agent.sh
 
 The supervisor records the worker PID and process-group ID, one attempt-wide
 absolute execution deadline, approved strategy digest, runtime backend, and
-outcome. `runtime/DEADLINE.json` is created once and reused by a same-attempt
+outcome. It also records the kernel-reported worker start timestamp so a later
+coordinator terminate request can reject a reused PID before signalling; the
+supervision token remains the lineage mechanism for detached descendants.
+`runtime/DEADLINE.json` is created once and reused by a same-attempt
 session fallback, so restarting a backend process never resets the attempt
 budget. The mutable supervisor state includes remaining time and a structured
 `attempt_deadline_approaching` reminder before cutoff. Worker-facing RDO

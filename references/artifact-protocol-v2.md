@@ -434,4 +434,7 @@ legacy-v0.5/v1 runs through explicit legacy readers; neither consumer
 recreates task-root truth. Every v2 merge records a verification object. When
 `verification.passed` is false, Git truth remains `merged`, but dependency
 resolution exposes `merged_unverified` and blocks downstream readiness until
-the coordinator arranges an explicit repair or revision task.
+the coordinator arranges an explicit repair or revision task. Merge application
+is recorded before post-merge commands. If those commands change the target
+HEAD, branch, or source containment, `verification.target_integrity` is
+`inconsistent` and dependency resolution exposes `merge_inconsistent`.

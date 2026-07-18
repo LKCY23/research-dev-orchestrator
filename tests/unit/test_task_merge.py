@@ -119,6 +119,13 @@ class TaskMergeTests(unittest.TestCase):
             if json.loads(line).get("event") == "task_merged"
         ]
 
+    def applied_events(self):
+        return [
+            json.loads(line)
+            for line in (self.run / "EVENTS.ndjson").read_text().splitlines()
+            if json.loads(line).get("event") == "task_merge_applied"
+        ]
+
     def test_approval_binds_exact_git_commit(self):
         decision = json.loads((self.task / "reviews" / "DECISION-v001.json").read_text())
         self.assertEqual(decision["approved_commit"], git(self.task_worktree, "rev-parse", "HEAD"))
@@ -165,6 +172,31 @@ class TaskMergeTests(unittest.TestCase):
         self.assertEqual(self.merge(), 0)
         self.assertEqual(json.loads((self.task / "STATUS.json").read_text())["state"], "merged")
         self.assertEqual(len(self.merged_events()), 1)
+
+    def test_resumes_verification_from_a_durable_merge_application(self):
+        source = git(self.task_worktree, "rev-parse", "HEAD")
+        target_before = git(self.root, "rev-parse", "HEAD")
+        git(self.root, "merge", "--ff-only", source)
+        applied = {
+            "at": "2026-07-14T00:02:00Z",
+            "actor": "coordinator",
+            "event": "task_merge_applied",
+            "run_id": "run-1",
+            "task_id": "T101-example",
+            "commit": source,
+            "source_branch": "agent/T101-example",
+            "target_branch": "main",
+            "target_head_before_merge": target_before,
+            "target_head_after_merge": source,
+            "mode": "fast_forward",
+            "coordinator_id": "codex",
+        }
+        (self.run / "EVENTS.ndjson").write_text(json.dumps(applied) + "\n")
+
+        self.assertEqual(self.merge(), 0)
+        self.assertEqual(1, len(self.applied_events()))
+        self.assertEqual(1, len(self.merged_events()))
+        self.assertEqual("merged", json.loads((self.task / "STATUS.json").read_text())["state"])
 
     def test_approval_accepts_task_commit_already_contained_in_target(self):
         source = git(self.task_worktree, "rev-parse", "HEAD")

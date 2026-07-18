@@ -55,6 +55,7 @@ resource_budget_exceeded
 worker_instruction_submitted
 worker_interrupted
 worker_terminated
+worker_termination_failed
 attempt_timed_out
 worker_blocked
 worker_review_ready
@@ -66,6 +67,7 @@ coordinator_reviewed
 codex_reviewed
 changes_requested
 task_approved
+task_merge_applied
 task_merged
 task_failed
 experiment_recorded
@@ -86,6 +88,19 @@ dispatcher exit code; it must not overwrite a later coordinator-owned state.
 Attempt-local `runtime/USAGE.ndjson` is a separate high-volume ledger, not part of the run timeline. Each normalized `model_usage` record includes a stable source event when available, the metrics actually observed on that event, cumulative totals, and `no_progress_turns`. Codex terminal metrics that were not observed are JSON `null`, not zero. Hard failures are written to `runtime/VIOLATIONS.ndjson` as `resource_budget_exceeded`; a declared hard metric missing from the terminal stream is `usage_observation_missing`.
 
 `dispatch_lock_removed` records a user-approved recovery action that removed a stale `.dispatch-lock`. It must include `task_id`, should include `attempt_id` when known, and should include `reason` plus a diagnostics `snapshot` path.
+
+`worker_termination_failed` records a coordinator terminate request that did
+not prove the current worker identity or did not achieve verified cleanup. It
+must include `attempt_id`, a non-success `status`, the failure `reason`, and any
+observed survivors. Historical PID/PGID observations alone never justify a
+`worker_terminated` event.
+
+`task_merge_applied` is written immediately after Git first proves that the
+bound task commit is contained by the target branch. It freezes the target HEAD
+before the operation, the HEAD immediately afterward, whether RDO performed a
+fast-forward or reconciled an already-contained commit, and the same v2
+attempt/artifact binding later carried by `task_merged`. Post-merge commands
+cannot erase this historical Git fact.
 
 `task_merged` records the exact merged `commit`, source branch, target branch,
 and coordinator identity. Every v2 event also contains `attempt_id`, the exact

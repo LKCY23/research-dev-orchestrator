@@ -147,6 +147,7 @@ workflow_timed_out
 worker_instruction_submitted
 worker_interrupted
 worker_terminated
+worker_termination_failed
 attempt_timed_out
 worker_blocked
 worker_review_ready
@@ -158,6 +159,7 @@ coordinator_reviewed
 codex_reviewed
 changes_requested
 task_approved
+task_merge_applied
 task_merged
 task_failed
 experiment_recorded

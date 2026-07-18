@@ -127,7 +127,13 @@ def _dependency_resolver(run_dir: Path):
                 or event["verification"].get("passed") is not True
             )
         ):
-            state = "merged_unverified"
+            verification = event.get("verification")
+            state = (
+                "merge_inconsistent"
+                if isinstance(verification, dict)
+                and verification.get("target_integrity") == "inconsistent"
+                else "merged_unverified"
+            )
         return {
             "state": state,
             "commit": event.get("commit") if event is not None else None,

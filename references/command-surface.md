@@ -349,6 +349,12 @@ same command resumes verification and protocol recording. Repeated completed
 invocations do not duplicate `task_merged` events. No `MERGE.json` artifact is
 created.
 
+Immediately after Git proves the bound commit is contained, the command appends
+`task_merge_applied` with the before/after target HEAD and exact v2 artifact
+binding. Post-merge verification is a later fact and cannot erase that durable
+application receipt. A retry with an application receipt resumes verification
+without executing another merge.
+
 For v2, pre/post-merge commands come only from the frozen canonical
 `ACCEPTANCE.md`; free `--verify-command` input is rejected. A failed post-merge
 command returns non-zero but the task remains truthfully `merged`, because RDO
@@ -364,6 +370,12 @@ than pretending the target branch was unmerged. The command appends the
 `task_merged` event before advancing `STATUS.json`; replay can complete a
 missing status transition. A historical `STATUS = merged`/missing-event crash
 window is recovered conservatively with `verification.passed = false`.
+
+If a post-merge command changes the expected target HEAD, branch, or source
+containment, the command still records both Git application and verification
+facts, returns non-zero, and sets `verification.target_integrity =
+inconsistent`. Dependency projection exposes `merge_inconsistent`, never an
+ordinary unmerged/approved state.
 
 Natural-language intent:
 

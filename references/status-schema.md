@@ -189,7 +189,10 @@ additional check, never a substitute for the Git commit boundary. Every v2
 merge event contains `verification`; when `verification.passed = false`, the
 irreversible Git fact remains `merged` but dependency resolution exposes
 `merged_unverified`, which cannot satisfy another task's
-`required_state = merged` readiness gate.
+`required_state = merged` readiness gate. A verification record with
+`target_integrity = inconsistent` is projected more specifically as
+`merge_inconsistent`; current-containment validation may also report a protocol
+violation when the check removed the bound source commit.
 
 ## Legacy boundary
 

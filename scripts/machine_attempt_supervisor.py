@@ -32,6 +32,7 @@ from supervisor import (
     current_termination_targets,
     finalization_epoch_from_path,
     load_or_create_attempt_deadline,
+    process_start_identity,
     reap_process,
     supervision_environment,
     terminate_processes,
@@ -368,10 +369,15 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    try:
+        worker_start_identity = process_start_identity(process.pid)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        worker_start_identity = None
     atomic_json(state_path, {
         "state": "running",
         "worker_pid": process.pid,
         "worker_pgid": process.pid,
+        "worker_start_identity": worker_start_identity,
         "observed_pids": [process.pid],
         "observed_pgids": [process.pid],
         "deadline_seconds": args.timeout_seconds,
@@ -533,6 +539,7 @@ def main() -> int:
                     "state": "running",
                     "worker_pid": process.pid,
                     "worker_pgid": process.pid,
+                    "worker_start_identity": worker_start_identity,
                     "observed_pids": sorted(observed_pids),
                     "observed_pgids": sorted(observed_pgids),
                     "deadline_seconds": args.timeout_seconds,
@@ -955,6 +962,7 @@ def main() -> int:
         "state": state,
         "worker_pid": process.pid,
         "worker_pgid": process.pid,
+        "worker_start_identity": worker_start_identity,
         "observed_pids": sorted(observed_pids),
         "observed_pgids": sorted(observed_pgids),
         "surviving_pids": list(survivors),

@@ -1093,6 +1093,42 @@ results = [subprocess.run(command, capture_output=True, text=True) for command i
         self.assertNotEqual(0, result.returncode)
         self.assertIn("merged_unverified", result.stderr)
 
+    def test_dependency_with_inconsistent_merge_target_is_not_ready(self) -> None:
+        dependency = self.run_dir / "tasks" / "T000"
+        dependency.mkdir()
+        self.write_json(
+            dependency / "STATUS.json",
+            {"task_id": "T000", "artifact_protocol_version": 2, "state": "merged"},
+        )
+        self.append_event(
+            {
+                "event": "task_merged",
+                "task_id": "T000",
+                "commit": self.base,
+                "verification": {
+                    "passed": False,
+                    "target_integrity": "inconsistent",
+                },
+            }
+        )
+        dependencies = json.dumps(
+            {
+                "schema_version": 2,
+                "dependencies": [{"task_id": "T000", "required_state": "merged"}],
+            },
+            indent=2,
+        )
+        (self.task_dir / "TASK.md").write_text(
+            task_text().replace(
+                '{\n  "schema_version": 2,\n  "dependencies": []\n}',
+                dependencies,
+            ),
+            encoding="utf-8",
+        )
+        result = self.freeze("A001", check=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("merge_inconsistent", result.stderr)
+
     def _publish_verified(
         self,
         attempt_id: str,

@@ -838,6 +838,24 @@ No additional background is needed.
         self.assertEqual("pre-merge", merged_events[0]["verification"]["pre_merge"]["phase"])
         self.assertEqual("post-merge", merged_events[0]["verification"]["post_merge"]["phase"])
 
+    def test_status_action_resolves_current_published_bundle_from_task_root(self) -> None:
+        fixture = self.make_fixture(profile="direct")
+        self.assertEqual(0, self.check(fixture, "unit"))
+        self.assertEqual(0, self.finalize(fixture, "verified"))
+        self.mark_handoff_completed(fixture, "verified")
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                0,
+                rdo.status_action(argparse.Namespace(task_dir=str(fixture.task))),
+            )
+
+        projection = json.loads(output.getvalue())["projection"]
+        self.assertEqual("published", projection["publication"]["state"])
+        self.assertEqual("current", projection["publication"]["relation"])
+        self.assertEqual(self.attempt_id, projection["publication"]["attempt_id"])
+
     def test_merge_rejects_artifact_bytes_changed_after_approval(self) -> None:
         fixture = self.make_fixture(profile="delegated")
         self.assertEqual(0, self.check(fixture, "unit"))
@@ -868,13 +886,24 @@ No additional background is needed.
 
         self.assertEqual(1, self.merge(fixture))
         status = json.loads((fixture.task / "STATUS.json").read_text())
-        self.assertEqual("approved", status["state"])
-        merged_events = [
+        self.assertEqual("merged", status["state"])
+        events = [
             json.loads(line)
             for line in (fixture.run / "EVENTS.ndjson").read_text().splitlines()
-            if json.loads(line).get("event") == "task_merged"
         ]
-        self.assertEqual([], merged_events)
+        applied_events = [
+            record for record in events if record.get("event") == "task_merge_applied"
+        ]
+        merged_events = [
+            record for record in events if record.get("event") == "task_merged"
+        ]
+        self.assertEqual(1, len(applied_events))
+        self.assertEqual(fixture.source_commit, applied_events[0]["commit"])
+        self.assertEqual(1, len(merged_events))
+        verification = merged_events[0]["verification"]
+        self.assertFalse(verification["passed"])
+        self.assertEqual("inconsistent", verification["target_integrity"])
+        self.assertFalse(verification["source_commit_contained"])
         self.assertFalse(
             subprocess.run(
                 ["git", "merge-base", "--is-ancestor", fixture.source_commit, "HEAD"],
@@ -883,6 +912,59 @@ No additional background is needed.
             ).returncode
             == 0
         )
+
+        self.assertEqual(1, self.merge(fixture))
+        replayed = [
+            json.loads(line)
+            for line in (fixture.run / "EVENTS.ndjson").read_text().splitlines()
+        ]
+        self.assertEqual(
+            1,
+            sum(record.get("event") == "task_merge_applied" for record in replayed),
+        )
+        self.assertEqual(
+            1,
+            sum(record.get("event") == "task_merged" for record in replayed),
+        )
+
+    def test_post_merge_commit_is_recorded_as_an_inconsistent_merge(self) -> None:
+        commit_on_target = self.command(
+            "post-commit",
+            "import subprocess; subprocess.run(['git','commit','--allow-empty','-m','post-check'], check=True)",
+        )
+        fixture = self.make_fixture(
+            profile="delegated",
+            post_merge_commands=[commit_on_target],
+        )
+        self.assertEqual(0, self.check(fixture, "unit"))
+        self.assertEqual(0, self.finalize(fixture, "review"))
+        self.mark_handoff_completed(fixture, "review")
+        self.assertEqual(0, self.review(fixture, "approved"))
+
+        self.assertEqual(1, self.merge(fixture))
+        events = [
+            json.loads(line)
+            for line in (fixture.run / "EVENTS.ndjson").read_text().splitlines()
+        ]
+        applied = [record for record in events if record.get("event") == "task_merge_applied"]
+        merged = [record for record in events if record.get("event") == "task_merged"]
+        self.assertEqual(1, len(applied))
+        self.assertEqual(1, len(merged))
+        self.assertEqual("merged", json.loads((fixture.task / "STATUS.json").read_text())["state"])
+        self.assertNotEqual(
+            applied[0]["target_head_after_merge"],
+            git(fixture.root, "rev-parse", "HEAD"),
+        )
+        self.assertTrue(
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", fixture.source_commit, "HEAD"],
+                cwd=fixture.root,
+                check=False,
+            ).returncode
+            == 0
+        )
+        self.assertFalse(merged[0]["verification"]["passed"])
+        self.assertEqual("inconsistent", merged[0]["verification"]["target_integrity"])
 
     def test_merge_requires_review_pointer_decision_digest(self) -> None:
         fixture = self.make_fixture(profile="delegated")
