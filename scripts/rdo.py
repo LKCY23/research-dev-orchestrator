@@ -53,7 +53,9 @@ from protocol import (
     load_json,
     parse_iso,
     read_event_journal,
+    record_operator_termination_locked,
     repo_root,
+    task_state_lock,
     utc_now,
     write_json,
 )
@@ -1403,6 +1405,18 @@ def task_resume(args: argparse.Namespace) -> int:
         or "\\" in previous_attempt_id
     ):
         raise SystemExit("task resume requires a safe current attempt id")
+    if args.execution_mode == "restart":
+        previous_attempt = load_json(
+            path / "attempts" / previous_attempt_id / "ATTEMPT.json"
+        )
+        restartable = previous_attempt.get("state") in {"terminated", "invalid_handoff"} or (
+            previous_attempt.get("state") == "completed"
+            and previous_attempt.get("handoff_state") == "blocked"
+        )
+        if not restartable:
+            raise SystemExit(
+                "clean restart requires a terminated, invalid_handoff, or blocked-handoff current attempt"
+            )
     root, run_id, task_id = _task_dispatch_identity(path, status)
     existing_attempt_ids = {
         candidate.name
@@ -1416,6 +1430,8 @@ def task_resume(args: argparse.Namespace) -> int:
     ]
     option_values = (
         ("--worker", args.worker_backend),
+        ("--model", args.model),
+        ("--reasoning-effort", args.reasoning_effort),
         ("--runtime", args.runtime_backend),
         ("--io", args.io_mode),
         ("--permission", args.permission_mode),
@@ -3980,18 +3996,39 @@ def cleanup_audit(args: argparse.Namespace) -> int:
         and metadata.get("attempt_id") == attempt.name
     )
     supervisor_state = supervisor.get("state") if isinstance(supervisor, dict) else None
-    attempt_terminal = metadata.get("state") in {"completed", "invalid_handoff"}
+    attempt_terminal = metadata.get("state") in {"completed", "invalid_handoff", "terminated"}
+    termination_path = attempt / "runtime" / "OPERATOR_TERMINATION.json"
+    operator_termination = (
+        load_json(termination_path)
+        if termination_path.is_file() and not termination_path.is_symlink()
+        else None
+    )
+    operator_cleanup_valid = bool(
+        metadata.get("state") == "terminated"
+        and isinstance(operator_termination, dict)
+        and operator_termination.get("attempt_id") == attempt.name
+        and operator_termination.get("cleanup_verified") is True
+        and operator_termination.get("surviving_pids") == []
+    )
     supervisor_terminal = supervisor_state in {
         "completed",
         "timed_out",
         "cleanup_failed",
-    }
+    } or operator_cleanup_valid
     eligible = bool(
         identity_valid
         and attempt_terminal
         and supervisor_terminal
     )
     recorded_cleanup = (
+        {
+            "state": "operator_terminated",
+            "cleanup_verified": True,
+            "cleanup_failure_reason": None,
+            "surviving_pids": [],
+        }
+        if operator_cleanup_valid
+        else
         {
             "state": supervisor.get("state"),
             "cleanup_verified": supervisor.get("cleanup_verified"),
@@ -4191,44 +4228,58 @@ def control(args: argparse.Namespace) -> int:
                 "session_id": target,
             }
     else:
-        metadata = path / "attempts" / str(attempt_id) / "runtime" / "supervisor.json"
-        if not metadata.exists():
-            raise SystemExit("attempt supervisor metadata is unavailable")
-        runtime = load_json(metadata)
-        if runtime.get("state") != "running":
-            termination = None
-            result = {
-                "status": "not_running",
-                "reason": "attempt supervisor is no longer running",
-                "supervisor_state": runtime.get("state"),
-                "surviving_pids": [],
-                "cleanup_verified": False,
-            }
-        else:
-            termination = terminate_current_supervision(
-                runtime.get("worker_pid"),
-                runtime.get("worker_pgid"),
-                runtime.get("worker_start_identity"),
-                runtime.get("supervision_token"),
-            )
-            result = {
-                "status": (
-                    "terminated"
-                    if termination.identity_verified and termination.cleanup_verified
-                    else "cleanup_failed"
-                    if termination.identity_verified
-                    else "identity_unverified"
-                ),
-                "reason": (
-                    termination.identity_failure_reason
-                    or termination.cleanup_failure_reason
-                ),
-                "root_running": termination.root_running,
-                "targeted_pids": list(termination.targeted_pids),
-                "targeted_pgids": list(termination.targeted_pgids),
-                "surviving_pids": list(termination.surviving_pids),
-                "cleanup_verified": termination.cleanup_verified,
-            }
+        with task_state_lock(path):
+            current_status = load_json(path / "STATUS.json")
+            if (
+                current_status.get("state") not in {"planning", "running"}
+                or current_status.get("current_attempt_id") != attempt_id
+            ):
+                raise SystemExit("worker termination no longer targets the active attempt")
+            metadata = path / "attempts" / str(attempt_id) / "runtime" / "supervisor.json"
+            if not metadata.exists():
+                raise SystemExit("attempt supervisor metadata is unavailable")
+            runtime = load_json(metadata)
+            if runtime.get("state") != "running":
+                termination = None
+                result = {
+                    "status": "not_running",
+                    "reason": "attempt supervisor is no longer running",
+                    "supervisor_state": runtime.get("state"),
+                    "surviving_pids": [],
+                    "cleanup_verified": False,
+                }
+            else:
+                termination = terminate_current_supervision(
+                    runtime.get("worker_pid"),
+                    runtime.get("worker_pgid"),
+                    runtime.get("worker_start_identity"),
+                    runtime.get("supervision_token"),
+                )
+                result = {
+                    "status": (
+                        "terminated"
+                        if termination.identity_verified and termination.cleanup_verified
+                        else "cleanup_failed"
+                        if termination.identity_verified
+                        else "identity_unverified"
+                    ),
+                    "reason": (
+                        termination.identity_failure_reason
+                        or termination.cleanup_failure_reason
+                    ),
+                    "root_running": termination.root_running,
+                    "targeted_pids": list(termination.targeted_pids),
+                    "targeted_pgids": list(termination.targeted_pgids),
+                    "surviving_pids": list(termination.surviving_pids),
+                    "cleanup_verified": termination.cleanup_verified,
+                }
+                if result["status"] == "terminated":
+                    record_operator_termination_locked(
+                        path,
+                        str(attempt_id),
+                        reason=getattr(args, "reason", "") or "operator requested termination",
+                        termination=result,
+                    )
         succeeded = result["status"] == "terminated"
         name = "worker_terminated" if succeeded else "worker_termination_failed"
     event(path, name, "coordinator", attempt_id=attempt_id, **result)
@@ -4258,14 +4309,16 @@ def build_parser() -> argparse.ArgumentParser:
     command = tasks.add_parser("revise"); command.add_argument("--task-dir", required=True); command.add_argument("--reviewer", required=True); command.add_argument("--findings-file", required=True); command.add_argument("--note", action="append", default=[]); command.set_defaults(func=task_revise)
     command = tasks.add_parser("resume"); command.add_argument("--task-dir", required=True)
     command.add_argument("--worker-backend", choices=("claude-code", "codex", "opencode", "kimi-code"), default="")
+    command.add_argument("--model", default="")
+    command.add_argument("--reasoning-effort", default="")
     command.add_argument("--runtime-backend", choices=("plain", "tmux"), default="")
     command.add_argument("--io-mode", choices=("machine", "human"), default="")
     command.add_argument("--permission-mode", choices=("default", "auto", "yolo"), default="")
     command.add_argument("--agent-name", default=""); command.add_argument("--session-id", default=""); command.add_argument("--worker-id", default="")
-    command.add_argument("--execution-mode", choices=("auto", "start", "resume", "replace"), default="auto")
+    command.add_argument("--execution-mode", choices=("auto", "start", "resume", "replace", "restart"), default="auto")
     command.add_argument("--phase", choices=("auto", "planning", "execution"), default="auto")
     command.set_defaults(func=task_resume)
-    command = tasks.add_parser("preview-prompt"); command.add_argument("--task-dir", required=True); command.add_argument("--worker-backend", choices=("claude-code", "codex", "opencode", "kimi-code"), default=""); command.add_argument("--execution-mode", choices=("auto", "start", "resume", "replace"), default="auto"); command.add_argument("--phase", choices=("auto", "planning", "execution"), default="auto"); command.add_argument("--body-only", action="store_true"); command.set_defaults(func=task_preview_prompt)
+    command = tasks.add_parser("preview-prompt"); command.add_argument("--task-dir", required=True); command.add_argument("--worker-backend", choices=("claude-code", "codex", "opencode", "kimi-code"), default=""); command.add_argument("--execution-mode", choices=("auto", "start", "resume", "replace", "restart"), default="auto"); command.add_argument("--phase", choices=("auto", "planning", "execution"), default="auto"); command.add_argument("--body-only", action="store_true"); command.set_defaults(func=task_preview_prompt)
     command = tasks.add_parser("merge"); command.add_argument("--task-dir", required=True); command.add_argument("--target-worktree", required=True); command.add_argument("--expected-commit", default=""); command.add_argument("--verify-command", action="append", default=[]); command.add_argument("--verification-timeout", type=float, default=300); command.add_argument("--coordinator", required=True); command.set_defaults(func=task_merge)
     workflows = areas.add_parser("workflow").add_subparsers(dest="workflow_action", required=True)
     for name in ("start", "heartbeat", "complete"):
@@ -4285,7 +4338,10 @@ def build_parser() -> argparse.ArgumentParser:
     workers = areas.add_parser("worker").add_subparsers(dest="worker_action", required=True)
     command = workers.add_parser("message"); command.add_argument("--task-dir", required=True); command.add_argument("--text", required=True); command.set_defaults(func=control)
     for name in ("interrupt", "terminate"):
-        command = workers.add_parser(name); command.add_argument("--task-dir", required=True); command.set_defaults(func=control)
+        command = workers.add_parser(name); command.add_argument("--task-dir", required=True)
+        if name == "terminate":
+            command.add_argument("--reason", default="operator requested termination")
+        command.set_defaults(func=control)
     return parser
 
 

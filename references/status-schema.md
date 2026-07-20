@@ -18,6 +18,8 @@ discriminator.
   "owner": "worker",
   "branch": "agent/T001-name",
   "worktree": ".agent-worktrees/T001-name",
+  "task_branch_root": "agent/T001-name",
+  "workspace_generation": 1,
   "updated_at": "2026-07-03T12:00:00Z",
   "needs_coordinator": false,
   "summary": "Implementation is ready for coordinator review.",
@@ -57,6 +59,13 @@ V2 requires `artifact_protocol_version = 2`. Always include `task_id`,
 `blocker_type`, `current_attempt_id`, `assigned_worker`, `evidence`, and
 `state_history`. For `pending`, `previous_state`, `current_attempt_id`, and
 `assigned_worker` may be `null`.
+
+`task_branch_root` and `workspace_generation` are optional workspace-lineage
+fields. They appear after the first clean restart: `task_branch_root` preserves
+the task's original branch namespace, while `workspace_generation` counts
+fresh workspaces created for later attempts. The immutable attempt-local
+`runtime/CLEAN_RESTART.json` receipt is the authority for each transition;
+these mutable STATUS fields are only its current projection.
 
 Artifact Protocol v2 never treats a missing `profile` as Full. The profile must
 be one explicit value from `direct|delegated|full`; only a recognized legacy
@@ -173,6 +182,10 @@ compatibility envelope `ATTEMPT.state = invalid_handoff`,
 require `environment` or `needs_user`, timeouts use `budget`, and execution or
 handoff failures require coordinator triage. Dispatch, never the worker, writes
 the final task transition.
+An explicit coordinator termination instead uses
+`ATTEMPT.state = terminated`, `outcome = operator_terminated`, and immutable
+`runtime/OPERATOR_TERMINATION.json`; it must not be classified as an invalid
+handoff.
 Monitoring reports candidate bytes from this invalid-handoff case as
 `publication_state = rejected`; the bundle remains null and strict consumers
 must not treat those bytes as published evidence.

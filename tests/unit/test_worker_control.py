@@ -167,6 +167,25 @@ class WorkerControlTests(unittest.TestCase):
                 "b" * 32,
             )
             self.assertEqual("worker_terminated", self.events(task)[0]["event"])
+            attempt = json.loads(
+                (task / "attempts" / "A001" / "ATTEMPT.json").read_text()
+            )
+            status = json.loads((task / "STATUS.json").read_text())
+            receipt = json.loads(
+                (
+                    task
+                    / "attempts"
+                    / "A001"
+                    / "runtime"
+                    / "OPERATOR_TERMINATION.json"
+                ).read_text()
+            )
+            self.assertEqual("terminated", attempt["state"])
+            self.assertEqual("operator_terminated", attempt["outcome"])
+            self.assertIsNone(attempt["exit_code"])
+            self.assertEqual("blocked", status["state"])
+            self.assertEqual("coordinator", status["owner"])
+            self.assertTrue(receipt["cleanup_verified"])
 
     def test_terminate_returns_failure_when_identity_cannot_be_proved(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

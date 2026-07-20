@@ -23,6 +23,8 @@ ENV_KEYS = {
     "RDO_WORKER_COMMAND": "worker_command",
     "CLAUDE_CODE_CMD": "worker_command",
     "RDO_WORKER_BACKEND": "worker_backend",
+    "RDO_WORKER_MODEL": "worker_model",
+    "RDO_WORKER_REASONING_EFFORT": "worker_reasoning_effort",
     "RDO_WORKER_AGENT_NAME": "worker_agent_name",
     "CLAUDE_AGENT_NAME": "worker_agent_name",
     "RDO_BACKEND_SESSION_ID": "worker_session_id",

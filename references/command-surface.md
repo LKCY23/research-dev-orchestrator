@@ -318,7 +318,7 @@ python scripts/rdo.py task resume \
   [--runtime-backend plain|tmux] \
   [--io-mode machine|human] \
   [--permission-mode default|auto|yolo] \
-  [--execution-mode auto|start|resume|replace] \
+  [--execution-mode auto|start|resume|replace|restart] \
   [--phase auto|planning|execution]
 ```
 

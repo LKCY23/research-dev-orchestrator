@@ -13,6 +13,7 @@ from typing import Any
 
 from agent_backends import load_backend
 from backend_startup import session_state
+from tmux_lifecycle import TmuxLifecycleError, preflight_tmux_runtime
 
 
 AUTH_PROBES: dict[str, tuple[list[str], str]] = {
@@ -113,6 +114,7 @@ def preflight(
     session_id: str = "",
     cwd: str = "",
     io_mode: str = "machine",
+    runtime_backend: str = "plain",
 ) -> dict[str, Any]:
     if command_override:
         parts = shlex.split(command_override)
@@ -138,6 +140,19 @@ def preflight(
         "fallback_required": False,
         "fallback_reason": "",
     }
+    runtime = {
+        "runtime_backend": runtime_backend,
+        "session_create": runtime_backend == "plain",
+        "session_inspect": runtime_backend == "plain",
+        "session_cleanup": runtime_backend == "plain",
+    }
+    if runtime_backend == "tmux":
+        try:
+            runtime = preflight_tmux_runtime()
+        except TmuxLifecycleError as exc:
+            errors.append(str(exc))
+    elif runtime_backend != "plain":
+        errors.append(f"unsupported runtime backend: {runtime_backend!r}")
     if executable is None:
         errors.append(f"worker executable not found: {executable_name!r}")
     elif source == "registry":
@@ -188,6 +203,7 @@ def preflight(
         "capabilities": capabilities,
         "requested_execution_mode": execution_mode,
         "resume": resume,
+        "runtime": runtime,
         "errors": errors,
     }
 
@@ -198,12 +214,13 @@ def main() -> int:
     parser.add_argument("--command", default="")
     parser.add_argument(
         "--execution-mode",
-        choices=["start", "resume", "replace"],
+        choices=["start", "resume", "replace", "restart"],
         default="start",
     )
     parser.add_argument("--session-id", default="")
     parser.add_argument("--cwd", default="")
     parser.add_argument("--io-mode", choices=["machine", "human"], default="machine")
+    parser.add_argument("--runtime-backend", choices=["plain", "tmux"], default="plain")
     args = parser.parse_args()
     result = preflight(
         args.backend,
@@ -212,6 +229,7 @@ def main() -> int:
         session_id=args.session_id,
         cwd=args.cwd,
         io_mode=args.io_mode,
+        runtime_backend=args.runtime_backend,
     )
     print(json.dumps(result, indent=2))
     if result["errors"]:

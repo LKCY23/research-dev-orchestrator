@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,53 @@ _IDENTITY_FORMAT = "#{session_id}\t#{session_created}\t#{session_name}"
 _ACTIVE_TASK_STATES = {"planning", "running"}
 _PRUNABLE_HANDOFF_STATES = {"strategy_review", "verified", "review"}
 TMUX_IDENTITY_REF = "runtime/TMUX_SESSION.json"
+
+
+def preflight_tmux_runtime() -> dict[str, Any]:
+    """Prove that this process can create, inspect, and remove a tmux session."""
+
+    session_name = f"rdo-preflight-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        created = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session_name, "sleep 30"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except FileNotFoundError as exc:
+        raise TmuxLifecycleError("tmux executable is unavailable") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TmuxLifecycleError("tmux session creation probe timed out") from exc
+    if created.returncode != 0:
+        detail = created.stderr.strip() or created.stdout.strip() or f"exit {created.returncode}"
+        raise TmuxLifecycleError(f"cannot create tmux preflight session: {detail}")
+
+    identity: dict[str, Any] | None = None
+    try:
+        identity = inspect_live_tmux_session(session_name)
+        if identity is None or identity["session_name"] != session_name:
+            raise TmuxLifecycleError("tmux preflight session cannot be inspected")
+        cleanup = kill_live_tmux_session(identity)
+        if cleanup["status"] not in {"killed", "already_absent"}:
+            raise TmuxLifecycleError(
+                f"cannot remove tmux preflight session: {cleanup.get('reason') or cleanup['status']}"
+            )
+        if inspect_live_tmux_session(str(identity["session_id"])) is not None:
+            raise TmuxLifecycleError("tmux preflight session survived cleanup")
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session_name],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    return {
+        "runtime_backend": "tmux",
+        "session_create": True,
+        "session_inspect": True,
+        "session_cleanup": True,
+    }
 
 
 def _parse_identity(line: str) -> dict[str, Any]:
@@ -83,7 +131,12 @@ def inspect_live_tmux_session(session_id: str) -> dict[str, Any] | None:
             return None
         detail = completed.stderr.strip() or f"exit {completed.returncode}"
         raise TmuxLifecycleError(f"cannot inspect tmux session {session_id}: {detail}")
-    return _parse_identity(completed.stdout.rstrip("\n"))
+    identity_line = completed.stdout.rstrip("\n")
+    # Some tmux versions return success plus an all-empty format expansion when
+    # the target disappeared while another server session remains alive.
+    if not any(identity_line.split("\t")):
+        return None
+    return _parse_identity(identity_line)
 
 
 def kill_live_tmux_session(expected: dict[str, Any]) -> dict[str, Any]:

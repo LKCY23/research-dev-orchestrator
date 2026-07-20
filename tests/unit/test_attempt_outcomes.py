@@ -10,6 +10,7 @@ from protocol_cli import (
     cmd_reconcile_dispatch_exit,
     cmd_validate_handoff,
 )
+from protocol import record_operator_termination
 
 
 class AttemptOutcomeTests(unittest.TestCase):
@@ -116,6 +117,29 @@ class AttemptOutcomeTests(unittest.TestCase):
             self.assertEqual("blocked", task_status["state"])
             self.assertEqual("environment", task_status["blocker_type"])
             self.assertEqual(0, self.reconcile(root, task, attempt, status))
+
+    def test_operator_termination_is_not_reclassified_as_invalid_handoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt, status = self.make_active(root)
+            record_operator_termination(
+                task,
+                "A001",
+                reason="wrong model configuration",
+                termination={
+                    "status": "terminated",
+                    "cleanup_verified": True,
+                    "surviving_pids": [],
+                },
+            )
+
+            self.assertEqual(0, self.reconcile(root, task, attempt, status))
+            metadata = json.loads((attempt / "ATTEMPT.json").read_text())
+            task_status = json.loads(status.read_text())
+            self.assertEqual("terminated", metadata["state"])
+            self.assertEqual("operator_terminated", metadata["outcome"])
+            self.assertEqual("blocked", task_status["state"])
+            self.assertEqual("wrong model configuration", task_status["blocking_reason"])
 
     def test_timeout_reconciles_to_budget_blocker(self):
         with tempfile.TemporaryDirectory() as temporary:

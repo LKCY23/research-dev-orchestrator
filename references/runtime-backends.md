@@ -171,6 +171,7 @@ Common fields:
     "runtime_backend": "plain",
     "io_mode": "machine",
     "model": null,
+    "reasoning_effort": null,
     "cli": "claude",
     "command": "claude",
     "cwd": "/path/to/worktree"
@@ -187,6 +188,7 @@ For `tmux`:
     "runtime_backend": "tmux",
     "io_mode": "human",
     "model": null,
+    "reasoning_effort": null,
     "cli": "claude",
     "command": "claude",
     "cwd": "/path/to/worktree",
@@ -196,7 +198,7 @@ For `tmux`:
 }
 ```
 
-`runtime.backend`, `runtime.runtime_backend`, `runtime.io_mode`, `runtime.cli`, `runtime.command`, and `runtime.cwd` are required. `runtime.tmux_session` and `runtime.attach_command` are required only when `backend = tmux`.
+`runtime.backend`, `runtime.runtime_backend`, `runtime.io_mode`, `runtime.cli`, `runtime.command`, and `runtime.cwd` are required. `runtime.model` and `runtime.reasoning_effort` bind the resolved model request (or are null when backend defaults were retained). `runtime.tmux_session` and `runtime.attach_command` are required only when `backend = tmux`.
 
 Generated tmux session names must be sanitized to avoid tmux target separators such as `:`.
 
@@ -288,4 +290,7 @@ Timeout diagnostics should record:
 
 ## Tmux Missing
 
-If `RDO_RUNTIME_BACKEND=tmux` and `tmux` is unavailable, dispatch must fail before creating an attempt, writing `LOCK`, acquiring `.dispatch-lock`, or moving `STATUS.json` to `running`.
+If `RDO_RUNTIME_BACKEND=tmux`, dispatch must prove that it can create, inspect,
+and remove a scratch session before creating an attempt, writing `LOCK`,
+acquiring `.dispatch-lock`, or moving `STATUS.json` to `running`. A present tmux
+binary with an inaccessible socket therefore fails during preflight.

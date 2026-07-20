@@ -138,31 +138,32 @@ backend_id: non-empty string, one of supported worker backends
 agent: legacy backend alias; non-empty string
 agent_name: non-empty string
 worker_id: stable logical worker identifier for ordinary attempts on the task
-parent_attempt_id: previous attempt ID for resume/replace lineage; null for the first attempt
+parent_attempt_id: previous attempt ID for resume/replace/restart lineage; null for the first attempt
 session_id: string; may be empty only if runtime cannot provide one
-execution_mode: start|resume|replace
-requested_execution_mode: originally requested start|resume|replace mode
+execution_mode: start|resume|replace|restart
+requested_execution_mode: originally requested start|resume|replace|restart mode
 requested_session_id: native session requested before preflight; may be empty
 resume_fallback_reason: null unless resume deterministically fell back to a full-context start
 resume_context_sha256: digest of derived runtime/RESUME_CONTEXT.json when Full execution materializes resume context
 carried_forward_workflows/remaining_workflows: workflow ID lists compiled by dispatch; empty/absent outside Full execution
-state: created|running|completed|invalid_handoff
-outcome: null while active; startup_failed|execution_failed|timed_out_unfinalized|finalization_timed_out|finalization_failed|invalid_handoff|completed when terminal
+state: created|running|completed|invalid_handoff|terminated
+outcome: null while active; startup_failed|execution_failed|timed_out_unfinalized|finalization_timed_out|finalization_failed|invalid_handoff|operator_terminated|completed when terminal
 phase: planning|execution
 strategy_id/strategy_sha256: required for Full execution; null for planning and Direct/Delegated execution
 backend_profile_sha256: digest of the pure compiled backend profile
 backend_settings_sha256: digest of generated native settings when the backend uses them
 read_policy_sha256: digest of runtime/READ_POLICY.json; handoff fails if it drifts
 started_at: non-empty valid ISO timestamp
-ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff
-exit_code: null for created/running; integer for completed; integer or null for invalid_handoff
+ended_at: null for created/running; valid ISO timestamp for completed/invalid_handoff/terminated
+exit_code: null for created/running/terminated; integer for completed; integer or null for invalid_handoff
 runtime: object
 runtime.backend/runtime_backend: plain|tmux
 runtime.io_mode: machine|human
 runtime.cli: non-empty string
 runtime.command: non-empty string
 runtime.cwd: non-empty string
-runtime.model: optional/null
+runtime.model: exact configured model or null when the backend default is retained
+runtime.reasoning_effort: configured reasoning/effort level or null
 runtime.tmux_session: required when runtime.backend = tmux
 runtime.attach_command: required when runtime.backend = tmux
 verified_commit: exact finalize-time Git HEAD for a completed Direct verified attempt; absent otherwise
@@ -207,6 +208,8 @@ and invalid current bytes remain explicitly non-published.
   `STATUS.json` active while the attempt is completed; replay must revalidate
   the same publication and complete only the missing transition.
 - `invalid_handoff`: the worker exited but did not produce a legal handoff request, evidence bundle, or process result.
+- `terminated`: the coordinator explicitly terminated an active worker and
+  process cleanup was verified. This is not a worker handoff failure.
 
 `state` remains the compatibility lifecycle envelope. `outcome` supplies the
 precise terminal cause without adding worker/process states to the task FSM:
@@ -235,6 +238,11 @@ invalid_handoff
   Candidate publication or handoff bytes existed but failed deterministic
   protocol validation.
 
+operator_terminated
+  A coordinator termination decision was frozen in
+  `runtime/OPERATOR_TERMINATION.json`; the attempt is `terminated`, the task is
+  `blocked`, and `exit_code` remains null.
+
 completed
   Dispatch validated and applied the handoff.
 ```
@@ -250,7 +258,7 @@ leaving the task permanently `running`.
 Do not use attempt state to represent task success. `completed` means the attempt completed protocol handoff, not that the task is approved or merged.
 
 A read-only post-task cleanup audit uses lifecycle terminality rather than
-success. Both `completed` and `invalid_handoff` attempts are eligible once the
+success. `completed`, `invalid_handoff`, and `terminated` attempts are eligible once the
 outer supervisor is terminal (`completed`, `timed_out`, or `cleanup_failed`).
 Active attempts and nonterminal/missing supervisor receipts remain ineligible.
 
@@ -426,4 +434,10 @@ Within a v2 attempt, `TASK_INPUTS.json`, `EVIDENCE.json`, `HANDOFF.json`, and
 `EVIDENCE.md`/`HANDOFF.md` are audit-bearing only for recognized legacy-v0.5/v1
 tasks; they are not v2 protocol files.
 
-Use a new attempt for implementation retries, normally with `execution_mode=resume` and the same worker/session. Use a revision task such as `T001R1-*` when task scope, acceptance criteria, profile, or design changes.
+Use a new attempt for implementation retries, normally with
+`execution_mode=resume` and the same worker/session. When contamination from a
+failed or operator-terminated workspace must be excluded, use
+`execution_mode=restart`: RDO keeps the same task ID and frozen task inputs but
+creates a new branch/worktree from `task_base_commit`; the prior workspace is
+retained for audit. Use a revision task such as `T001R1-*` only when task scope,
+acceptance criteria, profile, or design changes.

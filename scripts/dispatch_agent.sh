@@ -7,13 +7,15 @@ usage: scripts/dispatch_agent.sh <run-id> <task-id> [options]
 
 Options:
   --worker <backend>        claude-code | codex | opencode | kimi-code
+  --model <model>           exact backend model identifier
+  --reasoning-effort <level> backend reasoning/effort level
   --runtime <backend>       plain | tmux
   --io <mode>               machine | human
   --permission <mode>       default | auto | yolo
   --agent-name <name>       worker display name
   --session-id <id>         backend session id for manual resume metadata
   --worker-id <id>          stable logical worker id (normally auto-detected)
-  --execution-mode <mode>   start | resume | replace (normally auto-detected)
+  --execution-mode <mode>   start | resume | replace | restart (normally auto-detected)
   --command <shell-command> explicit command override, mainly for tests
   --phase <phase>           planning | execution (auto-detected when omitted)
 EOF
@@ -32,6 +34,14 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --worker)
       export RDO_WORKER_BACKEND="$2"
+      shift 2
+      ;;
+    --model)
+      export RDO_WORKER_MODEL="$2"
+      shift 2
+      ;;
+    --reasoning-effort)
+      export RDO_WORKER_REASONING_EFFORT="$2"
       shift 2
       ;;
     --runtime)

@@ -13,12 +13,51 @@ from tmux_lifecycle import (
     TmuxLifecycleError,
     build_tmux_inventory,
     kill_live_tmux_session,
+    inspect_live_tmux_session,
     list_live_tmux_sessions,
+    preflight_tmux_runtime,
     record_tmux_session_identity,
 )
 
 
 class TmuxLifecycleTests(unittest.TestCase):
+    @patch("tmux_lifecycle.subprocess.run")
+    def test_runtime_preflight_proves_create_inspect_and_cleanup(self, run) -> None:
+        identity = "$1\t17\trdo-preflight-1-token\n"
+        run.side_effect = [
+            __import__("subprocess").CompletedProcess([], 0, "", ""),
+            __import__("subprocess").CompletedProcess([], 0, identity, ""),
+            __import__("subprocess").CompletedProcess([], 0, identity, ""),
+            __import__("subprocess").CompletedProcess([], 0, "", ""),
+            __import__("subprocess").CompletedProcess([], 1, "", "can't find session"),
+            __import__("subprocess").CompletedProcess([], 1, "", "can't find session"),
+        ]
+        with patch("tmux_lifecycle.os.getpid", return_value=1), patch(
+            "tmux_lifecycle.secrets.token_hex", return_value="token"
+        ):
+            result = preflight_tmux_runtime()
+
+        self.assertTrue(result["session_create"])
+        self.assertTrue(result["session_inspect"])
+        self.assertTrue(result["session_cleanup"])
+
+    @patch("tmux_lifecycle.subprocess.run")
+    def test_runtime_preflight_rejects_tmux_socket_failure(self, run) -> None:
+        run.return_value = __import__("subprocess").CompletedProcess(
+            [], 1, "", "permission denied"
+        )
+
+        with self.assertRaisesRegex(TmuxLifecycleError, "permission denied"):
+            preflight_tmux_runtime()
+
+    @patch("tmux_lifecycle.subprocess.run")
+    def test_inspect_treats_empty_success_response_as_absent(self, run) -> None:
+        run.return_value = __import__("subprocess").CompletedProcess(
+            [], 0, "\t\t\n", ""
+        )
+
+        self.assertIsNone(inspect_live_tmux_session("$1"))
+
     def write_task(
         self,
         root: Path,

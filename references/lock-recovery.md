@@ -30,7 +30,7 @@ Run a Lock Recovery Review when any of these appear:
 ```text
 STATUS.state not in planning|running but .dispatch-lock exists
 STATUS.state in planning|running but .dispatch-lock/attempt_id does not match current_attempt_id
-STATUS.state = running but ATTEMPT.state is completed or invalid_handoff
+STATUS.state = running but ATTEMPT.state is completed, invalid_handoff, or terminated
 .dispatch-lock age exceeds the stale threshold
 .dispatch-lock/pid is missing
 .dispatch-lock/pid is not alive

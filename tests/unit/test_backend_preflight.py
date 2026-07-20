@@ -6,6 +6,7 @@ from unittest import mock
 
 from backend_preflight import auth_state, capability_state, preflight
 from backend_startup import session_state
+from tmux_lifecycle import TmuxLifecycleError
 
 
 class BackendPreflightTests(unittest.TestCase):
@@ -79,6 +80,38 @@ class BackendPreflightTests(unittest.TestCase):
             ["/usr/bin/codex", "--cd", "/tmp/work", "resume", "--help"],
             probe.call_args_list[-1].args[0],
         )
+
+    @mock.patch("backend_preflight.preflight_tmux_runtime")
+    @mock.patch("backend_preflight.run_probe")
+    @mock.patch("backend_preflight.shutil.which", return_value="/usr/bin/codex")
+    def test_tmux_runtime_is_probed_before_dispatch(self, _which, probe, tmux_probe):
+        probe.return_value = subprocess.CompletedProcess([], 0, "ok\n", "")
+        tmux_probe.return_value = {
+            "runtime_backend": "tmux",
+            "session_create": True,
+            "session_inspect": True,
+            "session_cleanup": True,
+        }
+
+        result = preflight("codex", runtime_backend="tmux", io_mode="human")
+
+        self.assertFalse(result["errors"])
+        self.assertTrue(result["runtime"]["session_cleanup"])
+        tmux_probe.assert_called_once_with()
+
+    @mock.patch(
+        "backend_preflight.preflight_tmux_runtime",
+        side_effect=TmuxLifecycleError("tmux socket denied"),
+    )
+    def test_tmux_runtime_failure_is_a_hard_preflight_error(self, _tmux_probe):
+        result = preflight(
+            "claude-code",
+            command_override="/bin/true",
+            runtime_backend="tmux",
+            io_mode="human",
+        )
+
+        self.assertIn("tmux socket denied", result["errors"])
 
 
 if __name__ == "__main__":

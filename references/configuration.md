@@ -38,6 +38,8 @@ CLI flag or coordinator intent argument
 ```toml
 [worker]
 backend = "claude-code"
+model = "" # exact backend model identifier
+reasoning_effort = "" # requires an explicit model
 agent_name = "claude-worker"
 permission_mode = "auto"
 command = ""
@@ -100,6 +102,12 @@ tighten shipped limits, and one-off environment or dispatch arguments cannot
 remove these restrictions. The compiled result is stored under the attempt's
 `runtime/BACKEND_PROFILE.json`.
 
+`worker.model` and `worker.reasoning_effort` are frozen into that signed
+profile. Claude Code receives `--model`/`--effort`; Codex receives
+`--model`/`model_reasoning_effort`. Unsupported adapter settings fail before
+dispatch mutation. Arbitrary `worker.command` overrides cannot claim these
+settings because RDO cannot prove how the wrapper applies them.
+
 Do not add persistent `session_id` to this file. Session id is runtime identity and should be passed with `RDO_BACKEND_SESSION_ID` when available.
 
 Do not add `protocol_version` or `package_version`. Versions are defined by the installed package in the top-level `VERSION` file, written to `RUN.json`, and audited by `collect_status.py`.
@@ -110,9 +118,10 @@ Do not add `protocol_version` or `package_version`. Versions are defined by the 
 RDO_WORKER_COMMAND
 CLAUDE_CODE_CMD
 RDO_WORKER_BACKEND
+RDO_WORKER_MODEL
+RDO_WORKER_REASONING_EFFORT
 RDO_WORKER_AGENT_NAME
 CLAUDE_AGENT_NAME
-RDO_BACKEND_SESSION_ID
 CLAUDE_SESSION_ID
 RDO_PERMISSION_MODE
 RDO_RUNTIME_BACKEND

@@ -18,6 +18,7 @@ DISPATCH_ASSETS="${SCRIPT_DIR}/dispatch_assets.py"
 AGENT_BACKEND_CLI="${SCRIPT_DIR}/agent_backend_cli.py"
 BACKEND_GOVERNANCE_CLI="${SCRIPT_DIR}/backend_governance_cli.py"
 BACKEND_PREFLIGHT="${SCRIPT_DIR}/backend_preflight.py"
+CLEAN_RESTART_CLI="${SCRIPT_DIR}/clean_restart.py"
 RESUME_CONTEXT_CLI="${SCRIPT_DIR}/resume_context.py"
 TASK_BUDGET_CLI="${SCRIPT_DIR}/task_budget_cli.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -396,6 +397,8 @@ eval "${CONFIG_ENV}"
 : "${RDO_WORKER_ID:=}"
 : "${RDO_EXECUTION_MODE:=auto}"
 : "${RDO_WORKER_BACKEND:=${CONFIG_RDO_WORKER_BACKEND}}"
+: "${RDO_WORKER_MODEL:=${CONFIG_RDO_WORKER_MODEL}}"
+: "${RDO_WORKER_REASONING_EFFORT:=${CONFIG_RDO_WORKER_REASONING_EFFORT}}"
 : "${RDO_PERMISSION_MODE:=${CONFIG_RDO_PERMISSION_MODE}}"
 : "${RDO_RUNTIME_BACKEND:=${CONFIG_RDO_RUNTIME_BACKEND}}"
 : "${RDO_IO_MODE:=${CONFIG_RDO_IO_MODE}}"
@@ -591,6 +594,10 @@ if [[ -n "${RDO_WORKER_COMMAND}" && "${RDO_TEST_ALLOW_UNGOVERNED_COMMAND_OVERRID
   echo "worker.command overrides do not provide a registered startup-event contract; use the registered backend command" >&2
   exit 2
 fi
+if [[ -n "${RDO_WORKER_COMMAND}" && ( -n "${RDO_WORKER_MODEL}" || -n "${RDO_WORKER_REASONING_EFFORT}" ) ]]; then
+  echo "model selection cannot be guaranteed for a worker.command override" >&2
+  exit 2
+fi
 
 ATTEMPT_SEQ="$(find "${TASK_DIR}/attempts" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
 ATTEMPT_NUM="$(printf "%03d" "$((ATTEMPT_SEQ + 1))")"
@@ -617,22 +624,6 @@ if [[ "${TASK_BUDGET_CODE}" -ne 0 ]]; then
 fi
 TASK_BUDGET_ENABLED="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("enabled") else "0")' "${TASK_BUDGET_ASSESSMENT}")"
 ATTEMPT_TIMEOUT_SECONDS="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["admission"]["attempt_wall_seconds"] or sys.argv[2])' "${TASK_BUDGET_ASSESSMENT}" "${ATTEMPT_POLICY_TIMEOUT_SECONDS}")"
-
-BACKEND_PROFILE_COMPILE_ARGS=(
-  compile
-  --repo-root "${REPO_ROOT}"
-  --task-dir "${TASK_DIR}"
-  --backend "${RDO_WORKER_BACKEND}"
-  --phase "${RDO_ATTEMPT_PHASE}"
-  --io-mode "${RDO_IO_MODE}"
-)
-if [[ -n "${STRATEGY_PATH}" ]]; then
-  BACKEND_PROFILE_COMPILE_ARGS+=(--strategy "${STRATEGY_PATH}")
-fi
-if [[ "${TASK_BUDGET_ENABLED}" == "1" ]]; then
-  BACKEND_PROFILE_COMPILE_ARGS+=(--task-budget-json "${TASK_BUDGET_ASSESSMENT}")
-fi
-BACKEND_PROFILE_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" "${BACKEND_PROFILE_COMPILE_ARGS[@]}")" || exit 2
 
 WORKER_CONTEXT="$(python3 - "${STATUS_PATH}" "${RDO_WORKER_BACKEND}" <<'PY'
 import json, sys
@@ -675,23 +666,98 @@ if [[ "${RDO_EXECUTION_MODE}" == "auto" ]]; then
   fi
 fi
 case "${RDO_EXECUTION_MODE}" in
-  start|resume|replace) ;;
-  *) echo "RDO_EXECUTION_MODE must be start, resume, or replace" >&2; exit 2 ;;
+  start|resume|replace|restart) ;;
+  *) echo "RDO_EXECUTION_MODE must be start, resume, replace, or restart" >&2; exit 2 ;;
 esac
 if [[ "${RDO_EXECUTION_MODE}" == "resume" && -z "${RDO_BACKEND_SESSION_ID}" ]]; then
   echo "resume requires a backend session id" >&2
   exit 2
 fi
+WORKSPACE_CONTEXT="$(python3 - "${STATUS_PATH}" <<'PY'
+import json, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+print(json.dumps({
+    "branch": status.get("branch") or "",
+    "root_branch": status.get("task_branch_root") or status.get("branch") or "",
+    "worktree": status.get("worktree") or "",
+    "state": status.get("state") or "",
+}))
+PY
+)"
+CURRENT_BRANCH="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["branch"])' "${WORKSPACE_CONTEXT}")"
+CURRENT_WORKTREE_REL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["worktree"])' "${WORKSPACE_CONTEXT}")"
+PLANNED_BRANCH="${CURRENT_BRANCH}"
+PLANNED_WORKTREE_REL="${CURRENT_WORKTREE_REL}"
+if [[ "${RDO_EXECUTION_MODE}" == "restart" ]]; then
+  if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" != "2" ]]; then
+    echo "clean restart requires artifact protocol v2" >&2
+    exit 2
+  fi
+  if [[ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["state"])' "${WORKSPACE_CONTEXT}")" != "blocked" ]]; then
+    echo "clean restart requires a blocked task" >&2
+    exit 2
+  fi
+  ROOT_BRANCH="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["root_branch"])' "${WORKSPACE_CONTEXT}")"
+  PLANNED_BRANCH="${ROOT_BRANCH}-restart-${ATTEMPT_ID}"
+  PLANNED_WORKTREE_REL="${CONFIG_RDO_WORKTREE_ROOT%/}/${TASK_ID}--${ATTEMPT_ID}"
+  RDO_BACKEND_SESSION_ID=""
+fi
+
+BACKEND_PROFILE_COMPILE_ARGS=(
+  compile
+  --repo-root "${REPO_ROOT}"
+  --task-dir "${TASK_DIR}"
+  --backend "${RDO_WORKER_BACKEND}"
+  --phase "${RDO_ATTEMPT_PHASE}"
+  --io-mode "${RDO_IO_MODE}"
+  --model "${RDO_WORKER_MODEL}"
+  --reasoning-effort "${RDO_WORKER_REASONING_EFFORT}"
+  --worktree "${PLANNED_WORKTREE_REL}"
+)
+if [[ -n "${STRATEGY_PATH}" ]]; then
+  BACKEND_PROFILE_COMPILE_ARGS+=(--strategy "${STRATEGY_PATH}")
+fi
+if [[ "${TASK_BUDGET_ENABLED}" == "1" ]]; then
+  BACKEND_PROFILE_COMPILE_ARGS+=(--task-budget-json "${TASK_BUDGET_ASSESSMENT}")
+fi
+BACKEND_PROFILE_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" "${BACKEND_PROFILE_COMPILE_ARGS[@]}")" || exit 2
+
 REQUESTED_EXECUTION_MODE="${RDO_EXECUTION_MODE}"
 REQUESTED_SESSION_ID="${RDO_BACKEND_SESSION_ID}"
 RESUME_FALLBACK_REASON=""
+set +e
 PREFLIGHT_JSON="$(python3 "${BACKEND_PREFLIGHT}" \
   --backend "${RDO_WORKER_BACKEND}" \
   --command "${RDO_WORKER_COMMAND}" \
   --execution-mode "${REQUESTED_EXECUTION_MODE}" \
   --session-id "${REQUESTED_SESSION_ID}" \
   --cwd "${REPO_ROOT}" \
-  --io-mode "${RDO_IO_MODE}")" || exit 2
+  --io-mode "${RDO_IO_MODE}" \
+  --runtime-backend "${RDO_RUNTIME_BACKEND}")"
+PREFLIGHT_CODE=$?
+set -e
+if [[ "${PREFLIGHT_CODE}" -ne 0 ]]; then
+  PREFLIGHT_DETAIL="$(python3 -c '
+import json, sys
+try:
+    errors = json.loads(sys.argv[1]).get("errors", [])
+except (json.JSONDecodeError, AttributeError):
+    errors = []
+print("; ".join(str(item) for item in errors if item) or "backend or runtime preflight failed")
+' "${PREFLIGHT_JSON}" 2>/dev/null || true)"
+  python3 "${PROTOCOL_CLI}" append-event \
+    --run-dir "${RUN_DIR}" \
+    --run-id "${RUN_ID}" \
+    --task-id "${TASK_ID}" \
+    --event-name "dispatch_preflight_failed" \
+    --agent-name "${RDO_WORKER_AGENT_NAME}" \
+    --worker-backend "${RDO_WORKER_BACKEND}" \
+    --runtime-backend "${RDO_RUNTIME_BACKEND}" \
+    --execution-mode "${REQUESTED_EXECUTION_MODE}" \
+    --status-path "${STATUS_PATH}" \
+    --detail "${PREFLIGHT_DETAIL:-backend or runtime preflight failed}" || true
+  exit "${PREFLIGHT_CODE}"
+fi
 RESUME_FALLBACK_REQUIRED="$(python3 -c '
 import json, sys
 print("1" if json.loads(sys.argv[1]).get("resume", {}).get("fallback_required") else "0")
@@ -806,6 +872,23 @@ else
   mkdir -p "${ATTEMPT_DIR}"
 fi
 
+if [[ "${RDO_EXECUTION_MODE}" == "restart" ]]; then
+  python3 "${CLEAN_RESTART_CLI}" \
+    --repo-root "${REPO_ROOT}" \
+    --task-dir "${TASK_DIR}" \
+    --attempt-id "${ATTEMPT_ID}" \
+    --task-base-commit "${TASK_BASE_COMMIT}" \
+    --new-branch "${PLANNED_BRANCH}" \
+    --new-worktree "${PLANNED_WORKTREE_REL}" >/dev/null || exit 2
+  BRANCH="${PLANNED_BRANCH}"
+  WORKTREE_REL="${PLANNED_WORKTREE_REL}"
+  if [[ "${WORKTREE_REL}" = /* ]]; then
+    WORKTREE_PATH="${WORKTREE_REL}"
+  else
+    WORKTREE_PATH="${REPO_ROOT}/${WORKTREE_REL}"
+  fi
+fi
+
 if [[ "${TASK_BUDGET_ENABLED}" == "1" ]]; then
   TASK_BUDGET_RESULT="$(python3 "${TASK_BUDGET_CLI}" freeze \
     --attempt-dir "${ATTEMPT_DIR}" \
@@ -881,6 +964,8 @@ elif [[ -n "${RESUME_FALLBACK_REASON}" ]]; then
   render_dispatch_prompt "full" "preflight_resume_fallback:${RESUME_FALLBACK_REASON}"
 elif [[ "${RDO_EXECUTION_MODE}" == "replace" ]]; then
   render_dispatch_prompt "full" "backend_replacement_session"
+elif [[ "${RDO_EXECUTION_MODE}" == "restart" ]]; then
+  render_dispatch_prompt "full" "clean_task_workspace_restart"
 else
   render_dispatch_prompt "full" "new_backend_session"
 fi
@@ -1104,6 +1189,8 @@ python3 "${PROTOCOL_CLI}" create-attempt \
   --parent-attempt-id "${PARENT_ATTEMPT_ID}" \
   --session-id "${RDO_BACKEND_SESSION_ID}" \
   --worker-backend "${RDO_WORKER_BACKEND}" \
+  --model "${RDO_WORKER_MODEL}" \
+  --reasoning-effort "${RDO_WORKER_REASONING_EFFORT}" \
   --execution-mode "${RDO_EXECUTION_MODE}" \
   --requested-execution-mode "${REQUESTED_EXECUTION_MODE}" \
   --requested-session-id "${REQUESTED_SESSION_ID}" \

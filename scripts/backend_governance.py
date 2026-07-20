@@ -108,9 +108,28 @@ def compile_backend_profile(
     strategy_path: Path | None = None,
     io_mode: str | None = None,
     task_budget_assessment: dict[str, Any] | None = None,
+    model: str = "",
+    reasoning_effort: str = "",
+    worktree: str = "",
 ) -> dict[str, Any]:
     if phase not in {"planning", "execution"}:
         raise BackendGovernanceError("phase must be planning or execution")
+    model = model.strip()
+    reasoning_effort = reasoning_effort.strip().lower()
+    supported_effort = {
+        "claude-code": {"low", "medium", "high", "xhigh", "max"},
+        "codex": {"minimal", "low", "medium", "high", "xhigh", "max"},
+    }
+    if (model or reasoning_effort) and backend_id not in supported_effort:
+        raise BackendGovernanceError(
+            f"backend {backend_id!r} does not have a governed model-selection adapter"
+        )
+    if reasoning_effort and not model:
+        raise BackendGovernanceError("reasoning_effort requires an explicit model")
+    if reasoning_effort and reasoning_effort not in supported_effort[backend_id]:
+        raise BackendGovernanceError(
+            f"unsupported reasoning_effort {reasoning_effort!r} for backend {backend_id!r}"
+        )
     backend = load_backend(backend_id)
     backend_errors = validate_backend(backend)
     if backend_errors:
@@ -123,6 +142,8 @@ def compile_backend_profile(
     policy = validate_execution_policy(load_json(task_dir / "EXECUTION_POLICY.json"))
     status_path = task_dir / "STATUS.json"
     status = load_json(status_path) if status_path.exists() else {}
+    if worktree:
+        status = {**status, "worktree": worktree}
     task_profile = status.get("profile", "full") if isinstance(status, dict) else "full"
     if task_profile not in {"direct", "delegated", "full"}:
         raise BackendGovernanceError(f"invalid task execution profile {task_profile!r}")
@@ -406,6 +427,11 @@ def compile_backend_profile(
     profile = {
         "schema_version": 1,
         "backend_id": backend_id,
+        "model_config": {
+            "model": model or None,
+            "reasoning_effort": reasoning_effort or None,
+        },
+        "worktree": str(status.get("worktree") or ""),
         "phase": phase,
         "task_profile": task_profile,
         "strategy_id": strategy.get("strategy_id") if strategy else None,

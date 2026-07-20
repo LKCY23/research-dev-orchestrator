@@ -545,8 +545,19 @@ def validate_attempt(
                     f"{task_dir.name}: {outcome or 'legacy invalid_handoff'} blocked task "
                     f"requires blocker_type in {sorted(expected_blockers)}"
                 )
+        elif attempt_state == "terminated":
+            if attempt.get("outcome") != "operator_terminated":
+                violations.append(
+                    f"{task_dir.name}: terminated attempt requires outcome=operator_terminated"
+                )
+            if status.get("blocker_type") != "needs_coordinator":
+                violations.append(
+                    f"{task_dir.name}: operator-terminated task requires blocker_type=needs_coordinator"
+                )
         else:
-            violations.append(f"{task_dir.name}: STATUS blocked requires completed or invalid_handoff attempt")
+            violations.append(
+                f"{task_dir.name}: STATUS blocked requires completed, invalid_handoff, or terminated attempt"
+            )
 
     if profile == "full" and attempt.get("phase") == "execution":
         try:

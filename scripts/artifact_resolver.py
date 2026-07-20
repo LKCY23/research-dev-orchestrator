@@ -360,7 +360,7 @@ def resolve_task_artifacts(
     if (
         monitoring_default
         and status.get("state") == "blocked"
-        and attempt_payload.get("state") == "invalid_handoff"
+        and attempt_payload.get("state") in {"invalid_handoff", "terminated"}
     ):
         try:
             validate_task_inputs_binding(

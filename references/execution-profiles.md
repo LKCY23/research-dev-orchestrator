@@ -140,12 +140,20 @@ An attempt records `worker_id`, `parent_attempt_id`, and `execution_mode`:
 - `start`: first attempt for the logical worker; create a native backend session.
 - `resume`: another bounded attempt for the same worker, resuming its native session and worktree.
 - `replace`: a deliberate worker/backend replacement; preserve the previous lineage and record the reason.
+- `restart`: a deliberate clean-workspace retry under the same task contract;
+  start a new backend session and create a fresh branch/worktree from the
+  frozen task base while preserving the prior attempt and workspace.
 
 Ordinary coordinator feedback uses `changes_requested -> running`, creates a new attempt, and resumes the same worker/session. This preserves context while keeping timeouts, logs, and handoffs independently auditable. Return to planning only when the strategy is invalidated by a scope, design, backend, workflow-kind, permission, or budget change.
 
 When a Full revision changes backend or strategy shape, native session resume may be impossible while work resume remains valid. The revision explicitly maps source workflows to target workflows with `reuse` or `revalidate`; dispatch verifies exact worktree continuity before honoring the mapping.
 
 Session reuse is best effort only when a backend cannot expose a native session identifier. The supported built-in backends use their native resume mechanism when a session ID is available.
+
+Use `rdo task resume --execution-mode restart` only when the blocked current
+attempt was operator-terminated, invalid, or explicitly handed off as blocked.
+Scope, acceptance, profile, and design changes still require a revision task;
+clean restart does not revise the task contract.
 
 ## Artifact Boundary
 

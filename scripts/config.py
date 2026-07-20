@@ -21,6 +21,8 @@ from agent_backends import validate_project_governance
 class RdoConfig:
     worker_command: str = ""
     worker_backend: str = "claude-code"
+    worker_model: str = ""
+    worker_reasoning_effort: str = ""
     worker_agent_name: str = "claude-worker"
     worker_session_id: str = ""
     permission_mode: str = "auto"
@@ -47,7 +49,7 @@ class ConfigLoadResult:
 
 
 TOML_SCHEMA = {
-    "worker": {"backend", "command", "agent_name", "permission_mode"},
+    "worker": {"backend", "command", "model", "reasoning_effort", "agent_name", "permission_mode"},
     "runtime": {"backend", "io_mode", "startup_timeout_seconds"},
     "tmux": {"session_prefix", "keep_session", "wait_timeout_seconds", "exit_code_grace_seconds"},
     "status": {"stale_lock_hours", "stale_created_minutes"},
@@ -60,6 +62,8 @@ ENV_MAP = {
     "RDO_WORKER_COMMAND": ("worker_command", "string_empty_ok"),
     "CLAUDE_CODE_CMD": ("worker_command", "string"),
     "RDO_WORKER_BACKEND": ("worker_backend_or_legacy_runtime", "worker_backend_or_legacy_runtime"),
+    "RDO_WORKER_MODEL": ("worker_model", "string_empty_ok"),
+    "RDO_WORKER_REASONING_EFFORT": ("worker_reasoning_effort", "string_empty_ok"),
     "CLAUDE_AGENT_NAME": ("worker_agent_name", "string"),
     "RDO_WORKER_AGENT_NAME": ("worker_agent_name", "string"),
     "CLAUDE_SESSION_ID": ("worker_session_id", "string_empty_ok"),
@@ -82,6 +86,8 @@ ENV_MAP = {
 TOML_MAP = {
     ("worker", "backend"): ("worker_backend", "worker_backend"),
     ("worker", "command"): ("worker_command", "string_empty_ok"),
+    ("worker", "model"): ("worker_model", "string_empty_ok"),
+    ("worker", "reasoning_effort"): ("worker_reasoning_effort", "string_empty_ok"),
     ("worker", "agent_name"): ("worker_agent_name", "string"),
     ("worker", "permission_mode"): ("permission_mode", "permission_mode"),
     ("runtime", "backend"): ("runtime_backend", "runtime_backend"),

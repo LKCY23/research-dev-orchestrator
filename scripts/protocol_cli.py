@@ -39,6 +39,8 @@ from protocol import (
     load_json,
     parse_iso,
     read_event_journal,
+    converge_operator_termination_locked,
+    task_state_lock,
     utc_now,
     write_json,
 )
@@ -340,7 +342,7 @@ def add_common_event_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--task-id", required=True)
-    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--attempt-id", default="")
 
 
 def cmd_check_dispatch_transition(args: argparse.Namespace) -> int:
@@ -476,6 +478,7 @@ def cmd_freeze_task_inputs(args: argparse.Namespace) -> int:
 
 def cmd_append_event(args: argparse.Namespace) -> int:
     dispatch_events = {
+        "dispatch_preflight_failed",
         "task_dispatched",
         "worker_process_started",
         "prompt_dispatched",
@@ -494,8 +497,9 @@ def cmd_append_event(args: argparse.Namespace) -> int:
         "event": args.event_name,
         "run_id": args.run_id,
         "task_id": args.task_id,
-        "attempt_id": args.attempt_id,
     }
+    if args.attempt_id:
+        payload["attempt_id"] = args.attempt_id
     if args.event_name == "task_dispatched":
         payload["worker"] = args.agent_name
         payload["worker_backend"] = getattr(args, "worker_backend", "")
@@ -503,6 +507,11 @@ def cmd_append_event(args: argparse.Namespace) -> int:
         assigned = status.get("assigned_worker") or {}
         payload["worker_id"] = assigned.get("worker_id", "")
         payload["execution_mode"] = getattr(args, "execution_mode", "")
+    if args.event_name == "dispatch_preflight_failed":
+        payload["worker_backend"] = getattr(args, "worker_backend", "")
+        payload["runtime_backend"] = getattr(args, "runtime_backend", "")
+        payload["execution_mode"] = getattr(args, "execution_mode", "")
+        payload["detail"] = getattr(args, "detail", "")
     if args.event_name == "worker_blocked":
         status = load_json(Path(args.status_path))
         payload["blocker_type"] = status.get("blocker_type", "")
@@ -518,7 +527,8 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
         "backend": args.runtime_backend,
         "runtime_backend": args.runtime_backend,
         "io_mode": args.io_mode,
-        "model": os.environ.get("CLAUDE_MODEL"),
+        "model": args.model or None,
+        "reasoning_effort": args.reasoning_effort or None,
         "cli": command_parts[0] if command_parts else command,
         "command": command,
         "cwd": args.cwd,
@@ -772,6 +782,18 @@ def _v2_governance_reasons(
         reasons.append("ATTEMPT backend profile digest is missing")
 
     if isinstance(profile, Mapping):
+        model_config = profile.get("model_config")
+        runtime = attempt.get("runtime")
+        if not isinstance(model_config, Mapping):
+            reasons.append("backend profile model_config is missing or invalid")
+        elif not isinstance(runtime, Mapping):
+            reasons.append("ATTEMPT runtime is missing while validating model configuration")
+        else:
+            for field in ("model", "reasoning_effort"):
+                if runtime.get(field) != model_config.get(field):
+                    reasons.append(
+                        f"ATTEMPT runtime {field} differs from the backend profile"
+                    )
         expected_profile = expected_dispatch.get("profile")
         expected_phase = expected_dispatch.get("phase")
         expected_backend = expected_dispatch.get("worker_backend")
@@ -2628,7 +2650,7 @@ def _v2_supervisor_receipt_reasons(
     return reasons
 
 
-def cmd_validate_handoff(args: argparse.Namespace) -> int:
+def _cmd_validate_handoff_locked(args: argparse.Namespace) -> int:
     attempt_path = Path(args.attempt_path)
     task_dir = Path(args.task_dir)
     startup_payload = _optional_json(getattr(args, "startup_path", ""))
@@ -3055,7 +3077,15 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
+def cmd_validate_handoff(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir)
+    with task_state_lock(task_dir):
+        if converge_operator_termination_locked(task_dir, args.attempt_id):
+            return 0
+        return _cmd_validate_handoff_locked(args)
+
+
+def _cmd_reconcile_dispatch_exit_locked(args: argparse.Namespace) -> int:
     """Idempotently close an active attempt after dispatcher failure."""
 
     status_path = Path(args.status_path)
@@ -3363,6 +3393,14 @@ def cmd_write_dispatch_diagnostics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir)
+    with task_state_lock(task_dir):
+        if converge_operator_termination_locked(task_dir, args.attempt_id):
+            return 0
+        return _cmd_reconcile_dispatch_exit_locked(args)
+
+
 def cmd_write_tmux_timeout_diagnostics(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir)
     diagnostics_dir = run_dir / "diagnostics"
@@ -3445,7 +3483,7 @@ def build_parser() -> argparse.ArgumentParser:
     freeze_inputs.add_argument("--profile", choices=["direct", "delegated", "full"], required=True)
     freeze_inputs.add_argument(
         "--execution-mode",
-        choices=["start", "resume", "replace"],
+        choices=["start", "resume", "replace", "restart"],
         default="start",
         help="recorded for dispatch diagnostics; all later v2 attempts enforce the frozen contract",
     )
@@ -3456,7 +3494,9 @@ def build_parser() -> argparse.ArgumentParser:
     event.add_argument("--event-name", required=True)
     event.add_argument("--agent-name", required=True)
     event.add_argument("--worker-backend", default="")
+    event.add_argument("--runtime-backend", default="")
     event.add_argument("--execution-mode", default="")
+    event.add_argument("--detail", default="")
     event.add_argument("--status-path", required=True)
     event.set_defaults(func=cmd_append_event)
 
@@ -3474,6 +3514,8 @@ def build_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--parent-attempt-id", default="")
     attempt.add_argument("--session-id", default="")
     attempt.add_argument("--worker-backend", default="claude-code")
+    attempt.add_argument("--model", default="")
+    attempt.add_argument("--reasoning-effort", default="")
     attempt.add_argument("--execution-mode", default="start")
     attempt.add_argument("--requested-execution-mode", default="")
     attempt.add_argument("--requested-session-id", default="")

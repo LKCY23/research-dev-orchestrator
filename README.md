@@ -268,9 +268,9 @@ See [Artifact Protocol v2](references/artifact-protocol-v2.md),
 
 The execution state model separates work progress from worker execution.
 
-A task is the durable work item: intent, constraints, acceptance criteria, and coordinator-owned progress. A worker is the logical execution owner. An attempt is one bounded supervision and audit slice, materialized with prompt, runtime metadata, transcript, result, evidence, and handoff request. New attempts normally resume the same worker, worktree, and native backend session.
+A task is the durable work item: intent, constraints, acceptance criteria, and coordinator-owned progress. A worker is the logical execution owner. An attempt is one bounded supervision and audit slice, materialized with prompt, runtime metadata, transcript, result, evidence, and handoff request. New attempts normally resume the same worker, worktree, and native backend session; an explicit clean restart keeps the task ID but creates a fresh branch/worktree from the frozen task base.
 
-Dispatch is the boundary between worker execution and task state. Direct and Delegated tasks enter execution immediately; Full tasks first pass immutable strategy review. Ordinary feedback creates a new attempt with `execution_mode=resume`; worker/backend replacement is explicit and recorded as `replace`.
+Dispatch is the boundary between worker execution and task state. Direct and Delegated tasks enter execution immediately; Full tasks first pass immutable strategy review. Ordinary feedback creates a new attempt with `execution_mode=resume`; worker/backend replacement is explicit and recorded as `replace`; contamination-free retry is explicit and recorded as `restart`.
 
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui","primaryColor":"#f8fafc","primaryTextColor":"#0f172a","primaryBorderColor":"#cbd5e1","lineColor":"#64748b","tertiaryColor":"#ffffff"},"flowchart":{"curve":"basis"}}}%%
@@ -361,7 +361,9 @@ best-effort evidence. After `rdo strategy submit|revise` or `rdo finalize`
 publishes a validated attempt-bound READY marker, the supervisor quiesces the
 TUI process group; coordinator review and final dispatch validation remain
 separate.
-Unsupported pairs fail before attempt, worktree, lock, or task-state mutation.
+For `tmux + human`, preflight also creates, inspects, and removes a scratch tmux
+session, so socket/permission failures occur before mutation. Unsupported pairs
+fail before attempt, worktree, lock, or task-state mutation.
 
 Backend command contracts live in `agent_backends/*.toml`; validate them with:
 

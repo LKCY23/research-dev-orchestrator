@@ -102,6 +102,10 @@ class TaskResumeTests(unittest.TestCase):
                     task,
                     "--worker-backend",
                     "codex",
+                    "--model",
+                    "gpt-5.6-luna",
+                    "--reasoning-effort",
+                    "max",
                     "--runtime-backend",
                     "tmux",
                     "--io-mode",
@@ -129,6 +133,10 @@ class TaskResumeTests(unittest.TestCase):
                     "T001-resume",
                     "--worker",
                     "codex",
+                    "--model",
+                    "gpt-5.6-luna",
+                    "--reasoning-effort",
+                    "max",
                     "--runtime",
                     "tmux",
                     "--io",
@@ -176,6 +184,53 @@ class TaskResumeTests(unittest.TestCase):
             self.assertFalse(result["attempt_created"])
             self.assertEqual("auto", result["requested_execution_mode"])
             self.assertEqual(7, result["dispatch_exit_code"])
+
+    def test_clean_restart_reuses_task_id_and_requests_a_fresh_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = self.fixture(root, state="blocked")
+            attempt_path = task / "attempts" / "A001" / "ATTEMPT.json"
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+            attempt["state"] = "terminated"
+            attempt["outcome"] = "operator_terminated"
+            attempt_path.write_text(json.dumps(attempt), encoding="utf-8")
+
+            with patch("rdo._run_task_dispatch", return_value=7) as dispatch:
+                code, result = self.invoke(
+                    task,
+                    "--execution-mode",
+                    "restart",
+                    "--model",
+                    "gpt-5.6-luna",
+                    "--reasoning-effort",
+                    "max",
+                )
+
+            self.assertEqual(7, code)
+            command = dispatch.call_args.args[0]
+            self.assertEqual(
+                [
+                    "run-1",
+                    "T001-resume",
+                    "--model",
+                    "gpt-5.6-luna",
+                    "--reasoning-effort",
+                    "max",
+                    "--execution-mode",
+                    "restart",
+                ],
+                command[1:],
+            )
+            self.assertFalse(result["attempt_created"])
+
+    def test_clean_restart_rejects_a_completed_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = self.fixture(root, state="blocked")
+            with patch("rdo._run_task_dispatch") as dispatch:
+                with self.assertRaisesRegex(SystemExit, "terminated, invalid_handoff"):
+                    self.invoke(task, "--execution-mode", "restart")
+            dispatch.assert_not_called()
 
     def test_resume_result_is_bound_to_the_new_child_not_mutable_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
