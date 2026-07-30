@@ -6,9 +6,49 @@ RDO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export RDO_ROOT
 RDO_KEEP_SMOKE_REPOS="${RDO_KEEP_SMOKE_REPOS:-1}"
 RDO_SMOKE_REGISTRY="${RDO_SMOKE_REGISTRY:-$(mktemp -t rdo-smoke-repos.XXXXXX)}"
+RDO_SMOKE_TMUX_REGISTRY="${RDO_SMOKE_TMUX_REGISTRY:-$(mktemp -t rdo-smoke-tmux.XXXXXX)}"
 export RDO_KEEP_SMOKE_REPOS
 export RDO_SMOKE_REGISTRY
+export RDO_SMOKE_TMUX_REGISTRY
 export RDO_TEST_ALLOW_UNGOVERNED_COMMAND_OVERRIDE=1
+
+register_smoke_tmux_receipt() {
+  printf '%s\n' "$1" >> "${RDO_SMOKE_TMUX_REGISTRY}"
+}
+
+cleanup_smoke_tmux_sessions() {
+  [[ -f "${RDO_SMOKE_TMUX_REGISTRY}" ]] || return 0
+  local cleanup_code=0
+  while IFS= read -r receipt; do
+    [[ -n "${receipt}" ]] || continue
+    PYTHONPATH="${RDO_ROOT}/scripts" python3 - "${receipt}" <<'PY' || cleanup_code=$?
+import json
+import sys
+from pathlib import Path
+
+from tmux_lifecycle import kill_live_tmux_session
+
+receipt = Path(sys.argv[1])
+payload = json.loads(receipt.read_text(encoding="utf-8"))
+result = kill_live_tmux_session(
+    {
+        "session_id": payload["session_id"],
+        "created_at_epoch": payload["created_at_epoch"],
+        "session_name": payload["session_name"],
+    }
+)
+if result["status"] not in {"killed", "already_absent"}:
+    print(
+        f"smoke tmux teardown failed for {receipt}: "
+        f"{result['status']}: {result.get('reason')}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+  done < "${RDO_SMOKE_TMUX_REGISTRY}"
+  rm -f "${RDO_SMOKE_TMUX_REGISTRY}"
+  return "${cleanup_code}"
+}
 
 cleanup_smoke_repos() {
   if [[ "${RDO_KEEP_SMOKE_REPOS}" != "0" || ! -f "${RDO_SMOKE_REGISTRY}" ]]; then
@@ -22,7 +62,22 @@ cleanup_smoke_repos() {
   rm -f "${RDO_SMOKE_REGISTRY}"
 }
 
-trap 'code=$?; cleanup_smoke_repos; exit "${code}"' EXIT
+cleanup_smoke_resources() {
+  local code="$1"
+  local cleanup_code=0
+  local repo_code=0
+  cleanup_smoke_tmux_sessions || cleanup_code=$?
+  cleanup_smoke_repos || repo_code=$?
+  if [[ "${cleanup_code}" -eq 0 && "${repo_code}" -ne 0 ]]; then
+    cleanup_code="${repo_code}"
+  fi
+  if [[ "${code}" -eq 0 && "${cleanup_code}" -ne 0 ]]; then
+    code="${cleanup_code}"
+  fi
+  exit "${code}"
+}
+
+trap 'cleanup_smoke_resources "$?"' EXIT
 
 setup_smoke_repo() {
   local base="${1:-}"

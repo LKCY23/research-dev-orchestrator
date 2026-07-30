@@ -57,6 +57,11 @@ from task_contract import (
 )
 from task_budget import TaskBudgetError, validate_assessment
 from supervisor import terminate_processes, validate_attempt_deadline_payload
+from tmux_lifecycle import (
+    TMUX_CLEANUP_FAILURE_STATUSES,
+    TMUX_CLEANUP_POLICIES,
+    TMUX_CLEANUP_STATUSES,
+)
 from validation import (
     HandoffValidationResult,
     parse_exit_code,
@@ -716,6 +721,90 @@ def cmd_record_session(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record_tmux_cleanup(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(args.payload_json)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"tmux cleanup payload is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("tmux cleanup payload must be an object")
+    policy = payload.get("policy")
+    cleanup_status = payload.get("status")
+    reason = payload.get("reason")
+    if policy not in TMUX_CLEANUP_POLICIES:
+        raise SystemExit(f"invalid tmux cleanup policy: {policy!r}")
+    if cleanup_status not in TMUX_CLEANUP_STATUSES:
+        raise SystemExit(f"invalid tmux cleanup status: {cleanup_status!r}")
+    if reason is not None and not isinstance(reason, str):
+        raise SystemExit("tmux cleanup reason must be a string or null")
+    if cleanup_status == "retained_by_policy" and policy != "retain":
+        raise SystemExit("retained_by_policy requires policy=retain")
+    if policy == "retain" and cleanup_status in {"killed", "kill_failed"}:
+        raise SystemExit(f"policy=retain cannot record status={cleanup_status}")
+
+    attempt_path = Path(args.attempt_path)
+    attempt = load_json(attempt_path)
+    if not isinstance(attempt, dict):
+        raise SystemExit("ATTEMPT.json must be an object")
+    runtime = attempt.get("runtime")
+    if not isinstance(runtime, dict) or runtime.get("backend") != "tmux":
+        raise SystemExit("tmux cleanup can only be recorded for a tmux attempt")
+    runtime["tmux_cleanup"] = {
+        "policy": policy,
+        "status": cleanup_status,
+        "reason": reason,
+        "recorded_at": utc_now(),
+    }
+    write_attempt_state(attempt_path, attempt)
+    return 0
+
+
+def _tmux_cleanup_failure(attempt: Mapping[str, Any]) -> dict[str, Any] | None:
+    runtime = attempt.get("runtime")
+    if not isinstance(runtime, Mapping) or runtime.get("backend") != "tmux":
+        return None
+    cleanup = runtime.get("tmux_cleanup")
+    if not isinstance(cleanup, Mapping):
+        return {
+            "kind": "tmux_session",
+            "terminated": False,
+            "cleanup_verified": False,
+            "surviving_pids": [],
+            "reason": "tmux cleanup result is missing",
+        }
+    policy = cleanup.get("policy")
+    cleanup_status = cleanup.get("status")
+    valid = (
+        policy in TMUX_CLEANUP_POLICIES
+        and cleanup_status in TMUX_CLEANUP_STATUSES
+        and not (
+            cleanup_status == "retained_by_policy"
+            and policy != "retain"
+        )
+        and not (
+            policy == "retain"
+            and cleanup_status in {"killed", "kill_failed"}
+        )
+    )
+    if valid and cleanup_status not in TMUX_CLEANUP_FAILURE_STATUSES:
+        return None
+    reason = cleanup.get("reason")
+    if not isinstance(reason, str) or not reason:
+        reason = (
+            f"invalid tmux cleanup record policy={policy!r} status={cleanup_status!r}"
+            if not valid
+            else str(cleanup_status)
+        )
+    return {
+        "kind": "tmux_session",
+        "terminated": False,
+        "cleanup_verified": False,
+        "surviving_pids": [],
+        "reason": reason,
+        "status": cleanup_status,
+    }
+
+
 def cmd_record_resume_fallback(args: argparse.Namespace) -> int:
     failure = _optional_json(args.failure_path) or {}
     attempt_path = Path(args.attempt_path)
@@ -739,6 +828,7 @@ def cmd_record_resume_fallback(args: argparse.Namespace) -> int:
         runtime["requested_command"] = runtime.get("command")
         runtime["command"] = args.command
         runtime["supervisor_command"] = args.supervisor_command
+        runtime.pop("tmux_cleanup", None)
     write_attempt_state(attempt_path, attempt)
 
     status_path = Path(args.status_path)
@@ -2815,6 +2905,9 @@ def _cmd_validate_handoff_locked(args: argparse.Namespace) -> int:
                 or "process cleanup could not be verified"
             ),
         }
+    tmux_cleanup_failure = _tmux_cleanup_failure(initial_attempt)
+    if cleanup_failure is None and tmux_cleanup_failure is not None:
+        cleanup_failure = tmux_cleanup_failure
     if cleanup_failure is not None:
         result = HandoffValidationResult(
             valid=False,
@@ -2825,7 +2918,11 @@ def _cmd_validate_handoff_locked(args: argparse.Namespace) -> int:
                 (
                     f"supervisor left surviving worker descendants: {surviving_pids}"
                     if surviving_pids
-                    else "supervisor could not verify complete worker process cleanup"
+                    else (
+                        "tmux session cleanup could not be verified"
+                        if cleanup_failure.get("kind") == "tmux_session"
+                        else "supervisor could not verify complete worker process cleanup"
+                    )
                 ),
             ],
             request=result.request,
@@ -3012,6 +3109,14 @@ def _cmd_validate_handoff_locked(args: argparse.Namespace) -> int:
                         f"{cleanup_failure['surviving_pids']}; the dispatch lock "
                         "must be retained for coordinator recovery."
                     )
+                elif cleanup_failure.get("kind") == "tmux_session":
+                    summary = "Tmux session cleanup could not be verified"
+                    blocker_type = "environment"
+                    blocking_reason = (
+                        "Dispatcher could not prove the receipt-bound tmux session "
+                        f"was safely handled ({cleanup_failure['reason']}); the "
+                        "dispatch lock must be retained for coordinator recovery."
+                    )
                 else:
                     summary = "Worker process cleanup could not be verified"
                     blocker_type = "environment"
@@ -3143,6 +3248,9 @@ def _cmd_reconcile_dispatch_exit_locked(args: argparse.Namespace) -> int:
         has_survivors = isinstance(surviving_pids, list) and bool(surviving_pids)
         if cleanup_result.get("terminated") is not True or has_survivors:
             cleanup_failure = dict(cleanup_result)
+    tmux_cleanup_failure = _tmux_cleanup_failure(attempt)
+    if cleanup_failure is None and tmux_cleanup_failure is not None:
+        cleanup_failure = tmux_cleanup_failure
 
     if (
         cleanup_failure is None
@@ -3258,10 +3366,14 @@ def _cmd_reconcile_dispatch_exit_locked(args: argparse.Namespace) -> int:
             )
         else:
             blocker_type = "environment"
-            summary = "Worker process cleanup could not be verified"
+            summary = (
+                "Tmux session cleanup could not be verified"
+                if cleanup_failure.get("kind") == "tmux_session"
+                else "Worker process cleanup could not be verified"
+            )
             reason = str(cleanup_failure.get("reason") or "unknown cleanup failure")
             blocking_reason = (
-                f"Dispatcher cleanup was not verifiable ({reason}); "
+                f"Dispatcher runtime cleanup was not verifiable ({reason}); "
                 "the dispatch lock was retained for coordinator recovery."
             )
     apply_dispatch_terminal_transition(
@@ -3559,6 +3671,11 @@ def build_parser() -> argparse.ArgumentParser:
     record_session.add_argument("--attempt-path", required=True)
     record_session.add_argument("--session-path", required=True)
     record_session.set_defaults(func=cmd_record_session)
+
+    tmux_cleanup = sub.add_parser("record-tmux-cleanup")
+    tmux_cleanup.add_argument("--attempt-path", required=True)
+    tmux_cleanup.add_argument("--payload-json", required=True)
+    tmux_cleanup.set_defaults(func=cmd_record_tmux_cleanup)
 
     fallback = sub.add_parser("record-resume-fallback")
     fallback.add_argument("--status-path", required=True)

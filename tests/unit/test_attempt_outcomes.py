@@ -346,6 +346,30 @@ class AttemptOutcomeTests(unittest.TestCase):
             self.assertEqual("irrecoverable", task_status["blocker_type"])
             self.assertIn("dispatch lock was retained", task_status["blocking_reason"])
 
+    def test_tmux_cleanup_failure_blocks_dispatch_reconciliation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task, attempt, status = self.make_active(root)
+            metadata = json.loads((attempt / "ATTEMPT.json").read_text())
+            metadata["runtime"] = {
+                "backend": "tmux",
+                "tmux_cleanup": {
+                    "policy": "cleanup_on_exit",
+                    "status": "identity_mismatch",
+                    "reason": "live identity differs from receipt",
+                },
+            }
+            self.write_json(attempt / "ATTEMPT.json", metadata)
+            self.write_json(attempt / "runtime" / "DISPATCH_ATTEMPT.json", metadata)
+
+            self.assertEqual(3, self.reconcile(root, task, attempt, status))
+            recorded = json.loads((attempt / "ATTEMPT.json").read_text())
+            task_status = json.loads(status.read_text())
+            self.assertEqual("tmux_session", recorded["cleanup_failure"]["kind"])
+            self.assertEqual("blocked", task_status["state"])
+            self.assertEqual("environment", task_status["blocker_type"])
+            self.assertIn("tmux", task_status["summary"].lower())
+
     def test_legacy_template_does_not_turn_execution_failure_into_invalid_handoff(self):
         with tempfile.TemporaryDirectory() as temporary:
             task = Path(temporary) / "tasks" / "T001"

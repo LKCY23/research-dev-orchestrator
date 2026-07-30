@@ -102,7 +102,8 @@ RDO_TMUX_SESSION_PREFIX
 RDO_TMUX_KEEP_SESSION
   false values: 0, false, no, off.
   true values: 1, true, yes, on.
-  When false, dispatch may kill/cleanup the tmux session after worker completion.
+  When false, dispatch must safely clean the receipt-bound tmux session and
+  verify its absence before publishing a successful attempt.
   When true, runner keeps the tmux session open after worker completion for human review.
 
 RDO_TMUX_WAIT_TIMEOUT_SECONDS
@@ -193,12 +194,18 @@ For `tmux`:
     "command": "claude",
     "cwd": "/path/to/worktree",
     "tmux_session": "rdo-20260704T1200-T001-A001",
-    "attach_command": "tmux attach -t rdo-20260704T1200-T001-A001"
+    "attach_command": "tmux attach -t rdo-20260704T1200-T001-A001",
+    "tmux_cleanup": {
+      "policy": "cleanup_on_exit",
+      "status": "already_absent",
+      "reason": null,
+      "recorded_at": "2026-07-30T12:00:00Z"
+    }
   }
 }
 ```
 
-`runtime.backend`, `runtime.runtime_backend`, `runtime.io_mode`, `runtime.cli`, `runtime.command`, and `runtime.cwd` are required. `runtime.model` and `runtime.reasoning_effort` bind the resolved model request (or are null when backend defaults were retained). `runtime.tmux_session` and `runtime.attach_command` are required only when `backend = tmux`.
+`runtime.backend`, `runtime.runtime_backend`, `runtime.io_mode`, `runtime.cli`, `runtime.command`, and `runtime.cwd` are required. `runtime.model` and `runtime.reasoning_effort` bind the resolved model request (or are null when backend defaults were retained). `runtime.tmux_session`, `runtime.attach_command`, and a terminal `runtime.tmux_cleanup` result are required only when `backend = tmux`.
 
 Generated tmux session names must be sanitized to avoid tmux target separators such as `:`.
 

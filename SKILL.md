@@ -273,6 +273,12 @@ machine acknowledgement.
 
 `tmux` backend is attachable execution, not detached orchestration. Dispatch still waits for the attempt-local `exit_code` file and validates handoff. If tmux wait times out before `exit_code` appears, dispatch exits `5`, keeps `.dispatch-lock`, leaves `ATTEMPT.state=running`, writes diagnostics, and requires Lock Recovery Review.
 
+Every tmux dispatch records an exact session identity receipt and a terminal
+`ATTEMPT.runtime.tmux_cleanup` policy/status. Default cleanup must verify the
+receipt-bound session is absent; explicit retention records
+`retained_by_policy`. Identity mismatch or unverifiable cleanup blocks
+publication and retains the dispatch lock.
+
 `collect_status.py` is read-only by default. It must not modify `STATUS.json`, delete locks, change FSM state, or repair violations. `--write-summary` may update only `SUMMARY.md`; `--write-diagnostics` may write only diagnostics files.
 
 For Artifact Protocol v2, consume `status_projection` (or `projection` from

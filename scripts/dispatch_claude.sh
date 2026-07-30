@@ -21,6 +21,7 @@ BACKEND_PREFLIGHT="${SCRIPT_DIR}/backend_preflight.py"
 CLEAN_RESTART_CLI="${SCRIPT_DIR}/clean_restart.py"
 RESUME_CONTEXT_CLI="${SCRIPT_DIR}/resume_context.py"
 TASK_BUDGET_CLI="${SCRIPT_DIR}/task_budget_cli.py"
+TMUX_LIFECYCLE_CLI="${SCRIPT_DIR}/tmux_lifecycle.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -35,6 +36,9 @@ KEEP_DISPATCH_LOCK_ON_EXIT=0
 PROCESS_CLEANUP_FAILED=0
 SUPERVISOR_CLEANUP_FAILED=0
 TMUX_WORKER_LAUNCHED=0
+TMUX_IDENTITY_READY=0
+TMUX_CLEANUP_RECORDED=0
+TMUX_SESSION_CLEANUP_FAILED=0
 
 sanitize_name() {
   LC_ALL=C tr -c 'A-Za-z0-9_.-' '-' | sed 's/^-*//; s/-*$//'
@@ -131,8 +135,60 @@ os.replace(temporary, path)
 PY
 }
 
+cleanup_tmux_session() {
+  local policy="$1"
+  local payload=""
+  local cleanup_code=0
+  local cleanup_status=""
+  [[ "${TMUX_IDENTITY_READY}" == "1" ]] || return 0
+  set +e
+  payload="$(python3 "${TMUX_LIFECYCLE_CLI}" cleanup \
+    --attempt-dir "${ATTEMPT_DIR}" \
+    --run-id "${RUN_ID}" \
+    --task-id "${TASK_ID}" \
+    --attempt-id "${ATTEMPT_ID}" \
+    --session-name "${TMUX_SESSION}" \
+    --policy "${policy}")"
+  cleanup_code=$?
+  set -e
+  if ! record_tmux_cleanup_payload "${payload}"; then
+    TMUX_SESSION_CLEANUP_FAILED=1
+    return 1
+  fi
+  cleanup_status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status", ""))' "${payload}")"
+  if [[ "${cleanup_status}" == "killed" || "${cleanup_status}" == "already_absent" ]]; then
+    TMUX_IDENTITY_READY=0
+  fi
+  if [[ "${cleanup_code}" -ne 0 ]]; then
+    TMUX_SESSION_CLEANUP_FAILED=1
+    return 1
+  fi
+  TMUX_SESSION_CLEANUP_FAILED=0
+  return 0
+}
+
+record_tmux_cleanup_payload() {
+  local payload="$1"
+  local record_code=0
+  [[ -n "${payload}" ]] || return 2
+  set +e
+  python3 "${PROTOCOL_CLI}" record-tmux-cleanup \
+    --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
+    --payload-json "${payload}"
+  record_code=$?
+  set -e
+  if [[ "${record_code}" -ne 0 ]]; then
+    return "${record_code}"
+  fi
+  TMUX_CLEANUP_RECORDED=1
+  return 0
+}
+
 run_tmux_worker_once() {
   TMUX_WORKER_LAUNCHED=0
+  TMUX_IDENTITY_READY=0
+  TMUX_CLEANUP_RECORDED=0
+  TMUX_SESSION_CLEANUP_FAILED=0
   EXIT_CODE_FILE="${ATTEMPT_DIR}/exit_code"
   RUNNER_PATH="${ATTEMPT_DIR}/run-worker.sh"
   DONE_SIGNAL="rdo-done-${TMUX_SESSION}"
@@ -159,11 +215,10 @@ import sys
 print("exec " + shlex.quote(sys.argv[1]))
 PY
 )"
-  # Create the tmux identity before starting the worker. This prevents a new
-  # protocol attempt from running without a durable receipt for later control.
-  tmux new-session -d -s "${TMUX_SESSION}" "sleep 2147483647"
+  # Create the parked session and its identity receipt as one lifecycle
+  # transaction before starting the worker.
   set +e
-  TMUX_RECEIPT_ERROR="$(python3 "${SCRIPT_DIR}/tmux_lifecycle.py" record \
+  TMUX_RECEIPT_ERROR="$(python3 "${TMUX_LIFECYCLE_CLI}" create \
     --output "${ATTEMPT_DIR}/runtime/TMUX_SESSION.json" \
     --run-id "${RUN_ID}" \
     --task-id "${TASK_ID}" \
@@ -172,18 +227,41 @@ PY
   TMUX_RECEIPT_CODE=$?
   set -e
   if [[ "${TMUX_RECEIPT_CODE}" -ne 0 ]]; then
-    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+    TMUX_STARTUP_CLEANUP_STATUS="already_absent"
+    if [[ "${TMUX_RECEIPT_CODE}" -eq 3 ]]; then
+      TMUX_STARTUP_CLEANUP_STATUS="verification_failed"
+      TMUX_SESSION_CLEANUP_FAILED=1
+    fi
+    TMUX_STARTUP_CLEANUP_PAYLOAD="$(python3 - \
+      "${TMUX_STARTUP_CLEANUP_STATUS}" \
+      "${TMUX_RECEIPT_ERROR:-tmux session creation failed}" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "policy": "cleanup_on_exit",
+    "status": sys.argv[1],
+    "reason": sys.argv[2],
+}))
+PY
+)"
+    set +e
+    record_tmux_cleanup_payload "${TMUX_STARTUP_CLEANUP_PAYLOAD}"
+    TMUX_STARTUP_RECORD_CODE=$?
+    set -e
+    if [[ "${TMUX_STARTUP_RECORD_CODE}" -ne 0 ]]; then
+      TMUX_SESSION_CLEANUP_FAILED=1
+    fi
     set +e
     write_tmux_identity_startup_failure "${TMUX_RECEIPT_ERROR:-tmux identity receipt could not be persisted}"
     set -e
     return 125
   fi
+  TMUX_IDENTITY_READY=1
   TMUX_SESSION_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["session_id"])' "${ATTEMPT_DIR}/runtime/TMUX_SESSION.json")"
   if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
     tmux pipe-pane -o -t "${TMUX_SESSION_ID}" "cat >> '${TRANSCRIPT_PATH}'" || true
   fi
   if ! tmux respawn-pane -k -t "${TMUX_SESSION_ID}" "${TMUX_COMMAND}"; then
-    tmux kill-session -t "${TMUX_SESSION_ID}" 2>/dev/null || true
     set +e
     write_tmux_identity_startup_failure "tmux could not start the worker in the receipt-bound session"
     set -e
@@ -195,7 +273,7 @@ PY
     STARTUP_PROBE_MARKER="${ATTEMPT_DIR}/runtime/human-startup-probed"
     if [[ "${RDO_IO_MODE}" == "human" && ! -f "${STARTUP_PROBE_MARKER}" ]]; then
       PANE_SNAPSHOT="${ATTEMPT_DIR}/runtime/startup-pane.txt"
-      tmux capture-pane -p -t "${TMUX_SESSION}" > "${PANE_SNAPSHOT}" 2>/dev/null || true
+      tmux capture-pane -p -t "${TMUX_SESSION_ID}" > "${PANE_SNAPSHOT}" 2>/dev/null || true
       set +e
       python3 "${SCRIPT_DIR}/human_startup_probe.py" \
         --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
@@ -218,9 +296,11 @@ PY
           PROCESS_CLEANUP_FAILED=1
           exit 6
         fi
-        tmux send-keys -t "${TMUX_SESSION}" C-c 2>/dev/null || true
+        tmux send-keys -t "${TMUX_SESSION_ID}" C-c 2>/dev/null || true
         sleep 0.2
-        tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+        if ! cleanup_tmux_session "cleanup_on_exit"; then
+          exit 6
+        fi
         if [[ ! -f "${EXIT_CODE_FILE}" ]]; then
           printf '125\n' > "${EXIT_CODE_FILE}.tmp"
           mv "${EXIT_CODE_FILE}.tmp" "${EXIT_CODE_FILE}"
@@ -262,9 +342,6 @@ PY
     set -e
   fi
   EXIT_CODE_RAW="$(cat "${EXIT_CODE_FILE}" 2>/dev/null || true)"
-  if [[ "${RDO_TMUX_KEEP_SESSION}" != "1" ]]; then
-    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
-  fi
   if [[ "${EXIT_CODE_RAW}" =~ ^[0-9]+$ ]]; then
     EXIT_CODE="${EXIT_CODE_RAW}"
   else
@@ -300,7 +377,10 @@ on_exit() {
   local cleanup_code=0
   if [[ "${code}" -eq 0 && \
         "${PROCESS_CLEANUP_FAILED}" != "1" && \
-        "${SUPERVISOR_CLEANUP_FAILED}" != "1" ]]; then
+        "${SUPERVISOR_CLEANUP_FAILED}" != "1" && \
+        "${TMUX_SESSION_CLEANUP_FAILED}" != "1" && \
+        ( "${RDO_RUNTIME_BACKEND:-}" != "tmux" || \
+          "${TMUX_CLEANUP_RECORDED}" == "1" ) ]]; then
     release_dispatch_lock
     return 0
   fi
@@ -318,11 +398,16 @@ on_exit() {
       PROCESS_CLEANUP_FAILED=0
     fi
   fi
-  if [[ "${RDO_RUNTIME_BACKEND:-}" == "tmux" && -n "${TMUX_SESSION:-}" ]] && \
-     tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
-    tmux send-keys -t "${TMUX_SESSION}" C-c 2>/dev/null || true
-    sleep 0.2
-    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+  if [[ "${RDO_RUNTIME_BACKEND:-}" == "tmux" && \
+        "${TMUX_IDENTITY_READY}" == "1" && \
+        "${TMUX_SESSION_CLEANUP_FAILED}" != "1" ]]; then
+    set +e
+    cleanup_tmux_session "cleanup_on_exit"
+    cleanup_code=$?
+    set -e
+    if [[ "${cleanup_code}" -ne 0 ]]; then
+      TMUX_SESSION_CLEANUP_FAILED=1
+    fi
   fi
   if [[ -n "${ATTEMPT_ID:-}" && -n "${ATTEMPT_DIR:-}" && \
         -d "${ATTEMPT_DIR}" && -f "${STATUS_PATH}" ]]; then
@@ -344,7 +429,8 @@ on_exit() {
     set -e
     if [[ "${reconcile_code}" -ne 0 || \
           "${PROCESS_CLEANUP_FAILED}" == "1" || \
-          "${SUPERVISOR_CLEANUP_FAILED}" == "1" ]]; then
+          "${SUPERVISOR_CLEANUP_FAILED}" == "1" || \
+          "${TMUX_SESSION_CLEANUP_FAILED}" == "1" ]]; then
       KEEP_DISPATCH_LOCK_ON_EXIT=1
     else
       KEEP_DISPATCH_LOCK_ON_EXIT=0
@@ -1393,7 +1479,10 @@ PY
           "${ATTEMPT_DIR}/runtime/RESUME_SUPERVISOR_FAILURE.json"
         [[ ! -f "${TRANSCRIPT_PATH}" ]] || cp "${TRANSCRIPT_PATH}" \
           "${ATTEMPT_DIR}/runtime/resume-failure-transcript.log"
-        tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+        if ! cleanup_tmux_session "cleanup_on_exit"; then
+          echo "receipt-bound tmux cleanup failed before resume fallback" >&2
+          exit 7
+        fi
         FALLBACK_SESSION_ID=""
         if [[ "${RDO_WORKER_BACKEND}" == "claude-code" ]]; then
           FALLBACK_SESSION_ID="${REQUESTED_SESSION_ID}"
@@ -1467,6 +1556,15 @@ PY
         RDO_WORKER_COMMAND="${FALLBACK_WORKER_COMMAND}"
         run_tmux_worker_once
       fi
+    fi
+    if [[ "${RDO_TMUX_KEEP_SESSION}" == "1" ]]; then
+      TMUX_CLEANUP_POLICY="retain"
+    else
+      TMUX_CLEANUP_POLICY="cleanup_on_exit"
+    fi
+    if ! cleanup_tmux_session "${TMUX_CLEANUP_POLICY}"; then
+      echo "receipt-bound tmux cleanup failed" >&2
+      exit 7
     fi
   fi
   {

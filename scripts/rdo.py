@@ -4131,7 +4131,11 @@ def tmux_prune(args: argparse.Namespace) -> int:
         try:
             outcome = kill_live_tmux_session(row)
         except TmuxLifecycleError as exc:
-            outcome = {"status": "failed", "reason": str(exc)}
+            outcome = {
+                "policy": "cleanup_on_exit",
+                "status": "verification_failed",
+                "reason": str(exc),
+            }
         results.append(
             {
                 "run_id": row["run_id"],
@@ -4143,7 +4147,10 @@ def tmux_prune(args: argparse.Namespace) -> int:
             }
         )
     failures = [
-        item for item in results if item["status"] in {"failed", "identity_changed"}
+        item
+        for item in results
+        if item["status"]
+        in {"identity_mismatch", "kill_failed", "verification_failed"}
     ]
     payload = {
         "schema_version": 1,
