@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Create a deterministic content fingerprint for tracked and untracked worktree files."""
+"""Create a deterministic content fingerprint for a Git worktree.
+
+Tracked Gitlinks are fingerprinted from their index object IDs.  A Gitlink may
+be materialized as a directory or left uninitialized, so treating every
+``git ls-files`` path as a regular filesystem file is both incorrect and
+non-deterministic.
+"""
 
 from __future__ import annotations
 
@@ -17,12 +23,58 @@ def git_paths(root: Path, *args: str) -> list[str]:
     return sorted(item.decode("utf-8", errors="surrogateescape") for item in output.split(b"\0") if item)
 
 
+def git_index_entries(root: Path) -> dict[str, tuple[str, str]]:
+    """Return stage-zero index entries as ``path -> (mode, object_id)``."""
+
+    output = subprocess.check_output(
+        ["git", "-C", str(root), "ls-files", "--stage", "-z"]
+    )
+    entries: dict[str, tuple[str, str]] = {}
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        metadata, encoded_path = record.split(b"\t", 1)
+        encoded_mode, encoded_object_id, encoded_stage = metadata.split(b" ", 2)
+        if encoded_stage != b"0":
+            continue
+        relative = encoded_path.decode("utf-8", errors="surrogateescape")
+        entries[relative] = (
+            encoded_mode.decode("ascii"),
+            encoded_object_id.decode("ascii"),
+        )
+    return entries
+
+
 def fingerprint(root: Path) -> dict[str, object]:
-    paths = sorted(set(git_paths(root, "ls-files") + git_paths(root, "ls-files", "--others", "--exclude-standard")))
+    index_entries = git_index_entries(root)
+    paths = sorted(
+        set(
+            list(index_entries)
+            + git_paths(root, "ls-files", "--others", "--exclude-standard")
+        )
+    )
     digest = hashlib.sha256()
     entries: list[dict[str, object]] = []
     for relative in paths:
         path = root / relative
+        index_mode, index_object_id = index_entries.get(relative, (None, None))
+        if index_mode == "160000":
+            content = b"gitlink\0" + index_object_id.encode("ascii")
+            file_digest = hashlib.sha256(content).hexdigest()
+            encoded_path = relative.encode("utf-8", errors="surrogateescape")
+            digest.update(len(encoded_path).to_bytes(8, "big"))
+            digest.update(encoded_path)
+            digest.update(bytes.fromhex(file_digest))
+            entries.append(
+                {
+                    "path": relative,
+                    "kind": "gitlink",
+                    "mode": index_mode,
+                    "git_oid": index_object_id,
+                    "sha256": file_digest,
+                }
+            )
+            continue
         kind = "symlink" if path.is_symlink() else "file"
         try:
             raw_mode = path.lstat().st_mode
