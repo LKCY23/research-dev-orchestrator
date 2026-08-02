@@ -209,6 +209,11 @@ Backend governance 是长期且由各 adapter 独立定义的。Strategy schema 
               result.md
 ```
 
+`init_run.py` 会把根目录规则写入目标仓库的 `.git/info/exclude`，确保
+`.agent-collab/` 和 `.agent-worktrees/` 只保留在本地。该操作可幂等重复，
+不会让项目 worktree 变 dirty。如果任一目录已经被 Git 追踪，初始化会直接
+失败，因为 ignore 规则无法把 tracked 文件变回本地文件。
+
 关键文件：
 
 - `STATUS.json`：task progress 和 FSM state。
@@ -407,6 +412,9 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/init_run.py" \
   --objective "Build a reproducible RAG benchmark pipeline" \
   --target-branch main
 ```
+
+初始化会先验证 RDO 运行目录未被追踪且已在本地忽略。团队也可以把相同规则
+提交到公共 `.gitignore`，但本地运行 RDO 不依赖这一步。
 
 创建 task：
 

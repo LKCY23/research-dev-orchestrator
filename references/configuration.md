@@ -34,6 +34,11 @@ CLI flag or coordinator intent argument
 ## rdo.toml
 
 `init_run.py` creates `.agent-collab/rdo.toml` if it does not exist.
+Before scaffolding, it also adds `/.agent-collab/` and
+`/.agent-worktrees/` to the target repository's `.git/info/exclude` and
+verifies both rules with Git. This local exclude is independent of project
+configuration and is not committed. Initialization refuses directories that
+are already tracked; remove them from the index explicitly before retrying.
 
 ```toml
 [worker]

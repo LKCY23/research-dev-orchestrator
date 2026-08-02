@@ -27,6 +27,10 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
   that checked candidate; checks, commits, and source changes are forbidden
   afterward.
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
+- `.agent-collab/` and `.agent-worktrees/` are local runtime state, not project
+  source. `init_run.py` records both in the target repository's
+  `.git/info/exclude`, verifies that Git ignores them, and refuses to initialize
+  while either path is already tracked.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.
 - `SUMMARY.md`, `dashboard.html`, and `diagnostics/` are derived monitor artifacts, not sources of truth.

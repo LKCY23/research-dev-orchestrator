@@ -226,6 +226,12 @@ The target repository gets a local `.agent-collab/` directory:
                 worktree-after.json
 ```
 
+`init_run.py` keeps `.agent-collab/` and `.agent-worktrees/` local by adding
+root-anchored rules to the target repository's `.git/info/exclude`. The update
+is idempotent and does not dirty the project worktree. Initialization fails if
+either directory is already tracked, because ignore rules cannot make tracked
+files local.
+
 Key files:
 
 - `STATUS.json`: task progress and finite-state-machine state.
@@ -456,6 +462,10 @@ python "$RESEARCH_DEV_ORCHESTRATOR_HOME/scripts/init_run.py" \
   --objective "Build a reproducible RAG benchmark pipeline" \
   --target-branch main
 ```
+
+Initialization first verifies that RDO runtime directories are untracked and
+locally ignored. Projects may also commit the same rules to `.gitignore` as a
+team-wide convention, but that is not required for local RDO operation.
 
 Create a task:
 
