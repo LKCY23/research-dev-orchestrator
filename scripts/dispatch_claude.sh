@@ -33,6 +33,7 @@ DIAGNOSTICS_DIR="${RUN_DIR}/diagnostics"
 STATUS_UPDATED=0
 DISPATCH_LOCK_ACQUIRED=0
 KEEP_DISPATCH_LOCK_ON_EXIT=0
+PROCESS_CLEANUP_REQUIRED=0
 PROCESS_CLEANUP_FAILED=0
 SUPERVISOR_CLEANUP_FAILED=0
 TMUX_WORKER_LAUNCHED=0
@@ -79,6 +80,48 @@ write_tmux_timeout_diagnostics() {
     --timeout-seconds "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" \
     --dispatch-lock-dir "${DISPATCH_LOCK_DIR}" \
     --attempt-dir "${ATTEMPT_DIR:-}"
+}
+
+cancel_tmux_wait() {
+  local reason="$1"
+  # A late pane EXIT trap cannot discharge the process-cleanup obligation.
+  PROCESS_CLEANUP_REQUIRED=1
+  python3 - "${ATTEMPT_DIR}/runtime/DISPATCH_TIMEOUT.json" "${reason}" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = dict(
+    reason=sys.argv[2],
+    exit_code=124,
+    timed_out=True,
+    timeout_source="dispatcher_tmux_wait",
+)
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+  write_tmux_timeout_diagnostics
+  exit 5
+}
+
+supervisor_result_readable() {
+  python3 - "${SUPERVISOR_RESULT}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+try:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("missing or unsafe supervisor result")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(payload, dict) else 1)
+PY
 }
 
 append_event() {
@@ -310,29 +353,14 @@ PY
     if [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" != "0" ]]; then
       NOW="$(date +%s)"
       if (( NOW - WAIT_START >= RDO_TMUX_WAIT_TIMEOUT_SECONDS )); then
-        python3 - "${ATTEMPT_DIR}/runtime/DISPATCH_TIMEOUT.json" <<'PY'
-import json
-import os
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-payload = dict(
-    reason="tmux_wait_timeout",
-    exit_code=124,
-    timed_out=True,
-    timeout_source="dispatcher_tmux_wait",
-)
-temporary = path.with_suffix(path.suffix + ".tmp")
-temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-os.replace(temporary, path)
-PY
-        write_tmux_timeout_diagnostics
-        exit 5
+        cancel_tmux_wait "tmux_wait_timeout"
       fi
     fi
     sleep 1
   done
+  if ! supervisor_result_readable && ! tmux has-session -t "${TMUX_SESSION_ID}" 2>/dev/null; then
+    cancel_tmux_wait "tmux_session_disappeared"
+  fi
   if [[ "${RDO_IO_MODE}" == "human" && -f "${TRANSCRIPT_PATH}" ]]; then
     set +e
     python3 "${SCRIPT_DIR}/human_startup_probe.py" \
@@ -376,6 +404,7 @@ on_exit() {
   local reconcile_code=0
   local cleanup_code=0
   if [[ "${code}" -eq 0 && \
+        "${PROCESS_CLEANUP_REQUIRED}" != "1" && \
         "${PROCESS_CLEANUP_FAILED}" != "1" && \
         "${SUPERVISOR_CLEANUP_FAILED}" != "1" && \
         "${TMUX_SESSION_CLEANUP_FAILED}" != "1" && \
@@ -384,7 +413,8 @@ on_exit() {
     release_dispatch_lock
     return 0
   fi
-  if [[ "${PROCESS_CLEANUP_FAILED}" == "1" || \
+  if [[ "${PROCESS_CLEANUP_REQUIRED}" == "1" || \
+        "${PROCESS_CLEANUP_FAILED}" == "1" || \
         ( "${RDO_RUNTIME_BACKEND:-}" == "tmux" && \
           "${TMUX_WORKER_LAUNCHED}" == "1" && \
           ( -z "${EXIT_CODE_FILE:-}" || ! -f "${EXIT_CODE_FILE}" ) ) ]]; then
@@ -395,6 +425,7 @@ on_exit() {
     if [[ "${cleanup_code}" -ne 0 ]]; then
       PROCESS_CLEANUP_FAILED=1
     else
+      PROCESS_CLEANUP_REQUIRED=0
       PROCESS_CLEANUP_FAILED=0
     fi
   fi

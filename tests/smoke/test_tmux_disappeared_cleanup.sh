@@ -36,9 +36,15 @@ RDO_WORKER_BACKEND=tmux RDO_IO_MODE=human RDO_TMUX_WAIT_TIMEOUT_SECONDS=1 CLAUDE
   "${RDO_ROOT}/scripts/dispatch_claude.sh" smoke-run T001-disappeared
 code="$?"
 set -e
-[[ "${code}" == "5" ]]
+[[ "${code}" == "5" ]] || {
+  printf 'expected timeout exit 5 after tmux disappeared, got %s\n' "${code}" >&2
+  exit 1
+}
 sleep 3
-test ! -e "${sentinel}"
+test ! -e "${sentinel}" || {
+  printf 'detached descendant survived cleanup and wrote %s\n' "${sentinel}" >&2
+  exit 1
+}
 
 python3 - <<'PY'
 import json

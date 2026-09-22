@@ -56,7 +56,11 @@ from task_contract import (
     write_task_inputs_immutable,
 )
 from task_budget import TaskBudgetError, validate_assessment
-from supervisor import terminate_processes, validate_attempt_deadline_payload
+from supervisor import (
+    terminate_current_supervision,
+    terminate_processes,
+    validate_attempt_deadline_payload,
+)
 from tmux_lifecycle import (
     TMUX_CLEANUP_FAILURE_STATUSES,
     TMUX_CLEANUP_POLICIES,
@@ -3434,40 +3438,49 @@ def cmd_terminate_attempt_processes(args: argparse.Namespace) -> int:
             )
         )
         return 2
-    pids = {
-        int(value)
-        for value in state.get("observed_pids", [])
-        if isinstance(value, int) and value > 1
-    }
-    pgids = {
-        int(value)
-        for value in state.get("observed_pgids", [])
-        if isinstance(value, int) and value > 1
-    }
-    root_pid = state.get("worker_pid")
     supervision_token = state.get("supervision_token")
-    cleanup_observation: dict[str, Any] = {"verified": True, "reason": None}
-    survivors = terminate_processes(
-        pgids,
-        pids,
-        root_pid=(
-            int(root_pid)
-            if isinstance(root_pid, int) and not isinstance(root_pid, bool)
-            else None
-        ),
-        supervision_token=(
-            supervision_token if isinstance(supervision_token, str) else None
-        ),
-        observed_pids=pids,
-        observed_pgids=pgids,
-        cleanup_observation=cleanup_observation,
+    if not isinstance(supervision_token, str) or not re.fullmatch(r"[0-9a-f]{32}", supervision_token):
+        print(json.dumps({
+            "terminated": False,
+            "cleanup_verified": False,
+            "reason": "supervision_token_missing_or_invalid",
+            "surviving_pids": [],
+        }))
+        return 2
+
+    result = terminate_current_supervision(
+        state.get("worker_pid"),
+        state.get("worker_pgid"),
+        state.get("worker_start_identity"),
+        supervision_token,
     )
+    if result.identity_verified:
+        pids = set(result.targeted_pids)
+        pgids = set(result.targeted_pgids)
+        survivors = result.surviving_pids
+        cleanup_verified = result.cleanup_verified
+        reason = result.cleanup_failure_reason
+    else:
+        # Historical PID/PGID numbers cannot identify a live process after root loss.
+        pids: set[int] = set()
+        pgids: set[int] = set()
+        cleanup_observation: dict[str, Any] = {"verified": True, "reason": None}
+        survivors = terminate_processes(
+            set(),
+            set(),
+            supervision_token=supervision_token,
+            observed_pids=pids,
+            observed_pgids=pgids,
+            cleanup_observation=cleanup_observation,
+        )
+        cleanup_verified = cleanup_observation["verified"]
+        reason = cleanup_observation["reason"]
     print(
         json.dumps(
             {
-                "terminated": bool(cleanup_observation["verified"] and not survivors),
-                "cleanup_verified": cleanup_observation["verified"],
-                "reason": cleanup_observation["reason"],
+                "terminated": bool(cleanup_verified and not survivors),
+                "cleanup_verified": cleanup_verified,
+                "reason": reason,
                 "observed_pids": sorted(pids),
                 "observed_pgids": sorted(pgids),
                 "surviving_pids": list(survivors),
@@ -3475,7 +3488,7 @@ def cmd_terminate_attempt_processes(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
-    return 0 if cleanup_observation["verified"] and not survivors else 2
+    return 0 if cleanup_verified and not survivors else 2
 
 
 def cmd_write_dispatch_diagnostics(args: argparse.Namespace) -> int:
