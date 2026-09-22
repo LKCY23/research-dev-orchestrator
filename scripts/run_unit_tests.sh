@@ -58,19 +58,21 @@ if rdo_test_run_logged \
   "${log_path}" \
   env PYTHONPATH="${unit_pythonpath}" \
   python3 -m unittest discover -s "${UNIT_DIR}" -p "${pattern}"; then
-  test_count="$(awk '/^Ran [0-9]+ tests? in / { count=$2 } END { print count }' "${log_path}")"
-  if [[ "${test_count:-0}" -eq 0 ]]; then
-    printf 'unit selector loaded no tests: %s\nfull log: %s\n' \
-      "${pattern}" "${log_path}" >&2
-    exit 2
-  fi
-  summary="$(awk '/^Ran [0-9]+ tests? in / { line=$0 } END { print line }' "${log_path}")"
-  if [[ -z "${summary}" ]]; then
-    summary="matched ${matched_count} files"
-  fi
-  printf 'PASS unit: %s (%ss); log: %s\n' \
-    "${summary}" "${RDO_TEST_LAST_ELAPSED}" "${log_path}"
+  status=0
 else
   status=$?
+fi
+
+test_count="$(awk '/^Ran [0-9]+ tests? in / { count=$2 } END { print count }' "${log_path}")"
+if [[ "${test_count}" == "0" || ( "${status}" -eq 0 && -z "${test_count}" ) ]]; then
+  printf 'unit selector loaded no tests: %s\nfull log: %s\n' \
+    "${pattern}" "${log_path}" >&2
+  exit 2
+fi
+if [[ "${status}" -ne 0 ]]; then
   exit "${status}"
 fi
+
+summary="$(awk '/^Ran [0-9]+ tests? in / { line=$0 } END { print line }' "${log_path}")"
+printf 'PASS unit: %s (%ss); log: %s\n' \
+  "${summary}" "${RDO_TEST_LAST_ELAPSED}" "${log_path}"

@@ -22,10 +22,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tmux
+      - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y tmux
+          sudo apt-get install -y tmux ripgrep
 
       - name: Show environment
         run: |
@@ -33,6 +33,7 @@ jobs:
           bash --version
           git --version
           tmux -V
+          rg --version
 
       - name: Python compile
         run: |

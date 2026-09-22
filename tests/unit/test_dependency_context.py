@@ -358,15 +358,16 @@ class DependencyContextTests(unittest.TestCase):
         self.assertNotIn("SHORT OUTCOME", result["content"])
         self.assertLessEqual(len(result["content"].encode()), result["max_bytes"])
 
-        search = json.loads(
-            self.broker(
-                "search",
-                "--source",
-                "dependency:T000",
-                "--query",
-                "cleanup_verified",
-            ).stdout
+        search_result = self.broker(
+            "search",
+            "--source",
+            "dependency:T000",
+            "--query",
+            "cleanup_verified",
+            check=False,
         )
+        self.assertEqual(0, search_result.returncode, search_result.stderr)
+        search = json.loads(search_result.stdout)
         self.assertIn("cleanup_verified", search["content"])
 
     def test_manifest_drift_is_rejected_before_retrieval(self) -> None:
