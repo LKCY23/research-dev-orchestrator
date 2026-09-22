@@ -97,6 +97,70 @@ setup_smoke_repo() {
   printf '%s\n' "${base}"
 }
 
+make_detached_child_worker() {
+  local worker="$1"
+  local sentinel="$2"
+  local release="$3"
+  local started="$4"
+  local drop_session="${5:-0}"
+  cat > "${worker}" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+prompt="\$(mktemp)"
+cat > "\${prompt}"
+ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
+rm -f "\${prompt}"
+python3 - "\${ATTEMPT_DIR}/runtime/supervisor.json" "${sentinel}" "${release}" "${started}" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+state = Path(sys.argv[1])
+deadline = time.monotonic() + 5
+while True:
+    try:
+        payload = json.loads(state.read_text())
+        ready = payload.get("supervision_token") == os.environ["RDO_SUPERVISION_TOKEN"]
+    except (OSError, ValueError):
+        ready = False
+    if ready:
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit("supervisor state was not ready before the cleanup test")
+    time.sleep(0.02)
+
+child_code = """
+from pathlib import Path
+import sys
+import time
+release = Path(sys.argv[1])
+deadline = time.monotonic() + 30
+while not release.exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+if release.exists():
+    Path(sys.argv[2]).write_text('late')
+"""
+child = subprocess.Popen(
+    [sys.executable, "-c", child_code, sys.argv[3], sys.argv[2]],
+    start_new_session=True,
+)
+Path(sys.argv[4]).write_text(str(child.pid))
+PY
+SH
+  if [[ "${drop_session}" == "1" ]]; then
+    cat >> "${worker}" <<'SH'
+sleep 0.5
+session="$(tmux display-message -p '#S')"
+tmux kill-session -t "${session}"
+SH
+  fi
+  printf 'sleep 30\n' >> "${worker}"
+  chmod +x "${worker}"
+}
+
 init_raw_run_and_task() {
   local run_id="$1"
   local task_id="$2"
