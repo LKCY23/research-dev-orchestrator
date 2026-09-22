@@ -1,0 +1,57 @@
+diff --git a/src/miniqueue/model.py b/src/miniqueue/model.py
+index 6e9a496..2b84b08 100644
+--- a/src/miniqueue/model.py
++++ b/src/miniqueue/model.py
+@@ -23,0 +24 @@ class JobState(str, Enum):
++    CANCELLED = "cancelled"
+@@ -118 +119 @@ class Job:
+-        if self.state in (JobState.SUCCEEDED, JobState.DEAD):
++        if self.state in (JobState.SUCCEEDED, JobState.DEAD, JobState.CANCELLED):
+@@ -126 +127 @@ class Job:
+-        return self.state in (JobState.SUCCEEDED, JobState.DEAD)
++        return self.state in (JobState.SUCCEEDED, JobState.DEAD, JobState.CANCELLED)
+@@ -239,0 +241 @@ class QueueStats:
++    cancelled: int
+@@ -243 +245 @@ class QueueStats:
+-        return self.queued + self.leased + self.succeeded + self.dead
++        return self.queued + self.leased + self.succeeded + self.dead + self.cancelled
+@@ -254,0 +257 @@ class QueueStats:
++            cancelled=counts[JobState.CANCELLED],
+diff --git a/src/miniqueue/queue.py b/src/miniqueue/queue.py
+index addcff7..155a92b 100644
+--- a/src/miniqueue/queue.py
++++ b/src/miniqueue/queue.py
+@@ -10 +10,7 @@ from .clock import Clock, SystemClock
+-from .errors import ConflictError, InvalidJobError, JobNotFoundError, LeaseError
++from .errors import (
++    ConflictError,
++    InvalidJobError,
++    InvalidStateTransitionError,
++    JobNotFoundError,
++    LeaseError,
++)
+@@ -117,0 +124,24 @@ class Queue:
++    def cancel(self, job_id: str, reason: str | None = None) -> Job:
++        if reason is None:
++            normalized_reason = "cancelled"
++        elif isinstance(reason, str) and reason.strip():
++            normalized_reason = reason.strip()
++        else:
++            raise InvalidJobError("reason must be a non-empty string")
++        now = self.clock.now()
++
++        def mutate(snapshot: QueueSnapshot) -> Job:
++            job = self._require_job(snapshot, job_id)
++            if job.state is JobState.CANCELLED:
++                return job.clone()
++            if job.state is not JobState.QUEUED:
++                raise InvalidStateTransitionError(
++                    f"cannot cancel job {job.job_id!r} from state {job.state.value!r}"
++                )
++            job.state = JobState.CANCELLED
++            job.completed_at = now
++            job.last_error = normalized_reason
++            return job.clone()
++
++        return self._mutate(mutate)
++

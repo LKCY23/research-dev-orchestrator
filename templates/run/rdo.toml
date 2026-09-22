@@ -4,6 +4,8 @@
 
 [worker]
 backend = "claude-code" # claude-code | codex | opencode | kimi-code
+model = ""
+reasoning_effort = ""
 agent_name = "claude-worker"
 permission_mode = "auto" # default | auto | yolo
 # Optional command override for fake workers or advanced local wrappers.

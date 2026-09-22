@@ -39,6 +39,8 @@ from protocol import (
     load_json,
     parse_iso,
     read_event_journal,
+    converge_operator_termination_locked,
+    task_state_lock,
     utc_now,
     write_json,
 )
@@ -54,7 +56,16 @@ from task_contract import (
     write_task_inputs_immutable,
 )
 from task_budget import TaskBudgetError, validate_assessment
-from supervisor import terminate_processes, validate_attempt_deadline_payload
+from supervisor import (
+    terminate_current_supervision,
+    terminate_processes,
+    validate_attempt_deadline_payload,
+)
+from tmux_lifecycle import (
+    TMUX_CLEANUP_FAILURE_STATUSES,
+    TMUX_CLEANUP_POLICIES,
+    TMUX_CLEANUP_STATUSES,
+)
 from validation import (
     HandoffValidationResult,
     parse_exit_code,
@@ -340,7 +351,7 @@ def add_common_event_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--task-id", required=True)
-    parser.add_argument("--attempt-id", required=True)
+    parser.add_argument("--attempt-id", default="")
 
 
 def cmd_check_dispatch_transition(args: argparse.Namespace) -> int:
@@ -476,6 +487,7 @@ def cmd_freeze_task_inputs(args: argparse.Namespace) -> int:
 
 def cmd_append_event(args: argparse.Namespace) -> int:
     dispatch_events = {
+        "dispatch_preflight_failed",
         "task_dispatched",
         "worker_process_started",
         "prompt_dispatched",
@@ -494,8 +506,9 @@ def cmd_append_event(args: argparse.Namespace) -> int:
         "event": args.event_name,
         "run_id": args.run_id,
         "task_id": args.task_id,
-        "attempt_id": args.attempt_id,
     }
+    if args.attempt_id:
+        payload["attempt_id"] = args.attempt_id
     if args.event_name == "task_dispatched":
         payload["worker"] = args.agent_name
         payload["worker_backend"] = getattr(args, "worker_backend", "")
@@ -503,6 +516,11 @@ def cmd_append_event(args: argparse.Namespace) -> int:
         assigned = status.get("assigned_worker") or {}
         payload["worker_id"] = assigned.get("worker_id", "")
         payload["execution_mode"] = getattr(args, "execution_mode", "")
+    if args.event_name == "dispatch_preflight_failed":
+        payload["worker_backend"] = getattr(args, "worker_backend", "")
+        payload["runtime_backend"] = getattr(args, "runtime_backend", "")
+        payload["execution_mode"] = getattr(args, "execution_mode", "")
+        payload["detail"] = getattr(args, "detail", "")
     if args.event_name == "worker_blocked":
         status = load_json(Path(args.status_path))
         payload["blocker_type"] = status.get("blocker_type", "")
@@ -518,7 +536,8 @@ def cmd_create_attempt(args: argparse.Namespace) -> int:
         "backend": args.runtime_backend,
         "runtime_backend": args.runtime_backend,
         "io_mode": args.io_mode,
-        "model": os.environ.get("CLAUDE_MODEL"),
+        "model": args.model or None,
+        "reasoning_effort": args.reasoning_effort or None,
         "cli": command_parts[0] if command_parts else command,
         "command": command,
         "cwd": args.cwd,
@@ -706,6 +725,90 @@ def cmd_record_session(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record_tmux_cleanup(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(args.payload_json)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"tmux cleanup payload is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("tmux cleanup payload must be an object")
+    policy = payload.get("policy")
+    cleanup_status = payload.get("status")
+    reason = payload.get("reason")
+    if policy not in TMUX_CLEANUP_POLICIES:
+        raise SystemExit(f"invalid tmux cleanup policy: {policy!r}")
+    if cleanup_status not in TMUX_CLEANUP_STATUSES:
+        raise SystemExit(f"invalid tmux cleanup status: {cleanup_status!r}")
+    if reason is not None and not isinstance(reason, str):
+        raise SystemExit("tmux cleanup reason must be a string or null")
+    if cleanup_status == "retained_by_policy" and policy != "retain":
+        raise SystemExit("retained_by_policy requires policy=retain")
+    if policy == "retain" and cleanup_status in {"killed", "kill_failed"}:
+        raise SystemExit(f"policy=retain cannot record status={cleanup_status}")
+
+    attempt_path = Path(args.attempt_path)
+    attempt = load_json(attempt_path)
+    if not isinstance(attempt, dict):
+        raise SystemExit("ATTEMPT.json must be an object")
+    runtime = attempt.get("runtime")
+    if not isinstance(runtime, dict) or runtime.get("backend") != "tmux":
+        raise SystemExit("tmux cleanup can only be recorded for a tmux attempt")
+    runtime["tmux_cleanup"] = {
+        "policy": policy,
+        "status": cleanup_status,
+        "reason": reason,
+        "recorded_at": utc_now(),
+    }
+    write_attempt_state(attempt_path, attempt)
+    return 0
+
+
+def _tmux_cleanup_failure(attempt: Mapping[str, Any]) -> dict[str, Any] | None:
+    runtime = attempt.get("runtime")
+    if not isinstance(runtime, Mapping) or runtime.get("backend") != "tmux":
+        return None
+    cleanup = runtime.get("tmux_cleanup")
+    if not isinstance(cleanup, Mapping):
+        return {
+            "kind": "tmux_session",
+            "terminated": False,
+            "cleanup_verified": False,
+            "surviving_pids": [],
+            "reason": "tmux cleanup result is missing",
+        }
+    policy = cleanup.get("policy")
+    cleanup_status = cleanup.get("status")
+    valid = (
+        policy in TMUX_CLEANUP_POLICIES
+        and cleanup_status in TMUX_CLEANUP_STATUSES
+        and not (
+            cleanup_status == "retained_by_policy"
+            and policy != "retain"
+        )
+        and not (
+            policy == "retain"
+            and cleanup_status in {"killed", "kill_failed"}
+        )
+    )
+    if valid and cleanup_status not in TMUX_CLEANUP_FAILURE_STATUSES:
+        return None
+    reason = cleanup.get("reason")
+    if not isinstance(reason, str) or not reason:
+        reason = (
+            f"invalid tmux cleanup record policy={policy!r} status={cleanup_status!r}"
+            if not valid
+            else str(cleanup_status)
+        )
+    return {
+        "kind": "tmux_session",
+        "terminated": False,
+        "cleanup_verified": False,
+        "surviving_pids": [],
+        "reason": reason,
+        "status": cleanup_status,
+    }
+
+
 def cmd_record_resume_fallback(args: argparse.Namespace) -> int:
     failure = _optional_json(args.failure_path) or {}
     attempt_path = Path(args.attempt_path)
@@ -729,6 +832,7 @@ def cmd_record_resume_fallback(args: argparse.Namespace) -> int:
         runtime["requested_command"] = runtime.get("command")
         runtime["command"] = args.command
         runtime["supervisor_command"] = args.supervisor_command
+        runtime.pop("tmux_cleanup", None)
     write_attempt_state(attempt_path, attempt)
 
     status_path = Path(args.status_path)
@@ -772,6 +876,18 @@ def _v2_governance_reasons(
         reasons.append("ATTEMPT backend profile digest is missing")
 
     if isinstance(profile, Mapping):
+        model_config = profile.get("model_config")
+        runtime = attempt.get("runtime")
+        if not isinstance(model_config, Mapping):
+            reasons.append("backend profile model_config is missing or invalid")
+        elif not isinstance(runtime, Mapping):
+            reasons.append("ATTEMPT runtime is missing while validating model configuration")
+        else:
+            for field in ("model", "reasoning_effort"):
+                if runtime.get(field) != model_config.get(field):
+                    reasons.append(
+                        f"ATTEMPT runtime {field} differs from the backend profile"
+                    )
         expected_profile = expected_dispatch.get("profile")
         expected_phase = expected_dispatch.get("phase")
         expected_backend = expected_dispatch.get("worker_backend")
@@ -957,7 +1073,7 @@ def _v2_log_binding_valid(attempt_dir: Path, record: Mapping[str, Any], prefix: 
 def _v2_finalization_binding(
     attempt_dir: Path,
     bundle: Any,
-) -> tuple[list[str], str | None, float | None]:
+) -> tuple[list[str], str | None, float | None, str | None, str | None]:
     """Independently validate the immutable source/deadline freeze."""
 
     from strategy import canonical_digest
@@ -979,7 +1095,7 @@ def _v2_finalization_binding(
         reasons.append(
             f"EVIDENCE.json is missing finalization artifacts: {missing}"
         )
-        return reasons, None, None
+        return reasons, None, None, None, None
     try:
         snapshot_path = safe_ref(
             attempt_dir,
@@ -991,7 +1107,7 @@ def _v2_finalization_binding(
         marker = load_json(marker_path)
         deadline = validate_attempt_deadline_payload(load_json(deadline_path))
     except (ArtifactBundleError, OSError, ValueError, json.JSONDecodeError) as exc:
-        return [f"finalization artifacts are invalid: {exc}"], None, None
+        return [f"finalization artifacts are invalid: {exc}"], None, None, None, None
     binding = bundle.task_inputs_binding
     if (
         not isinstance(snapshot, dict)
@@ -1006,6 +1122,8 @@ def _v2_finalization_binding(
         frozen_entries_sha256 = None
     else:
         frozen_entries_sha256 = str(snapshot["entries_sha256"])
+    frozen_source_commit: str | None = None
+    frozen_source_tree: str | None = None
     expected_marker = {
         "schema_version": 2,
         "artifact_protocol_version": 2,
@@ -1033,6 +1151,27 @@ def _v2_finalization_binding(
             reasons.append("FINALIZATION.json source snapshot digest is invalid")
         if marker.get("deadline_sha256") != file_sha256(deadline_path):
             reasons.append("FINALIZATION.json deadline digest is invalid")
+        candidate_identity_version = marker.get("candidate_identity_version")
+        if candidate_identity_version is not None:
+            source_commit = marker.get("source_commit")
+            source_tree = marker.get("source_tree")
+            if (
+                candidate_identity_version != 1
+                or snapshot.get("candidate_identity_version") != 1
+                or not isinstance(source_commit, str)
+                or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_commit)
+                is None
+                or not isinstance(source_tree, str)
+                or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_tree)
+                is None
+                or snapshot.get("source_commit") != source_commit
+                or snapshot.get("source_tree") != source_tree
+                or bundle.handoff.get("source_commit") != source_commit
+            ):
+                reasons.append("FINALIZATION.json candidate commit/tree binding is invalid")
+            else:
+                frozen_source_commit = source_commit
+                frozen_source_tree = source_tree
         grace = marker.get("grace_seconds")
         marker_deadline = marker.get("deadline_at_epoch")
         if (
@@ -1051,8 +1190,12 @@ def _v2_finalization_binding(
             > 1e-6
         ):
             reasons.append("FINALIZATION.json deadline arithmetic is invalid")
-    return reasons, frozen_entries_sha256, (
-        float(marker_started) if marker_started is not None else None
+    return (
+        reasons,
+        frozen_entries_sha256,
+        float(marker_started) if marker_started is not None else None,
+        frozen_source_commit,
+        frozen_source_tree,
     )
 
 
@@ -1068,7 +1211,13 @@ def _v2_acceptance_reasons(
     """Independently enforce frozen checks/outputs after bundle publication."""
 
     reasons: list[str] = []
-    finalization_reasons, frozen_entries_sha256, marker_started = (
+    (
+        finalization_reasons,
+        frozen_entries_sha256,
+        marker_started,
+        frozen_source_commit,
+        frozen_source_tree,
+    ) = (
         _v2_finalization_binding(attempt_dir, bundle)
     )
     reasons.extend(finalization_reasons)
@@ -1125,6 +1274,14 @@ def _v2_acceptance_reasons(
                 and record.get("source_after_entries_sha256")
                 == frozen_entries_sha256
                 and record.get("source_unchanged") is True
+                and (
+                    frozen_source_commit is None
+                    or record.get("source_commit") == frozen_source_commit
+                )
+                and (
+                    frozen_source_tree is None
+                    or record.get("source_tree") == frozen_source_tree
+                )
                 and (
                     "finalization_started_at_epoch" not in record
                     or marker_started is not None
@@ -1546,7 +1703,13 @@ def _validate_v2_handoff(
         if phase not in {"planning", "execution"}:
             reasons.append("blocked handoff requires an active planning or execution attempt")
         if bundle is not None:
-            finalization_reasons, _frozen_sha, _marker_started = (
+            (
+                finalization_reasons,
+                _frozen_sha,
+                _marker_started,
+                _frozen_commit,
+                _frozen_tree,
+            ) = (
                 _v2_finalization_binding(attempt_dir, bundle)
             )
             reasons.extend(finalization_reasons)
@@ -2581,7 +2744,7 @@ def _v2_supervisor_receipt_reasons(
     return reasons
 
 
-def cmd_validate_handoff(args: argparse.Namespace) -> int:
+def _cmd_validate_handoff_locked(args: argparse.Namespace) -> int:
     attempt_path = Path(args.attempt_path)
     task_dir = Path(args.task_dir)
     startup_payload = _optional_json(getattr(args, "startup_path", ""))
@@ -2746,6 +2909,9 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
                 or "process cleanup could not be verified"
             ),
         }
+    tmux_cleanup_failure = _tmux_cleanup_failure(initial_attempt)
+    if cleanup_failure is None and tmux_cleanup_failure is not None:
+        cleanup_failure = tmux_cleanup_failure
     if cleanup_failure is not None:
         result = HandoffValidationResult(
             valid=False,
@@ -2756,7 +2922,11 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
                 (
                     f"supervisor left surviving worker descendants: {surviving_pids}"
                     if surviving_pids
-                    else "supervisor could not verify complete worker process cleanup"
+                    else (
+                        "tmux session cleanup could not be verified"
+                        if cleanup_failure.get("kind") == "tmux_session"
+                        else "supervisor could not verify complete worker process cleanup"
+                    )
                 ),
             ],
             request=result.request,
@@ -2943,6 +3113,14 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
                         f"{cleanup_failure['surviving_pids']}; the dispatch lock "
                         "must be retained for coordinator recovery."
                     )
+                elif cleanup_failure.get("kind") == "tmux_session":
+                    summary = "Tmux session cleanup could not be verified"
+                    blocker_type = "environment"
+                    blocking_reason = (
+                        "Dispatcher could not prove the receipt-bound tmux session "
+                        f"was safely handled ({cleanup_failure['reason']}); the "
+                        "dispatch lock must be retained for coordinator recovery."
+                    )
                 else:
                     summary = "Worker process cleanup could not be verified"
                     blocker_type = "environment"
@@ -3008,7 +3186,15 @@ def cmd_validate_handoff(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
+def cmd_validate_handoff(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir)
+    with task_state_lock(task_dir):
+        if converge_operator_termination_locked(task_dir, args.attempt_id):
+            return 0
+        return _cmd_validate_handoff_locked(args)
+
+
+def _cmd_reconcile_dispatch_exit_locked(args: argparse.Namespace) -> int:
     """Idempotently close an active attempt after dispatcher failure."""
 
     status_path = Path(args.status_path)
@@ -3066,6 +3252,9 @@ def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
         has_survivors = isinstance(surviving_pids, list) and bool(surviving_pids)
         if cleanup_result.get("terminated") is not True or has_survivors:
             cleanup_failure = dict(cleanup_result)
+    tmux_cleanup_failure = _tmux_cleanup_failure(attempt)
+    if cleanup_failure is None and tmux_cleanup_failure is not None:
+        cleanup_failure = tmux_cleanup_failure
 
     if (
         cleanup_failure is None
@@ -3181,10 +3370,14 @@ def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
             )
         else:
             blocker_type = "environment"
-            summary = "Worker process cleanup could not be verified"
+            summary = (
+                "Tmux session cleanup could not be verified"
+                if cleanup_failure.get("kind") == "tmux_session"
+                else "Worker process cleanup could not be verified"
+            )
             reason = str(cleanup_failure.get("reason") or "unknown cleanup failure")
             blocking_reason = (
-                f"Dispatcher cleanup was not verifiable ({reason}); "
+                f"Dispatcher runtime cleanup was not verifiable ({reason}); "
                 "the dispatch lock was retained for coordinator recovery."
             )
     apply_dispatch_terminal_transition(
@@ -3245,40 +3438,49 @@ def cmd_terminate_attempt_processes(args: argparse.Namespace) -> int:
             )
         )
         return 2
-    pids = {
-        int(value)
-        for value in state.get("observed_pids", [])
-        if isinstance(value, int) and value > 1
-    }
-    pgids = {
-        int(value)
-        for value in state.get("observed_pgids", [])
-        if isinstance(value, int) and value > 1
-    }
-    root_pid = state.get("worker_pid")
     supervision_token = state.get("supervision_token")
-    cleanup_observation: dict[str, Any] = {"verified": True, "reason": None}
-    survivors = terminate_processes(
-        pgids,
-        pids,
-        root_pid=(
-            int(root_pid)
-            if isinstance(root_pid, int) and not isinstance(root_pid, bool)
-            else None
-        ),
-        supervision_token=(
-            supervision_token if isinstance(supervision_token, str) else None
-        ),
-        observed_pids=pids,
-        observed_pgids=pgids,
-        cleanup_observation=cleanup_observation,
+    if not isinstance(supervision_token, str) or not re.fullmatch(r"[0-9a-f]{32}", supervision_token):
+        print(json.dumps({
+            "terminated": False,
+            "cleanup_verified": False,
+            "reason": "supervision_token_missing_or_invalid",
+            "surviving_pids": [],
+        }))
+        return 2
+
+    result = terminate_current_supervision(
+        state.get("worker_pid"),
+        state.get("worker_pgid"),
+        state.get("worker_start_identity"),
+        supervision_token,
     )
+    if result.identity_verified:
+        pids = set(result.targeted_pids)
+        pgids = set(result.targeted_pgids)
+        survivors = result.surviving_pids
+        cleanup_verified = result.cleanup_verified
+        reason = result.cleanup_failure_reason
+    else:
+        # Historical PID/PGID numbers cannot identify a live process after root loss.
+        pids: set[int] = set()
+        pgids: set[int] = set()
+        cleanup_observation: dict[str, Any] = {"verified": True, "reason": None}
+        survivors = terminate_processes(
+            set(),
+            set(),
+            supervision_token=supervision_token,
+            observed_pids=pids,
+            observed_pgids=pgids,
+            cleanup_observation=cleanup_observation,
+        )
+        cleanup_verified = cleanup_observation["verified"]
+        reason = cleanup_observation["reason"]
     print(
         json.dumps(
             {
-                "terminated": bool(cleanup_observation["verified"] and not survivors),
-                "cleanup_verified": cleanup_observation["verified"],
-                "reason": cleanup_observation["reason"],
+                "terminated": bool(cleanup_verified and not survivors),
+                "cleanup_verified": cleanup_verified,
+                "reason": reason,
                 "observed_pids": sorted(pids),
                 "observed_pgids": sorted(pgids),
                 "surviving_pids": list(survivors),
@@ -3286,7 +3488,7 @@ def cmd_terminate_attempt_processes(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
-    return 0 if cleanup_observation["verified"] and not survivors else 2
+    return 0 if cleanup_verified and not survivors else 2
 
 
 def cmd_write_dispatch_diagnostics(args: argparse.Namespace) -> int:
@@ -3314,6 +3516,14 @@ def cmd_write_dispatch_diagnostics(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     return 0
+
+
+def cmd_reconcile_dispatch_exit(args: argparse.Namespace) -> int:
+    task_dir = Path(args.task_dir)
+    with task_state_lock(task_dir):
+        if converge_operator_termination_locked(task_dir, args.attempt_id):
+            return 0
+        return _cmd_reconcile_dispatch_exit_locked(args)
 
 
 def cmd_write_tmux_timeout_diagnostics(args: argparse.Namespace) -> int:
@@ -3398,7 +3608,7 @@ def build_parser() -> argparse.ArgumentParser:
     freeze_inputs.add_argument("--profile", choices=["direct", "delegated", "full"], required=True)
     freeze_inputs.add_argument(
         "--execution-mode",
-        choices=["start", "resume", "replace"],
+        choices=["start", "resume", "replace", "restart"],
         default="start",
         help="recorded for dispatch diagnostics; all later v2 attempts enforce the frozen contract",
     )
@@ -3409,7 +3619,9 @@ def build_parser() -> argparse.ArgumentParser:
     event.add_argument("--event-name", required=True)
     event.add_argument("--agent-name", required=True)
     event.add_argument("--worker-backend", default="")
+    event.add_argument("--runtime-backend", default="")
     event.add_argument("--execution-mode", default="")
+    event.add_argument("--detail", default="")
     event.add_argument("--status-path", required=True)
     event.set_defaults(func=cmd_append_event)
 
@@ -3427,6 +3639,8 @@ def build_parser() -> argparse.ArgumentParser:
     attempt.add_argument("--parent-attempt-id", default="")
     attempt.add_argument("--session-id", default="")
     attempt.add_argument("--worker-backend", default="claude-code")
+    attempt.add_argument("--model", default="")
+    attempt.add_argument("--reasoning-effort", default="")
     attempt.add_argument("--execution-mode", default="start")
     attempt.add_argument("--requested-execution-mode", default="")
     attempt.add_argument("--requested-session-id", default="")
@@ -3470,6 +3684,11 @@ def build_parser() -> argparse.ArgumentParser:
     record_session.add_argument("--attempt-path", required=True)
     record_session.add_argument("--session-path", required=True)
     record_session.set_defaults(func=cmd_record_session)
+
+    tmux_cleanup = sub.add_parser("record-tmux-cleanup")
+    tmux_cleanup.add_argument("--attempt-path", required=True)
+    tmux_cleanup.add_argument("--payload-json", required=True)
+    tmux_cleanup.set_defaults(func=cmd_record_tmux_cleanup)
 
     fallback = sub.add_parser("record-resume-fallback")
     fallback.add_argument("--status-path", required=True)

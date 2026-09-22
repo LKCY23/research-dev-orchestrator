@@ -17,11 +17,20 @@ Do not treat this as a server, RPC, queue, or daemon architecture. Use repo-loca
   freeze `TASK.md`, `CONTEXT.md`, `ACCEPTANCE.md`, and
   `EXECUTION_POLICY.json` before any attempt, lock, worktree, or running-state
   mutation. Recognized v1 runs use only the explicit legacy decoder.
-- Run required acceptance commands through `rdo check`; legacy `rdo exec --acceptance`,
-  free-text command claims, and task-root handoff/evidence files
-  cannot satisfy a v2 gate.
-- Execution workers commit task changes on their assigned branch and leave the worktree clean before final handoff.
+- Execution workers finish implementation and review, commit task changes on
+  their assigned branch, and leave the worktree clean before `rdo check`.
+- Run required acceptance commands through `rdo check`; each v2 record binds
+  the exact clean candidate commit/tree. Legacy `rdo exec --acceptance`,
+  free-text command claims, and task-root handoff/evidence files cannot satisfy
+  a v2 gate.
+- Finalization begins only after acceptance and output gates pass. It freezes
+  that checked candidate; checks, commits, and source changes are forbidden
+  afterward.
 - Filesystem is the protocol: exchange state through `.agent-collab/runs/<run-id>/...`.
+- `.agent-collab/` and `.agent-worktrees/` are local runtime state, not project
+  source. `init_run.py` records both in the target repository's
+  `.git/info/exclude`, verifies that Git ignores them, and refuses to initialize
+  while either path is already tracked.
 - Git is the isolation boundary: use one branch/worktree per task; workers never merge.
 - FSM is a hard protocol: read `references/state-machine.json` before any state mutation.
 - `SUMMARY.md`, `dashboard.html`, and `diagnostics/` are derived monitor artifacts, not sources of truth.
@@ -267,6 +276,12 @@ attachable and best effort; prompt submission is recorded but not treated as a
 machine acknowledgement.
 
 `tmux` backend is attachable execution, not detached orchestration. Dispatch still waits for the attempt-local `exit_code` file and validates handoff. If tmux wait times out before `exit_code` appears, dispatch exits `5`, keeps `.dispatch-lock`, leaves `ATTEMPT.state=running`, writes diagnostics, and requires Lock Recovery Review.
+
+Every tmux dispatch records an exact session identity receipt and a terminal
+`ATTEMPT.runtime.tmux_cleanup` policy/status. Default cleanup must verify the
+receipt-bound session is absent; explicit retention records
+`retained_by_policy`. Identity mismatch or unverifiable cleanup blocks
+publication and retains the dispatch lock.
 
 `collect_status.py` is read-only by default. It must not modify `STATUS.json`, delete locks, change FSM state, or repair violations. `--write-summary` may update only `SUMMARY.md`; `--write-diagnostics` may write only diagnostics files.
 

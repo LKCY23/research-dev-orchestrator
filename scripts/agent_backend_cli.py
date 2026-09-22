@@ -77,7 +77,7 @@ def main() -> int:
     command.add_argument("--prompt-path", default="")
     command.add_argument("--agent-name", default="")
     command.add_argument("--backend-profile", default="")
-    command.add_argument("--execution-mode", choices=["start", "resume", "replace"], default="start")
+    command.add_argument("--execution-mode", choices=["start", "resume", "replace", "restart"], default="start")
     command.add_argument("--session-id", default="")
     command.add_argument("--json", action="store_true")
     command.set_defaults(func=cmd_command)

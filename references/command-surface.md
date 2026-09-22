@@ -88,15 +88,18 @@ acceptance contract and appends a structured supervised record. In machine
 mode the command remains inside the worker sandbox while the outer attempt
 supervisor supplies the process-cleanup receipt; it never accepts arbitrary
 argv from the broker protocol. Free text and `rdo exec --acceptance` cannot
-satisfy a v2 acceptance gate.
+satisfy a v2 acceptance gate. The task worktree must already be a clean commit;
+the record binds its exact commit, tree, and semantic source digest. A command
+that changes that identity fails with exit code 126.
 
-`rdo finalization begin` explicitly freezes a Direct/Delegated source tree once
-implementation, ordinary testing, and remediation are complete. Required
-checks may have run immediately before entry or may be repeated during
-finalization; RDO accepts them only when their source digests match the frozen
-tree. Full enters automatically after its last required workflow. Repeating
-begin is idempotent and never extends the deadline, which is fixed at the
-original execution deadline plus the configured grace.
+`rdo finalization begin` explicitly freezes a candidate only after all required
+checks and outputs already match its exact clean commit. Full applies the same
+acceptance gate before appending its last required workflow completion; that
+completion does not itself freeze the attempt. `rdo finalize` performs the
+same preflight and may enter finalization atomically, so a separate begin call
+is optional. After entry, checks, commits, workflow activity, and source edits
+are forbidden. Repeating begin is idempotent and never extends the deadline,
+which is fixed at the original execution deadline plus the configured grace.
 
 `rdo strategy submit|revise` and `rdo finalize` publish the attempt-local
 `HANDOFF_READY.json` only after immutable handoff and evidence artifacts are
@@ -315,7 +318,7 @@ python scripts/rdo.py task resume \
   [--runtime-backend plain|tmux] \
   [--io-mode machine|human] \
   [--permission-mode default|auto|yolo] \
-  [--execution-mode auto|start|resume|replace] \
+  [--execution-mode auto|start|resume|replace|restart] \
   [--phase auto|planning|execution]
 ```
 

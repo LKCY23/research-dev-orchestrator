@@ -6,9 +6,49 @@ RDO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export RDO_ROOT
 RDO_KEEP_SMOKE_REPOS="${RDO_KEEP_SMOKE_REPOS:-1}"
 RDO_SMOKE_REGISTRY="${RDO_SMOKE_REGISTRY:-$(mktemp -t rdo-smoke-repos.XXXXXX)}"
+RDO_SMOKE_TMUX_REGISTRY="${RDO_SMOKE_TMUX_REGISTRY:-$(mktemp -t rdo-smoke-tmux.XXXXXX)}"
 export RDO_KEEP_SMOKE_REPOS
 export RDO_SMOKE_REGISTRY
+export RDO_SMOKE_TMUX_REGISTRY
 export RDO_TEST_ALLOW_UNGOVERNED_COMMAND_OVERRIDE=1
+
+register_smoke_tmux_receipt() {
+  printf '%s\n' "$1" >> "${RDO_SMOKE_TMUX_REGISTRY}"
+}
+
+cleanup_smoke_tmux_sessions() {
+  [[ -f "${RDO_SMOKE_TMUX_REGISTRY}" ]] || return 0
+  local cleanup_code=0
+  while IFS= read -r receipt; do
+    [[ -n "${receipt}" ]] || continue
+    PYTHONPATH="${RDO_ROOT}/scripts" python3 - "${receipt}" <<'PY' || cleanup_code=$?
+import json
+import sys
+from pathlib import Path
+
+from tmux_lifecycle import kill_live_tmux_session
+
+receipt = Path(sys.argv[1])
+payload = json.loads(receipt.read_text(encoding="utf-8"))
+result = kill_live_tmux_session(
+    {
+        "session_id": payload["session_id"],
+        "created_at_epoch": payload["created_at_epoch"],
+        "session_name": payload["session_name"],
+    }
+)
+if result["status"] not in {"killed", "already_absent"}:
+    print(
+        f"smoke tmux teardown failed for {receipt}: "
+        f"{result['status']}: {result.get('reason')}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+  done < "${RDO_SMOKE_TMUX_REGISTRY}"
+  rm -f "${RDO_SMOKE_TMUX_REGISTRY}"
+  return "${cleanup_code}"
+}
 
 cleanup_smoke_repos() {
   if [[ "${RDO_KEEP_SMOKE_REPOS}" != "0" || ! -f "${RDO_SMOKE_REGISTRY}" ]]; then
@@ -22,7 +62,22 @@ cleanup_smoke_repos() {
   rm -f "${RDO_SMOKE_REGISTRY}"
 }
 
-trap 'code=$?; cleanup_smoke_repos; exit "${code}"' EXIT
+cleanup_smoke_resources() {
+  local code="$1"
+  local cleanup_code=0
+  local repo_code=0
+  cleanup_smoke_tmux_sessions || cleanup_code=$?
+  cleanup_smoke_repos || repo_code=$?
+  if [[ "${cleanup_code}" -eq 0 && "${repo_code}" -ne 0 ]]; then
+    cleanup_code="${repo_code}"
+  fi
+  if [[ "${code}" -eq 0 && "${cleanup_code}" -ne 0 ]]; then
+    code="${cleanup_code}"
+  fi
+  exit "${code}"
+}
+
+trap 'cleanup_smoke_resources "$?"' EXIT
 
 setup_smoke_repo() {
   local base="${1:-}"
@@ -40,6 +95,70 @@ setup_smoke_repo() {
   git add file.txt
   git commit -m init >/dev/null
   printf '%s\n' "${base}"
+}
+
+make_detached_child_worker() {
+  local worker="$1"
+  local sentinel="$2"
+  local release="$3"
+  local started="$4"
+  local drop_session="${5:-0}"
+  cat > "${worker}" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+prompt="\$(mktemp)"
+cat > "\${prompt}"
+ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
+rm -f "\${prompt}"
+python3 - "\${ATTEMPT_DIR}/runtime/supervisor.json" "${sentinel}" "${release}" "${started}" <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+state = Path(sys.argv[1])
+deadline = time.monotonic() + 5
+while True:
+    try:
+        payload = json.loads(state.read_text())
+        ready = payload.get("supervision_token") == os.environ["RDO_SUPERVISION_TOKEN"]
+    except (OSError, ValueError):
+        ready = False
+    if ready:
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit("supervisor state was not ready before the cleanup test")
+    time.sleep(0.02)
+
+child_code = """
+from pathlib import Path
+import sys
+import time
+release = Path(sys.argv[1])
+deadline = time.monotonic() + 30
+while not release.exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+if release.exists():
+    Path(sys.argv[2]).write_text('late')
+"""
+child = subprocess.Popen(
+    [sys.executable, "-c", child_code, sys.argv[3], sys.argv[2]],
+    start_new_session=True,
+)
+Path(sys.argv[4]).write_text(str(child.pid))
+PY
+SH
+  if [[ "${drop_session}" == "1" ]]; then
+    cat >> "${worker}" <<'SH'
+sleep 0.5
+session="$(tmux display-message -p '#S')"
+tmux kill-session -t "${session}"
+SH
+  fi
+  printf 'sleep 30\n' >> "${worker}"
+  chmod +x "${worker}"
 }
 
 init_raw_run_and_task() {

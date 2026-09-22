@@ -75,6 +75,7 @@ created
 running
 completed
 invalid_handoff
+terminated
 ```
 
 ## Attempt Outcomes
@@ -86,6 +87,7 @@ timed_out_unfinalized
 finalization_timed_out
 finalization_failed
 invalid_handoff
+operator_terminated
 completed
 ```
 
@@ -103,6 +105,7 @@ full
 start
 resume
 replace
+restart
 ```
 
 ## Task States
@@ -129,6 +132,7 @@ requirements_updated
 design_method_selected
 adr_added
 task_created
+dispatch_preflight_failed
 task_dispatched
 worker_process_started
 prompt_dispatched

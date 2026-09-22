@@ -28,13 +28,28 @@ separate actions. Recognized legacy-v0.5/v1 attempts use their historical
 
 With `RDO_TMUX_KEEP_SESSION=1`, the runner leaves a login shell in the pane after
 the worker process has been quiesced, so an attached observer can still inspect
-the attempt. Otherwise dispatch cleans up the tmux session after validation.
-Dispatch creates the tmux session in a parked state, durably records its tmux
-ID, name, and creation time in attempt-local `runtime/TMUX_SESSION.json`, and
-only then starts the worker in that session. A new-protocol attempt fails
-startup and closes the parked session when this receipt cannot be written.
-Later lifecycle cleanup and worker control bind to the receipt instead of
-trusting a reusable session name.
+the attempt. Otherwise dispatch must close the receipt-bound tmux session and
+verify its absence before handoff validation can succeed. Dispatch creates the
+tmux session in a parked state while obtaining its ID, name, and creation time,
+durably records that identity in attempt-local `runtime/TMUX_SESSION.json`, and
+only then starts the worker. If receipt persistence fails, the creation helper
+rolls back the exact returned identity before reporting startup failure. Later
+lifecycle cleanup and worker control bind to the receipt instead of trusting a
+reusable session name.
+
+`ATTEMPT.runtime.tmux_cleanup` records one policy and one leaf status. It does
+not persist separate outcome/result fields:
+
+```text
+policy = cleanup_on_exit | retain
+status = killed | already_absent | retained_by_policy
+       | identity_mismatch | kill_failed | verification_failed
+```
+
+The first three statuses satisfy their compatible policy. The final three are
+cleanup failures: dispatch blocks publication and retains the dispatch lock for
+coordinator recovery. `identity_mismatch` refuses to kill a session whose live
+ID, name, or creation time differs from the receipt.
 
 ## Lifecycle Inventory And Prune
 

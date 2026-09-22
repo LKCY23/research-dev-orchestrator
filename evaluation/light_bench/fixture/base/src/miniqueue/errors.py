@@ -13,8 +13,12 @@ class JobNotFoundError(MiniQueueError, LookupError):
     """Raised when an operation names an unknown job identifier."""
 
 
+class InvalidStateTransitionError(MiniQueueError):
+    """Raised when an operation is invalid from the job's lifecycle state."""
+
+
 class LeaseError(MiniQueueError):
-    """Raised when a worker does not own the active lease for a job."""
+    """Raised when lease ownership, validity, or expiry checks fail."""
 
 
 class ConflictError(MiniQueueError):

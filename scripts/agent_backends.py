@@ -235,8 +235,8 @@ def build_command(
         raise ValueError(f"io_mode must be one of {sorted(IO_MODES)}")
     if permission_mode not in PERMISSION_MODES:
         raise ValueError(f"permission_mode must be one of {sorted(PERMISSION_MODES)}")
-    if execution_mode not in {"start", "resume", "replace"}:
-        raise ValueError("execution_mode must be start, resume, or replace")
+    if execution_mode not in {"start", "resume", "replace", "restart"}:
+        raise ValueError("execution_mode must be start, resume, replace, or restart")
     if execution_mode == "resume" and not session_id:
         raise ValueError("resume execution requires session_id")
     payload = load_backend(backend_id)
@@ -289,6 +289,31 @@ def build_command(
             "RDO_BACKEND_PROFILE": str(profile_path),
             "RDO_BACKEND_PROFILE_SHA256": str(profile.get("profile_sha256") or ""),
         }
+        model_config = profile.get("model_config", {})
+        if not isinstance(model_config, dict):
+            raise ValueError("backend profile model_config must be an object")
+        model = model_config.get("model")
+        reasoning_effort = model_config.get("reasoning_effort")
+        if model is not None and (not isinstance(model, str) or not model):
+            raise ValueError("backend profile model must be null or a non-empty string")
+        if reasoning_effort is not None and (
+            not isinstance(reasoning_effort, str) or not reasoning_effort
+        ):
+            raise ValueError("backend profile reasoning_effort must be null or a non-empty string")
+        if backend_id == "claude-code":
+            model_args = []
+            if model:
+                model_args.extend(("--model", model))
+            if reasoning_effort:
+                model_args.extend(("--effort", reasoning_effort))
+            argv[1:1] = model_args
+        elif backend_id == "codex":
+            model_args = []
+            if model:
+                model_args.extend(("--model", model))
+            if reasoning_effort:
+                model_args.extend(("-c", f'model_reasoning_effort="{reasoning_effort}"'))
+            argv[1:1] = model_args
         if backend_id == "claude-code":
             settings_path = profile_path.parent / "claude-settings.json"
             if not settings_path.exists():

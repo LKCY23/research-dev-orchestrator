@@ -20,7 +20,7 @@
     },
     "planning": {
       "strategy_review": ["dispatch"],
-      "blocked": ["dispatch"]
+      "blocked": ["dispatch", "coordinator"]
     },
     "strategy_review": {
       "changes_requested": ["coordinator"],
@@ -30,7 +30,7 @@
     "running": {
       "verified": ["dispatch"],
       "review": ["dispatch"],
-      "blocked": ["dispatch"],
+      "blocked": ["dispatch", "coordinator"],
       "strategy_review": ["dispatch"]
     },
     "blocked": {

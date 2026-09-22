@@ -18,8 +18,10 @@ DISPATCH_ASSETS="${SCRIPT_DIR}/dispatch_assets.py"
 AGENT_BACKEND_CLI="${SCRIPT_DIR}/agent_backend_cli.py"
 BACKEND_GOVERNANCE_CLI="${SCRIPT_DIR}/backend_governance_cli.py"
 BACKEND_PREFLIGHT="${SCRIPT_DIR}/backend_preflight.py"
+CLEAN_RESTART_CLI="${SCRIPT_DIR}/clean_restart.py"
 RESUME_CONTEXT_CLI="${SCRIPT_DIR}/resume_context.py"
 TASK_BUDGET_CLI="${SCRIPT_DIR}/task_budget_cli.py"
+TMUX_LIFECYCLE_CLI="${SCRIPT_DIR}/tmux_lifecycle.py"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_DIR="${REPO_ROOT}/.agent-collab/runs/${RUN_ID}"
 TASK_DIR="${RUN_DIR}/tasks/${TASK_ID}"
@@ -31,9 +33,13 @@ DIAGNOSTICS_DIR="${RUN_DIR}/diagnostics"
 STATUS_UPDATED=0
 DISPATCH_LOCK_ACQUIRED=0
 KEEP_DISPATCH_LOCK_ON_EXIT=0
+PROCESS_CLEANUP_REQUIRED=0
 PROCESS_CLEANUP_FAILED=0
 SUPERVISOR_CLEANUP_FAILED=0
 TMUX_WORKER_LAUNCHED=0
+TMUX_IDENTITY_READY=0
+TMUX_CLEANUP_RECORDED=0
+TMUX_SESSION_CLEANUP_FAILED=0
 
 sanitize_name() {
   LC_ALL=C tr -c 'A-Za-z0-9_.-' '-' | sed 's/^-*//; s/-*$//'
@@ -74,6 +80,48 @@ write_tmux_timeout_diagnostics() {
     --timeout-seconds "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" \
     --dispatch-lock-dir "${DISPATCH_LOCK_DIR}" \
     --attempt-dir "${ATTEMPT_DIR:-}"
+}
+
+cancel_tmux_wait() {
+  local reason="$1"
+  # A late pane EXIT trap cannot discharge the process-cleanup obligation.
+  PROCESS_CLEANUP_REQUIRED=1
+  python3 - "${ATTEMPT_DIR}/runtime/DISPATCH_TIMEOUT.json" "${reason}" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = dict(
+    reason=sys.argv[2],
+    exit_code=124,
+    timed_out=True,
+    timeout_source="dispatcher_tmux_wait",
+)
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+  write_tmux_timeout_diagnostics
+  exit 5
+}
+
+supervisor_result_readable() {
+  python3 - "${SUPERVISOR_RESULT}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+try:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("missing or unsafe supervisor result")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(payload, dict) else 1)
+PY
 }
 
 append_event() {
@@ -130,8 +178,60 @@ os.replace(temporary, path)
 PY
 }
 
+cleanup_tmux_session() {
+  local policy="$1"
+  local payload=""
+  local cleanup_code=0
+  local cleanup_status=""
+  [[ "${TMUX_IDENTITY_READY}" == "1" ]] || return 0
+  set +e
+  payload="$(python3 "${TMUX_LIFECYCLE_CLI}" cleanup \
+    --attempt-dir "${ATTEMPT_DIR}" \
+    --run-id "${RUN_ID}" \
+    --task-id "${TASK_ID}" \
+    --attempt-id "${ATTEMPT_ID}" \
+    --session-name "${TMUX_SESSION}" \
+    --policy "${policy}")"
+  cleanup_code=$?
+  set -e
+  if ! record_tmux_cleanup_payload "${payload}"; then
+    TMUX_SESSION_CLEANUP_FAILED=1
+    return 1
+  fi
+  cleanup_status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status", ""))' "${payload}")"
+  if [[ "${cleanup_status}" == "killed" || "${cleanup_status}" == "already_absent" ]]; then
+    TMUX_IDENTITY_READY=0
+  fi
+  if [[ "${cleanup_code}" -ne 0 ]]; then
+    TMUX_SESSION_CLEANUP_FAILED=1
+    return 1
+  fi
+  TMUX_SESSION_CLEANUP_FAILED=0
+  return 0
+}
+
+record_tmux_cleanup_payload() {
+  local payload="$1"
+  local record_code=0
+  [[ -n "${payload}" ]] || return 2
+  set +e
+  python3 "${PROTOCOL_CLI}" record-tmux-cleanup \
+    --attempt-path "${ATTEMPT_DIR}/ATTEMPT.json" \
+    --payload-json "${payload}"
+  record_code=$?
+  set -e
+  if [[ "${record_code}" -ne 0 ]]; then
+    return "${record_code}"
+  fi
+  TMUX_CLEANUP_RECORDED=1
+  return 0
+}
+
 run_tmux_worker_once() {
   TMUX_WORKER_LAUNCHED=0
+  TMUX_IDENTITY_READY=0
+  TMUX_CLEANUP_RECORDED=0
+  TMUX_SESSION_CLEANUP_FAILED=0
   EXIT_CODE_FILE="${ATTEMPT_DIR}/exit_code"
   RUNNER_PATH="${ATTEMPT_DIR}/run-worker.sh"
   DONE_SIGNAL="rdo-done-${TMUX_SESSION}"
@@ -158,11 +258,10 @@ import sys
 print("exec " + shlex.quote(sys.argv[1]))
 PY
 )"
-  # Create the tmux identity before starting the worker. This prevents a new
-  # protocol attempt from running without a durable receipt for later control.
-  tmux new-session -d -s "${TMUX_SESSION}" "sleep 2147483647"
+  # Create the parked session and its identity receipt as one lifecycle
+  # transaction before starting the worker.
   set +e
-  TMUX_RECEIPT_ERROR="$(python3 "${SCRIPT_DIR}/tmux_lifecycle.py" record \
+  TMUX_RECEIPT_ERROR="$(python3 "${TMUX_LIFECYCLE_CLI}" create \
     --output "${ATTEMPT_DIR}/runtime/TMUX_SESSION.json" \
     --run-id "${RUN_ID}" \
     --task-id "${TASK_ID}" \
@@ -171,18 +270,41 @@ PY
   TMUX_RECEIPT_CODE=$?
   set -e
   if [[ "${TMUX_RECEIPT_CODE}" -ne 0 ]]; then
-    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+    TMUX_STARTUP_CLEANUP_STATUS="already_absent"
+    if [[ "${TMUX_RECEIPT_CODE}" -eq 3 ]]; then
+      TMUX_STARTUP_CLEANUP_STATUS="verification_failed"
+      TMUX_SESSION_CLEANUP_FAILED=1
+    fi
+    TMUX_STARTUP_CLEANUP_PAYLOAD="$(python3 - \
+      "${TMUX_STARTUP_CLEANUP_STATUS}" \
+      "${TMUX_RECEIPT_ERROR:-tmux session creation failed}" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "policy": "cleanup_on_exit",
+    "status": sys.argv[1],
+    "reason": sys.argv[2],
+}))
+PY
+)"
+    set +e
+    record_tmux_cleanup_payload "${TMUX_STARTUP_CLEANUP_PAYLOAD}"
+    TMUX_STARTUP_RECORD_CODE=$?
+    set -e
+    if [[ "${TMUX_STARTUP_RECORD_CODE}" -ne 0 ]]; then
+      TMUX_SESSION_CLEANUP_FAILED=1
+    fi
     set +e
     write_tmux_identity_startup_failure "${TMUX_RECEIPT_ERROR:-tmux identity receipt could not be persisted}"
     set -e
     return 125
   fi
+  TMUX_IDENTITY_READY=1
   TMUX_SESSION_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["session_id"])' "${ATTEMPT_DIR}/runtime/TMUX_SESSION.json")"
   if [[ "${PROMPT_TRANSPORT}" != "stdin" ]]; then
     tmux pipe-pane -o -t "${TMUX_SESSION_ID}" "cat >> '${TRANSCRIPT_PATH}'" || true
   fi
   if ! tmux respawn-pane -k -t "${TMUX_SESSION_ID}" "${TMUX_COMMAND}"; then
-    tmux kill-session -t "${TMUX_SESSION_ID}" 2>/dev/null || true
     set +e
     write_tmux_identity_startup_failure "tmux could not start the worker in the receipt-bound session"
     set -e
@@ -194,7 +316,7 @@ PY
     STARTUP_PROBE_MARKER="${ATTEMPT_DIR}/runtime/human-startup-probed"
     if [[ "${RDO_IO_MODE}" == "human" && ! -f "${STARTUP_PROBE_MARKER}" ]]; then
       PANE_SNAPSHOT="${ATTEMPT_DIR}/runtime/startup-pane.txt"
-      tmux capture-pane -p -t "${TMUX_SESSION}" > "${PANE_SNAPSHOT}" 2>/dev/null || true
+      tmux capture-pane -p -t "${TMUX_SESSION_ID}" > "${PANE_SNAPSHOT}" 2>/dev/null || true
       set +e
       python3 "${SCRIPT_DIR}/human_startup_probe.py" \
         --startup-path "${ATTEMPT_DIR}/runtime/STARTUP.json" \
@@ -217,9 +339,11 @@ PY
           PROCESS_CLEANUP_FAILED=1
           exit 6
         fi
-        tmux send-keys -t "${TMUX_SESSION}" C-c 2>/dev/null || true
+        tmux send-keys -t "${TMUX_SESSION_ID}" C-c 2>/dev/null || true
         sleep 0.2
-        tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+        if ! cleanup_tmux_session "cleanup_on_exit"; then
+          exit 6
+        fi
         if [[ ! -f "${EXIT_CODE_FILE}" ]]; then
           printf '125\n' > "${EXIT_CODE_FILE}.tmp"
           mv "${EXIT_CODE_FILE}.tmp" "${EXIT_CODE_FILE}"
@@ -229,29 +353,14 @@ PY
     if [[ "${RDO_TMUX_WAIT_TIMEOUT_SECONDS}" != "0" ]]; then
       NOW="$(date +%s)"
       if (( NOW - WAIT_START >= RDO_TMUX_WAIT_TIMEOUT_SECONDS )); then
-        python3 - "${ATTEMPT_DIR}/runtime/DISPATCH_TIMEOUT.json" <<'PY'
-import json
-import os
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-payload = dict(
-    reason="tmux_wait_timeout",
-    exit_code=124,
-    timed_out=True,
-    timeout_source="dispatcher_tmux_wait",
-)
-temporary = path.with_suffix(path.suffix + ".tmp")
-temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-os.replace(temporary, path)
-PY
-        write_tmux_timeout_diagnostics
-        exit 5
+        cancel_tmux_wait "tmux_wait_timeout"
       fi
     fi
     sleep 1
   done
+  if ! supervisor_result_readable && ! tmux has-session -t "${TMUX_SESSION_ID}" 2>/dev/null; then
+    cancel_tmux_wait "tmux_session_disappeared"
+  fi
   if [[ "${RDO_IO_MODE}" == "human" && -f "${TRANSCRIPT_PATH}" ]]; then
     set +e
     python3 "${SCRIPT_DIR}/human_startup_probe.py" \
@@ -261,9 +370,6 @@ PY
     set -e
   fi
   EXIT_CODE_RAW="$(cat "${EXIT_CODE_FILE}" 2>/dev/null || true)"
-  if [[ "${RDO_TMUX_KEEP_SESSION}" != "1" ]]; then
-    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
-  fi
   if [[ "${EXIT_CODE_RAW}" =~ ^[0-9]+$ ]]; then
     EXIT_CODE="${EXIT_CODE_RAW}"
   else
@@ -298,12 +404,17 @@ on_exit() {
   local reconcile_code=0
   local cleanup_code=0
   if [[ "${code}" -eq 0 && \
+        "${PROCESS_CLEANUP_REQUIRED}" != "1" && \
         "${PROCESS_CLEANUP_FAILED}" != "1" && \
-        "${SUPERVISOR_CLEANUP_FAILED}" != "1" ]]; then
+        "${SUPERVISOR_CLEANUP_FAILED}" != "1" && \
+        "${TMUX_SESSION_CLEANUP_FAILED}" != "1" && \
+        ( "${RDO_RUNTIME_BACKEND:-}" != "tmux" || \
+          "${TMUX_CLEANUP_RECORDED}" == "1" ) ]]; then
     release_dispatch_lock
     return 0
   fi
-  if [[ "${PROCESS_CLEANUP_FAILED}" == "1" || \
+  if [[ "${PROCESS_CLEANUP_REQUIRED}" == "1" || \
+        "${PROCESS_CLEANUP_FAILED}" == "1" || \
         ( "${RDO_RUNTIME_BACKEND:-}" == "tmux" && \
           "${TMUX_WORKER_LAUNCHED}" == "1" && \
           ( -z "${EXIT_CODE_FILE:-}" || ! -f "${EXIT_CODE_FILE}" ) ) ]]; then
@@ -314,14 +425,20 @@ on_exit() {
     if [[ "${cleanup_code}" -ne 0 ]]; then
       PROCESS_CLEANUP_FAILED=1
     else
+      PROCESS_CLEANUP_REQUIRED=0
       PROCESS_CLEANUP_FAILED=0
     fi
   fi
-  if [[ "${RDO_RUNTIME_BACKEND:-}" == "tmux" && -n "${TMUX_SESSION:-}" ]] && \
-     tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
-    tmux send-keys -t "${TMUX_SESSION}" C-c 2>/dev/null || true
-    sleep 0.2
-    tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+  if [[ "${RDO_RUNTIME_BACKEND:-}" == "tmux" && \
+        "${TMUX_IDENTITY_READY}" == "1" && \
+        "${TMUX_SESSION_CLEANUP_FAILED}" != "1" ]]; then
+    set +e
+    cleanup_tmux_session "cleanup_on_exit"
+    cleanup_code=$?
+    set -e
+    if [[ "${cleanup_code}" -ne 0 ]]; then
+      TMUX_SESSION_CLEANUP_FAILED=1
+    fi
   fi
   if [[ -n "${ATTEMPT_ID:-}" && -n "${ATTEMPT_DIR:-}" && \
         -d "${ATTEMPT_DIR}" && -f "${STATUS_PATH}" ]]; then
@@ -343,7 +460,8 @@ on_exit() {
     set -e
     if [[ "${reconcile_code}" -ne 0 || \
           "${PROCESS_CLEANUP_FAILED}" == "1" || \
-          "${SUPERVISOR_CLEANUP_FAILED}" == "1" ]]; then
+          "${SUPERVISOR_CLEANUP_FAILED}" == "1" || \
+          "${TMUX_SESSION_CLEANUP_FAILED}" == "1" ]]; then
       KEEP_DISPATCH_LOCK_ON_EXIT=1
     else
       KEEP_DISPATCH_LOCK_ON_EXIT=0
@@ -396,6 +514,8 @@ eval "${CONFIG_ENV}"
 : "${RDO_WORKER_ID:=}"
 : "${RDO_EXECUTION_MODE:=auto}"
 : "${RDO_WORKER_BACKEND:=${CONFIG_RDO_WORKER_BACKEND}}"
+: "${RDO_WORKER_MODEL:=${CONFIG_RDO_WORKER_MODEL}}"
+: "${RDO_WORKER_REASONING_EFFORT:=${CONFIG_RDO_WORKER_REASONING_EFFORT}}"
 : "${RDO_PERMISSION_MODE:=${CONFIG_RDO_PERMISSION_MODE}}"
 : "${RDO_RUNTIME_BACKEND:=${CONFIG_RDO_RUNTIME_BACKEND}}"
 : "${RDO_IO_MODE:=${CONFIG_RDO_IO_MODE}}"
@@ -591,6 +711,10 @@ if [[ -n "${RDO_WORKER_COMMAND}" && "${RDO_TEST_ALLOW_UNGOVERNED_COMMAND_OVERRID
   echo "worker.command overrides do not provide a registered startup-event contract; use the registered backend command" >&2
   exit 2
 fi
+if [[ -n "${RDO_WORKER_COMMAND}" && ( -n "${RDO_WORKER_MODEL}" || -n "${RDO_WORKER_REASONING_EFFORT}" ) ]]; then
+  echo "model selection cannot be guaranteed for a worker.command override" >&2
+  exit 2
+fi
 
 ATTEMPT_SEQ="$(find "${TASK_DIR}/attempts" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
 ATTEMPT_NUM="$(printf "%03d" "$((ATTEMPT_SEQ + 1))")"
@@ -617,22 +741,6 @@ if [[ "${TASK_BUDGET_CODE}" -ne 0 ]]; then
 fi
 TASK_BUDGET_ENABLED="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1]).get("enabled") else "0")' "${TASK_BUDGET_ASSESSMENT}")"
 ATTEMPT_TIMEOUT_SECONDS="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["admission"]["attempt_wall_seconds"] or sys.argv[2])' "${TASK_BUDGET_ASSESSMENT}" "${ATTEMPT_POLICY_TIMEOUT_SECONDS}")"
-
-BACKEND_PROFILE_COMPILE_ARGS=(
-  compile
-  --repo-root "${REPO_ROOT}"
-  --task-dir "${TASK_DIR}"
-  --backend "${RDO_WORKER_BACKEND}"
-  --phase "${RDO_ATTEMPT_PHASE}"
-  --io-mode "${RDO_IO_MODE}"
-)
-if [[ -n "${STRATEGY_PATH}" ]]; then
-  BACKEND_PROFILE_COMPILE_ARGS+=(--strategy "${STRATEGY_PATH}")
-fi
-if [[ "${TASK_BUDGET_ENABLED}" == "1" ]]; then
-  BACKEND_PROFILE_COMPILE_ARGS+=(--task-budget-json "${TASK_BUDGET_ASSESSMENT}")
-fi
-BACKEND_PROFILE_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" "${BACKEND_PROFILE_COMPILE_ARGS[@]}")" || exit 2
 
 WORKER_CONTEXT="$(python3 - "${STATUS_PATH}" "${RDO_WORKER_BACKEND}" <<'PY'
 import json, sys
@@ -675,23 +783,98 @@ if [[ "${RDO_EXECUTION_MODE}" == "auto" ]]; then
   fi
 fi
 case "${RDO_EXECUTION_MODE}" in
-  start|resume|replace) ;;
-  *) echo "RDO_EXECUTION_MODE must be start, resume, or replace" >&2; exit 2 ;;
+  start|resume|replace|restart) ;;
+  *) echo "RDO_EXECUTION_MODE must be start, resume, replace, or restart" >&2; exit 2 ;;
 esac
 if [[ "${RDO_EXECUTION_MODE}" == "resume" && -z "${RDO_BACKEND_SESSION_ID}" ]]; then
   echo "resume requires a backend session id" >&2
   exit 2
 fi
+WORKSPACE_CONTEXT="$(python3 - "${STATUS_PATH}" <<'PY'
+import json, sys
+status = json.load(open(sys.argv[1], encoding="utf-8"))
+print(json.dumps({
+    "branch": status.get("branch") or "",
+    "root_branch": status.get("task_branch_root") or status.get("branch") or "",
+    "worktree": status.get("worktree") or "",
+    "state": status.get("state") or "",
+}))
+PY
+)"
+CURRENT_BRANCH="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["branch"])' "${WORKSPACE_CONTEXT}")"
+CURRENT_WORKTREE_REL="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["worktree"])' "${WORKSPACE_CONTEXT}")"
+PLANNED_BRANCH="${CURRENT_BRANCH}"
+PLANNED_WORKTREE_REL="${CURRENT_WORKTREE_REL}"
+if [[ "${RDO_EXECUTION_MODE}" == "restart" ]]; then
+  if [[ "${TASK_ARTIFACT_PROTOCOL_VERSION}" != "2" ]]; then
+    echo "clean restart requires artifact protocol v2" >&2
+    exit 2
+  fi
+  if [[ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["state"])' "${WORKSPACE_CONTEXT}")" != "blocked" ]]; then
+    echo "clean restart requires a blocked task" >&2
+    exit 2
+  fi
+  ROOT_BRANCH="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["root_branch"])' "${WORKSPACE_CONTEXT}")"
+  PLANNED_BRANCH="${ROOT_BRANCH}-restart-${ATTEMPT_ID}"
+  PLANNED_WORKTREE_REL="${CONFIG_RDO_WORKTREE_ROOT%/}/${TASK_ID}--${ATTEMPT_ID}"
+  RDO_BACKEND_SESSION_ID=""
+fi
+
+BACKEND_PROFILE_COMPILE_ARGS=(
+  compile
+  --repo-root "${REPO_ROOT}"
+  --task-dir "${TASK_DIR}"
+  --backend "${RDO_WORKER_BACKEND}"
+  --phase "${RDO_ATTEMPT_PHASE}"
+  --io-mode "${RDO_IO_MODE}"
+  --model "${RDO_WORKER_MODEL}"
+  --reasoning-effort "${RDO_WORKER_REASONING_EFFORT}"
+  --worktree "${PLANNED_WORKTREE_REL}"
+)
+if [[ -n "${STRATEGY_PATH}" ]]; then
+  BACKEND_PROFILE_COMPILE_ARGS+=(--strategy "${STRATEGY_PATH}")
+fi
+if [[ "${TASK_BUDGET_ENABLED}" == "1" ]]; then
+  BACKEND_PROFILE_COMPILE_ARGS+=(--task-budget-json "${TASK_BUDGET_ASSESSMENT}")
+fi
+BACKEND_PROFILE_JSON="$(python3 "${BACKEND_GOVERNANCE_CLI}" "${BACKEND_PROFILE_COMPILE_ARGS[@]}")" || exit 2
+
 REQUESTED_EXECUTION_MODE="${RDO_EXECUTION_MODE}"
 REQUESTED_SESSION_ID="${RDO_BACKEND_SESSION_ID}"
 RESUME_FALLBACK_REASON=""
+set +e
 PREFLIGHT_JSON="$(python3 "${BACKEND_PREFLIGHT}" \
   --backend "${RDO_WORKER_BACKEND}" \
   --command "${RDO_WORKER_COMMAND}" \
   --execution-mode "${REQUESTED_EXECUTION_MODE}" \
   --session-id "${REQUESTED_SESSION_ID}" \
   --cwd "${REPO_ROOT}" \
-  --io-mode "${RDO_IO_MODE}")" || exit 2
+  --io-mode "${RDO_IO_MODE}" \
+  --runtime-backend "${RDO_RUNTIME_BACKEND}")"
+PREFLIGHT_CODE=$?
+set -e
+if [[ "${PREFLIGHT_CODE}" -ne 0 ]]; then
+  PREFLIGHT_DETAIL="$(python3 -c '
+import json, sys
+try:
+    errors = json.loads(sys.argv[1]).get("errors", [])
+except (json.JSONDecodeError, AttributeError):
+    errors = []
+print("; ".join(str(item) for item in errors if item) or "backend or runtime preflight failed")
+' "${PREFLIGHT_JSON}" 2>/dev/null || true)"
+  python3 "${PROTOCOL_CLI}" append-event \
+    --run-dir "${RUN_DIR}" \
+    --run-id "${RUN_ID}" \
+    --task-id "${TASK_ID}" \
+    --event-name "dispatch_preflight_failed" \
+    --agent-name "${RDO_WORKER_AGENT_NAME}" \
+    --worker-backend "${RDO_WORKER_BACKEND}" \
+    --runtime-backend "${RDO_RUNTIME_BACKEND}" \
+    --execution-mode "${REQUESTED_EXECUTION_MODE}" \
+    --status-path "${STATUS_PATH}" \
+    --detail "${PREFLIGHT_DETAIL:-backend or runtime preflight failed}" || true
+  exit "${PREFLIGHT_CODE}"
+fi
 RESUME_FALLBACK_REQUIRED="$(python3 -c '
 import json, sys
 print("1" if json.loads(sys.argv[1]).get("resume", {}).get("fallback_required") else "0")
@@ -806,6 +989,23 @@ else
   mkdir -p "${ATTEMPT_DIR}"
 fi
 
+if [[ "${RDO_EXECUTION_MODE}" == "restart" ]]; then
+  python3 "${CLEAN_RESTART_CLI}" \
+    --repo-root "${REPO_ROOT}" \
+    --task-dir "${TASK_DIR}" \
+    --attempt-id "${ATTEMPT_ID}" \
+    --task-base-commit "${TASK_BASE_COMMIT}" \
+    --new-branch "${PLANNED_BRANCH}" \
+    --new-worktree "${PLANNED_WORKTREE_REL}" >/dev/null || exit 2
+  BRANCH="${PLANNED_BRANCH}"
+  WORKTREE_REL="${PLANNED_WORKTREE_REL}"
+  if [[ "${WORKTREE_REL}" = /* ]]; then
+    WORKTREE_PATH="${WORKTREE_REL}"
+  else
+    WORKTREE_PATH="${REPO_ROOT}/${WORKTREE_REL}"
+  fi
+fi
+
 if [[ "${TASK_BUDGET_ENABLED}" == "1" ]]; then
   TASK_BUDGET_RESULT="$(python3 "${TASK_BUDGET_CLI}" freeze \
     --attempt-dir "${ATTEMPT_DIR}" \
@@ -881,6 +1081,8 @@ elif [[ -n "${RESUME_FALLBACK_REASON}" ]]; then
   render_dispatch_prompt "full" "preflight_resume_fallback:${RESUME_FALLBACK_REASON}"
 elif [[ "${RDO_EXECUTION_MODE}" == "replace" ]]; then
   render_dispatch_prompt "full" "backend_replacement_session"
+elif [[ "${RDO_EXECUTION_MODE}" == "restart" ]]; then
+  render_dispatch_prompt "full" "clean_task_workspace_restart"
 else
   render_dispatch_prompt "full" "new_backend_session"
 fi
@@ -1104,6 +1306,8 @@ python3 "${PROTOCOL_CLI}" create-attempt \
   --parent-attempt-id "${PARENT_ATTEMPT_ID}" \
   --session-id "${RDO_BACKEND_SESSION_ID}" \
   --worker-backend "${RDO_WORKER_BACKEND}" \
+  --model "${RDO_WORKER_MODEL}" \
+  --reasoning-effort "${RDO_WORKER_REASONING_EFFORT}" \
   --execution-mode "${RDO_EXECUTION_MODE}" \
   --requested-execution-mode "${REQUESTED_EXECUTION_MODE}" \
   --requested-session-id "${REQUESTED_SESSION_ID}" \
@@ -1306,7 +1510,10 @@ PY
           "${ATTEMPT_DIR}/runtime/RESUME_SUPERVISOR_FAILURE.json"
         [[ ! -f "${TRANSCRIPT_PATH}" ]] || cp "${TRANSCRIPT_PATH}" \
           "${ATTEMPT_DIR}/runtime/resume-failure-transcript.log"
-        tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+        if ! cleanup_tmux_session "cleanup_on_exit"; then
+          echo "receipt-bound tmux cleanup failed before resume fallback" >&2
+          exit 7
+        fi
         FALLBACK_SESSION_ID=""
         if [[ "${RDO_WORKER_BACKEND}" == "claude-code" ]]; then
           FALLBACK_SESSION_ID="${REQUESTED_SESSION_ID}"
@@ -1380,6 +1587,15 @@ PY
         RDO_WORKER_COMMAND="${FALLBACK_WORKER_COMMAND}"
         run_tmux_worker_once
       fi
+    fi
+    if [[ "${RDO_TMUX_KEEP_SESSION}" == "1" ]]; then
+      TMUX_CLEANUP_POLICY="retain"
+    else
+      TMUX_CLEANUP_POLICY="cleanup_on_exit"
+    fi
+    if ! cleanup_tmux_session "${TMUX_CLEANUP_POLICY}"; then
+      echo "receipt-bound tmux cleanup failed" >&2
+      exit 7
     fi
   fi
   {

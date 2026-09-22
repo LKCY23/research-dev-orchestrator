@@ -313,7 +313,7 @@ def main() -> int:
     parser.add_argument("--permission-mode", choices=["default", "auto"], required=True)
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--prompt", required=True)
-    parser.add_argument("--execution-mode", choices=["start", "resume", "replace"], default="start")
+    parser.add_argument("--execution-mode", choices=["start", "resume", "replace", "restart"], default="start")
     parser.add_argument("--session-id", default="")
     args = parser.parse_args()
 

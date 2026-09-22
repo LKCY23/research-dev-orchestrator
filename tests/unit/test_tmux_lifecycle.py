@@ -9,16 +9,59 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import rdo
+import protocol_cli
 from tmux_lifecycle import (
     TmuxLifecycleError,
     build_tmux_inventory,
+    cleanup_attempt_tmux_session,
+    create_tmux_session_with_receipt,
     kill_live_tmux_session,
+    inspect_live_tmux_session,
     list_live_tmux_sessions,
+    preflight_tmux_runtime,
     record_tmux_session_identity,
 )
 
 
 class TmuxLifecycleTests(unittest.TestCase):
+    @patch("tmux_lifecycle.subprocess.run")
+    def test_runtime_preflight_proves_create_inspect_and_cleanup(self, run) -> None:
+        identity = "$1\t17\trdo-preflight-1-token\n"
+        run.side_effect = [
+            __import__("subprocess").CompletedProcess([], 0, "", ""),
+            __import__("subprocess").CompletedProcess([], 0, identity, ""),
+            __import__("subprocess").CompletedProcess([], 0, identity, ""),
+            __import__("subprocess").CompletedProcess([], 0, "", ""),
+            __import__("subprocess").CompletedProcess([], 1, "", "can't find session"),
+            __import__("subprocess").CompletedProcess([], 1, "", "can't find session"),
+            __import__("subprocess").CompletedProcess([], 1, "", "can't find session"),
+        ]
+        with patch("tmux_lifecycle.os.getpid", return_value=1), patch(
+            "tmux_lifecycle.secrets.token_hex", return_value="token"
+        ):
+            result = preflight_tmux_runtime()
+
+        self.assertTrue(result["session_create"])
+        self.assertTrue(result["session_inspect"])
+        self.assertTrue(result["session_cleanup"])
+
+    @patch("tmux_lifecycle.subprocess.run")
+    def test_runtime_preflight_rejects_tmux_socket_failure(self, run) -> None:
+        run.return_value = __import__("subprocess").CompletedProcess(
+            [], 1, "", "permission denied"
+        )
+
+        with self.assertRaisesRegex(TmuxLifecycleError, "permission denied"):
+            preflight_tmux_runtime()
+
+    @patch("tmux_lifecycle.subprocess.run")
+    def test_inspect_treats_empty_success_response_as_absent(self, run) -> None:
+        run.return_value = __import__("subprocess").CompletedProcess(
+            [], 0, "\t\t\n", ""
+        )
+
+        self.assertIsNone(inspect_live_tmux_session("$1"))
+
     def write_task(
         self,
         root: Path,
@@ -228,7 +271,8 @@ class TmuxLifecycleTests(unittest.TestCase):
     def test_kill_revalidates_stable_tmux_identity_and_uses_session_id(self):
         expected = self.live("$7", "rdo-clean", 7)
         with patch(
-            "tmux_lifecycle.inspect_live_tmux_session", return_value=expected
+            "tmux_lifecycle.inspect_live_tmux_session",
+            side_effect=[expected, None],
         ), patch(
             "tmux_lifecycle.subprocess.run",
             return_value=SimpleNamespace(returncode=0, stderr=""),
@@ -244,7 +288,7 @@ class TmuxLifecycleTests(unittest.TestCase):
             "tmux_lifecycle.inspect_live_tmux_session", return_value=changed
         ), patch("tmux_lifecycle.subprocess.run") as run:
             result = kill_live_tmux_session(expected)
-        self.assertEqual("identity_changed", result["status"])
+        self.assertEqual("identity_mismatch", result["status"])
         run.assert_not_called()
 
     def test_prune_cli_kills_only_prunable_rows_and_reports_failures(self):
@@ -289,7 +333,11 @@ class TmuxLifecycleTests(unittest.TestCase):
 
         with patch("rdo._tmux_inventory", return_value=inventory), patch(
             "rdo.kill_live_tmux_session",
-            return_value={"status": "identity_changed", "reason": "changed"},
+            return_value={
+                "policy": "cleanup_on_exit",
+                "status": "identity_mismatch",
+                "reason": "changed",
+            },
         ), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(1, rdo.tmux_prune(args))
 
@@ -335,6 +383,124 @@ class TmuxLifecycleTests(unittest.TestCase):
                 )
             self.assertEqual(payload, json.loads(output.read_text(encoding="utf-8")))
             self.assertFalse(output.with_suffix(".json.tmp").exists())
+
+    @patch("tmux_lifecycle.subprocess.run")
+    def test_create_returns_and_records_tmux_identity_atomically(self, run) -> None:
+        run.return_value = __import__("subprocess").CompletedProcess(
+            [], 0, "$5\t5\trdo-created\n", ""
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "runtime" / "TMUX_SESSION.json"
+            payload = create_tmux_session_with_receipt(
+                output,
+                run_id="run-1",
+                task_id="T001",
+                attempt_id="A001",
+                session_name="rdo-created",
+                command="sleep 30",
+            )
+            self.assertEqual("$5", payload["session_id"])
+            self.assertEqual(payload, json.loads(output.read_text(encoding="utf-8")))
+        self.assertEqual(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{session_id}\t#{session_created}\t#{session_name}",
+                "-s",
+                "rdo-created",
+                "sleep 30",
+            ],
+            run.call_args.args[0],
+        )
+
+    def test_attempt_cleanup_uses_one_leaf_status_for_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt = Path(temporary)
+            runtime = attempt / "runtime"
+            runtime.mkdir()
+            expected = self.live("$5", "rdo-retained", 5)
+            (runtime / "TMUX_SESSION.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "run_id": "run-1",
+                        "task_id": "T001",
+                        "attempt_id": "A001",
+                        **expected,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "tmux_lifecycle.inspect_live_tmux_session",
+                return_value=expected,
+            ):
+                result = cleanup_attempt_tmux_session(
+                    attempt,
+                    run_id="run-1",
+                    task_id="T001",
+                    attempt_id="A001",
+                    session_name="rdo-retained",
+                    policy="retain",
+                )
+        self.assertEqual(
+            {
+                "policy": "retain",
+                "status": "retained_by_policy",
+                "reason": None,
+            },
+            result,
+        )
+
+    def test_protocol_records_one_tmux_cleanup_leaf_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt_path = Path(temporary) / "ATTEMPT.json"
+            attempt_path.write_text(
+                json.dumps({"runtime": {"backend": "tmux"}}),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                attempt_path=str(attempt_path),
+                payload_json=json.dumps(
+                    {
+                        "policy": "cleanup_on_exit",
+                        "status": "already_absent",
+                        "reason": None,
+                    }
+                ),
+            )
+            self.assertEqual(0, protocol_cli.cmd_record_tmux_cleanup(args))
+            payload = json.loads(attempt_path.read_text(encoding="utf-8"))
+        cleanup = payload["runtime"]["tmux_cleanup"]
+        self.assertEqual("cleanup_on_exit", cleanup["policy"])
+        self.assertEqual("already_absent", cleanup["status"])
+        self.assertNotIn("outcome", cleanup)
+        self.assertNotIn("result", cleanup)
+
+    def test_protocol_rejects_incompatible_tmux_cleanup_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            attempt_path = Path(temporary) / "ATTEMPT.json"
+            attempt_path.write_text(
+                json.dumps({"runtime": {"backend": "tmux"}}),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                attempt_path=str(attempt_path),
+                payload_json=json.dumps(
+                    {
+                        "policy": "cleanup_on_exit",
+                        "status": "retained_by_policy",
+                        "reason": None,
+                    }
+                ),
+            )
+            with self.assertRaisesRegex(
+                SystemExit, "retained_by_policy requires policy=retain"
+            ):
+                protocol_cli.cmd_record_tmux_cleanup(args)
 
     def test_prune_parser_requires_explicit_terminal_flag(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

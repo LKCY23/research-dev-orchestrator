@@ -64,7 +64,7 @@ def build_resume_context(
         if not metadata_path.exists():
             raise ResumeContextError(f"resume source attempt does not exist: {source_attempt_id}")
         metadata = load_json(metadata_path)
-        if metadata.get("state") not in {"completed", "invalid_handoff"}:
+        if metadata.get("state") not in {"completed", "invalid_handoff", "terminated"}:
             raise ResumeContextError(f"resume source attempt is not terminal: {source_attempt_id}")
         source_workflow = resume["from_workflow"]
         records = workflow_records(source_attempt)

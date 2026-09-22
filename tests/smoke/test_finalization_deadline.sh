@@ -42,14 +42,14 @@ prompt="\$(mktemp)"
 cat > "\${prompt}"
 ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
 printf 'completed before finalization\\n' > file.txt
-python3 "${RDO_ROOT}/scripts/rdo.py" finalization begin \
-  --attempt-dir "\${ATTEMPT_DIR}" >/dev/null
+git add file.txt
+git commit -m "commit checked candidate" >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" check \
   --attempt-dir "\${ATTEMPT_DIR}" \
   --check-id smoke >/dev/null
+python3 "${RDO_ROOT}/scripts/rdo.py" finalization begin \
+  --attempt-dir "\${ATTEMPT_DIR}" >/dev/null
 sleep 2.1
-git add file.txt
-git commit -m "commit during finalize-only grace" >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
   --attempt-dir "\${ATTEMPT_DIR}" \
   --state verified \
@@ -106,14 +106,15 @@ set -euo pipefail
 prompt="\$(mktemp)"
 cat > "\${prompt}"
 ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
-python3 "${RDO_ROOT}/scripts/rdo.py" finalization begin \
-  --attempt-dir "\${ATTEMPT_DIR}" >/dev/null
+printf 'recoverable committed work\\n' > file.txt
+git add file.txt
+git commit -m "recoverable checked work" >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" check \
   --attempt-dir "\${ATTEMPT_DIR}" \
   --check-id smoke >/dev/null
-printf 'recoverable committed work\\n' > file.txt
-git add file.txt
-git commit -m "recoverable work after finalization entry" >/dev/null
+python3 "${RDO_ROOT}/scripts/rdo.py" finalization begin \
+  --attempt-dir "\${ATTEMPT_DIR}" >/dev/null
+git commit --allow-empty -m "illegal commit during finalize-only grace" >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
   --attempt-dir "\${ATTEMPT_DIR}" \
   --state verified \
@@ -159,11 +160,11 @@ prompt="\$(mktemp)"
 cat > "\${prompt}"
 ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
 test "\$(cat file.txt)" = "recoverable committed work"
-python3 "${RDO_ROOT}/scripts/rdo.py" finalization begin \
-  --attempt-dir "\${ATTEMPT_DIR}" >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" check \
   --attempt-dir "\${ATTEMPT_DIR}" \
   --check-id smoke >/dev/null
+python3 "${RDO_ROOT}/scripts/rdo.py" finalization begin \
+  --attempt-dir "\${ATTEMPT_DIR}" >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" finalize \
   --attempt-dir "\${ATTEMPT_DIR}" \
   --state verified \
@@ -213,7 +214,7 @@ python3 "${RDO_ROOT}/scripts/create_task.py" \
   --allowed-paths file.txt >/dev/null
 complete_task_contract timeout-run T003-timeout timeout
 timeout_task="${timeout_repo}/.agent-collab/runs/timeout-run/tasks/T003-timeout"
-set_attempt_timeout "${timeout_task}/EXECUTION_POLICY.json" 1
+set_attempt_timeout "${timeout_task}/EXECUTION_POLICY.json" 3
 late_sentinel="${timeout_repo}/late-descendant.txt"
 
 timeout_worker="${timeout_repo}/timeout-worker.sh"
@@ -223,6 +224,9 @@ set -euo pipefail
 prompt="\$(mktemp)"
 cat > "\${prompt}"
 ATTEMPT_DIR="\$(awk -F': ' '/^- ATTEMPT_DIR:/ {print \$2}' "\${prompt}")"
+python3 "${RDO_ROOT}/scripts/rdo.py" check \
+  --attempt-dir "\${ATTEMPT_DIR}" \
+  --check-id smoke >/dev/null
 python3 "${RDO_ROOT}/scripts/rdo.py" finalization begin \
   --attempt-dir "\${ATTEMPT_DIR}" >/dev/null
 python3 - "${late_sentinel}" <<'PY'

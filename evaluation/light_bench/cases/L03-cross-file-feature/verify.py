@@ -30,6 +30,7 @@ def main() -> int:
     sys.path.insert(0, str(root / "src"))
     from miniqueue import (
         InvalidJobError,
+        InvalidStateTransitionError,
         JobState,
         JsonStore,
         ManualClock,
@@ -50,16 +51,16 @@ def main() -> int:
             or cancelled.completed_at != 42
             or cancelled.attempts != 0
         ):
-            return fail(f"invalid cancellation result: {cancelled!r}")
+            return fail(f"[A086/A094/A095] invalid cancellation result: {cancelled!r}")
         reloaded = Queue(JsonStore(path), clock=clock).get("job")
         if reloaded.state is not JobState.CANCELLED:
-            return fail("cancelled state did not survive JSON reload")
+            return fail("[A091] cancelled state did not survive JSON reload")
         repeated = queue.cancel("job", reason="ignored on idempotent repeat")
         if repeated.to_dict() != cancelled.to_dict():
-            return fail("repeated cancellation must return unchanged terminal job")
+            return fail("[A087] repeated cancellation must return unchanged terminal job")
         stats = queue.stats()
         if stats.cancelled != 1 or stats.total != 1:
-            return fail(f"cancelled stats are incorrect: {stats!r}")
+            return fail(f"[A092/A093] cancelled stats are incorrect: {stats!r}")
         handled: list[str] = []
         scheduler = Scheduler(
             queue,
@@ -67,9 +68,13 @@ def main() -> int:
             worker_id="worker",
         )
         if scheduler.run_once().status != "idle" or handled:
-            return fail("cancelled work was dispatched")
+            return fail("[A084] cancelled work was dispatched")
 
-    for terminal_kind in ("leased", "succeeded", "dead"):
+    for terminal_kind, requirement_id in (
+        ("leased", "A088"),
+        ("succeeded", "A089"),
+        ("dead", "A090"),
+    ):
         clock = ManualClock(10)
         queue = Queue(clock=clock)
         queue.enqueue(
@@ -83,12 +88,20 @@ def main() -> int:
         before = queue.get("job").to_dict()
         try:
             queue.cancel("job")
-        except InvalidJobError:
+        except InvalidStateTransitionError:
             pass
+        except Exception as exc:
+            return fail(
+                f"[{requirement_id}] {terminal_kind} job cancellation raised "
+                f"{type(exc).__name__}, expected InvalidStateTransitionError"
+            )
         else:
-            return fail(f"{terminal_kind} job cancellation must be rejected")
+            return fail(
+                f"[{requirement_id}] {terminal_kind} job cancellation must raise "
+                "InvalidStateTransitionError"
+            )
         if queue.get("job").to_dict() != before:
-            return fail(f"rejected {terminal_kind} cancellation mutated the job")
+            return fail(f"[{requirement_id}] rejected {terminal_kind} cancellation mutated the job")
 
     blank_queue = Queue(clock=ManualClock())
     blank_queue.enqueue({"kind": "work"}, job_id="blank")
@@ -97,7 +110,7 @@ def main() -> int:
     except InvalidJobError:
         pass
     else:
-        return fail("blank cancellation reason must be rejected")
+        return fail("[A096] blank cancellation reason must raise InvalidJobError")
     print("L03 verifier passed")
     return 0
 

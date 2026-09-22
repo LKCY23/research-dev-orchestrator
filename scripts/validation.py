@@ -251,6 +251,13 @@ def validate_runtime_backend(runtime: Any, task_name: str) -> tuple[list[str], d
             if not is_non_empty_string(runtime.get(field)):
                 violations.append(f"{task_name}: ATTEMPT.runtime.{field} is required for tmux backend")
 
+    for field in ("model", "reasoning_effort"):
+        value = runtime.get(field)
+        if value is not None and not is_non_empty_string(value):
+            violations.append(
+                f"{task_name}: ATTEMPT.runtime.{field} must be null or a non-empty string"
+            )
+
     return violations, runtime
 
 
@@ -314,7 +321,7 @@ def validate_attempt_schema(
     violations.extend(runtime_violations)
 
     attempt_state = attempt.get("state")
-    if attempt_state in {"completed", "invalid_handoff"}:
+    if attempt_state in {"completed", "invalid_handoff", "terminated"}:
         if not attempt.get("ended_at"):
             violations.append(f"{task_name}: ATTEMPT.state {attempt_state} requires ended_at")
     if attempt_state == "completed":
@@ -323,6 +330,8 @@ def validate_attempt_schema(
     if attempt_state == "invalid_handoff":
         if attempt.get("exit_code") is not None and not is_int_not_bool(attempt.get("exit_code")):
             violations.append(f"{task_name}: invalid_handoff ATTEMPT requires exit_code integer or null")
+    if attempt_state == "terminated" and attempt.get("exit_code") is not None:
+        violations.append(f"{task_name}: terminated ATTEMPT requires exit_code=null")
     if attempt_state in {"created", "running"}:
         if attempt.get("ended_at") is not None:
             violations.append(f"{task_name}: ATTEMPT.state {attempt_state} requires ended_at=null")
@@ -336,6 +345,16 @@ def validate_attempt_schema(
     if attempt_state == "invalid_handoff":
         if attempt.get("handoff_valid") is not False:
             violations.append(f"{task_name}: invalid_handoff ATTEMPT requires handoff_valid=false")
+    if attempt_state == "terminated":
+        if attempt.get("handoff_valid") is not False:
+            violations.append(f"{task_name}: terminated ATTEMPT requires handoff_valid=false")
+        if attempt.get("handoff_state") is not None:
+            violations.append(f"{task_name}: terminated ATTEMPT requires handoff_state=null")
+        if outcome != "operator_terminated":
+            violations.append(f"{task_name}: terminated ATTEMPT requires outcome=operator_terminated")
+        termination = attempt.get("operator_termination")
+        if not isinstance(termination, dict):
+            violations.append(f"{task_name}: terminated ATTEMPT requires operator_termination evidence")
     if attempt_state in {"created", "running"} and outcome is not None:
         violations.append(f"{task_name}: active ATTEMPT requires outcome=null")
     if attempt_state == "completed" and outcome not in {None, "completed"}:

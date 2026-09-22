@@ -83,12 +83,13 @@ attempt = json.loads(
 attempt_dir = task / "attempts" / status["current_attempt_id"]
 handoff = json.loads((attempt_dir / "HANDOFF.json").read_text())
 assert status["state"] == "blocked", status
-current_head = subprocess.check_output(
-    ["git", "rev-parse", "HEAD"],
+# Supervision may stop the worker after mutation but before commit B completes.
+source_diff = subprocess.run(
+    ["git", "diff", "--quiet", handoff["source_commit"], "--", "file.txt"],
     cwd=attempt["runtime"]["cwd"],
-    text=True,
-).strip()
-assert current_head != handoff["source_commit"]
+    check=False,
+)
+assert source_diff.returncode == 1, {"diff_rc": source_diff.returncode, "status": status}
 assert (
     "HEAD changed after handoff finalization" in status["blocking_reason"]
     or "source_commit" in status["blocking_reason"]

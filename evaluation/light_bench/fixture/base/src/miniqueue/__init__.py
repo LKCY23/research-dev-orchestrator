@@ -1,7 +1,13 @@
 """A deterministic, persistent mini queue used by RDO light-bench cases."""
 
 from .clock import ManualClock, SystemClock
-from .errors import ConflictError, InvalidJobError, JobNotFoundError, LeaseError
+from .errors import (
+    ConflictError,
+    InvalidJobError,
+    InvalidStateTransitionError,
+    JobNotFoundError,
+    LeaseError,
+)
 from .model import Job, JobState, QueueSnapshot, QueueStats
 from .queue import Queue, QueueConfig
 from .retry import RetryPolicy
@@ -11,6 +17,7 @@ from .store import JsonStore, MemoryStore
 __all__ = [
     "ConflictError",
     "InvalidJobError",
+    "InvalidStateTransitionError",
     "Job",
     "JobNotFoundError",
     "JobState",

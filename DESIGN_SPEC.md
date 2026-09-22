@@ -1105,15 +1105,17 @@ scripts/
 职责：
 
 ```text
-1. 创建 .agent-collab/runs/<run-id>/。
-2. 生成 RUN.json。
-3. 创建空模板文件和目录。
-4. 创建 SUMMARY.md 初始骨架。
-5. 创建 EVENTS.ndjson 和 JOURNAL.md。
-6. 创建 diagnostics/。
-7. 记录 target_branch、base_commit、protocol_version。
-8. 追加 run_created event。
-9. 已有 run 直接拒绝；不提供 --force 覆盖语义。
+1. 拒绝已被 Git 追踪的 .agent-collab/ 或 .agent-worktrees/。
+2. 幂等写入并验证目标仓库 .git/info/exclude 中的本地运行目录规则。
+3. 创建 .agent-collab/runs/<run-id>/。
+4. 生成 RUN.json。
+5. 创建空模板文件和目录。
+6. 创建 SUMMARY.md 初始骨架。
+7. 创建 EVENTS.ndjson 和 JOURNAL.md。
+8. 创建 diagnostics/。
+9. 记录 target_branch、base_commit、protocol_version。
+10. 追加 run_created event。
+11. 已有 run 直接拒绝；不提供 --force 覆盖语义。
 ```
 
 限制：

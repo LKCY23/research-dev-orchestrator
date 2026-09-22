@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import fcntl
 import hashlib
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -76,7 +77,7 @@ TASK_STATES = {
 }
 
 BLOCKER_TYPES = {"needs_coordinator", "needs_user", "environment", "budget", "irrecoverable"}
-ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff"}
+ATTEMPT_STATES = {"created", "running", "completed", "invalid_handoff", "terminated"}
 ATTEMPT_OUTCOMES = {
     "startup_failed",
     "execution_failed",
@@ -84,15 +85,167 @@ ATTEMPT_OUTCOMES = {
     "finalization_timed_out",
     "finalization_failed",
     "invalid_handoff",
+    "operator_terminated",
     "completed",
 }
 HANDOFF_STATES = {"strategy_review", "verified", "review", "blocked", None}
 EXECUTION_PROFILES = {"direct", "delegated", "full"}
-EXECUTION_MODES = {"start", "resume", "replace"}
+EXECUTION_MODES = {"start", "resume", "replace", "restart"}
 RUNTIME_BACKENDS = {"plain", "tmux"}
 IO_MODES = {"machine", "human"}
 WORKER_BACKENDS = {"claude-code", "codex", "opencode", "kimi-code"}
 COORDINATOR_BACKENDS = {"codex", "claude-code"}
+
+
+@contextmanager
+def task_state_lock(task_dir: Path):
+    """Serialize coordinator termination with dispatcher terminal reconciliation."""
+
+    lock_path = task_dir / ".state-mutation.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _publish_json_once(path: Path, payload: dict[str, Any]) -> str:
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        written = os.write(descriptor, encoded)
+        if written != len(encoded):
+            raise OSError(f"short immutable JSON publish: {written}/{len(encoded)}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def converge_operator_termination_locked(task_dir: Path, attempt_id: str) -> bool:
+    """Converge a frozen operator-termination receipt into attempt/task state."""
+
+    attempt_path = task_dir / "attempts" / attempt_id / "ATTEMPT.json"
+    receipt_path = attempt_path.parent / "runtime" / "OPERATOR_TERMINATION.json"
+    if not receipt_path.is_file() or receipt_path.is_symlink():
+        return False
+    receipt_bytes = receipt_path.read_bytes()
+    receipt = json.loads(receipt_bytes)
+    if not isinstance(receipt, dict):
+        raise ValueError("operator termination receipt must be an object")
+    if receipt.get("task_id") != load_json(task_dir / "STATUS.json").get("task_id"):
+        raise ValueError("operator termination receipt task_id does not match STATUS")
+    if receipt.get("attempt_id") != attempt_id:
+        raise ValueError("operator termination receipt attempt_id does not match")
+    if receipt.get("cleanup_verified") is not True:
+        raise ValueError("operator termination receipt requires verified process cleanup")
+
+    status_path = task_dir / "STATUS.json"
+    status = load_json(status_path)
+    attempt = load_json(attempt_path)
+    if status.get("current_attempt_id") != attempt_id:
+        raise ValueError("operator termination no longer targets the current attempt")
+    if attempt.get("attempt_id") != attempt_id:
+        raise ValueError("operator termination ATTEMPT identity does not match")
+
+    ended_at = str(receipt.get("terminated_at") or "")
+    if not ended_at:
+        raise ValueError("operator termination receipt is missing terminated_at")
+    receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+    if attempt.get("state") != "terminated":
+        if attempt.get("state") not in {"created", "running"}:
+            raise ValueError("operator termination requires an active attempt")
+        attempt.update(
+            state="terminated",
+            outcome="operator_terminated",
+            handoff_valid=False,
+            handoff_state=None,
+            ended_at=ended_at,
+            exit_code=None,
+            operator_termination={
+                "receipt_ref": "runtime/OPERATOR_TERMINATION.json",
+                "receipt_sha256": receipt_sha256,
+                "reason": str(receipt.get("reason") or "operator requested termination"),
+            },
+        )
+        write_json(attempt_path, attempt)
+        write_json(attempt_path.parent / "runtime" / "DISPATCH_ATTEMPT.json", attempt)
+
+    if status.get("state") != "blocked":
+        source = status.get("state")
+        if source not in {"planning", "running"}:
+            raise ValueError("operator termination requires an active task state")
+        status.update(
+            previous_state=source,
+            state="blocked",
+            owner="coordinator",
+            updated_at=ended_at,
+            needs_coordinator=True,
+            summary="Worker terminated by coordinator",
+            blocker_type="needs_coordinator",
+            blocking_reason=str(receipt.get("reason") or "operator requested termination"),
+        )
+        status.setdefault("state_history", []).append(
+            {"from": source, "to": "blocked", "actor": "coordinator", "at": ended_at}
+        )
+        write_json(status_path, status)
+    return True
+
+
+def record_operator_termination_locked(
+    task_dir: Path,
+    attempt_id: str,
+    *,
+    reason: str,
+    termination: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze and apply termination while the caller holds task_state_lock."""
+
+    status = load_json(task_dir / "STATUS.json")
+    attempt_path = task_dir / "attempts" / attempt_id / "ATTEMPT.json"
+    attempt = load_json(attempt_path)
+    if status.get("current_attempt_id") != attempt_id:
+        raise ValueError("operator termination does not target the current attempt")
+    if status.get("state") not in {"planning", "running"}:
+        raise ValueError("operator termination requires an active task")
+    if attempt.get("state") not in {"created", "running"}:
+        raise ValueError("operator termination requires an active attempt")
+    if termination.get("cleanup_verified") is not True:
+        raise ValueError("operator termination requires verified process cleanup")
+    receipt = {
+        "schema_version": 1,
+        "task_id": status.get("task_id"),
+        "attempt_id": attempt_id,
+        "requested_by": "coordinator",
+        "reason": reason or "operator requested termination",
+        "terminated_at": utc_now(),
+        **termination,
+    }
+    receipt_path = attempt_path.parent / "runtime" / "OPERATOR_TERMINATION.json"
+    _publish_json_once(receipt_path, receipt)
+    converge_operator_termination_locked(task_dir, attempt_id)
+    return receipt
+
+
+def record_operator_termination(
+    task_dir: Path,
+    attempt_id: str,
+    *,
+    reason: str,
+    termination: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze and apply one verified coordinator termination decision."""
+
+    with task_state_lock(task_dir):
+        return record_operator_termination_locked(
+            task_dir,
+            attempt_id,
+            reason=reason,
+            termination=termination,
+        )
 PERMISSION_MODES = {"default", "auto", "yolo"}
 
 CORE_EVENTS = {
@@ -101,6 +254,7 @@ CORE_EVENTS = {
     "design_method_selected",
     "adr_added",
     "task_created",
+    "dispatch_preflight_failed",
     "task_dispatched",
     "worker_process_started",
     "prompt_dispatched",
@@ -141,6 +295,7 @@ CORE_EVENTS = {
 
 TASK_EVENTS = {
     "task_created",
+    "dispatch_preflight_failed",
     "task_dispatched",
     "worker_process_started",
     "prompt_dispatched",

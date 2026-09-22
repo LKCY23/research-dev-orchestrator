@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -207,6 +208,27 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(2, result.returncode)
         self.assertIn("unit selector loaded no tests", result.stderr)
         self.assertIn("Ran 0 tests", (log_dir / "unit.log").read_text(encoding="utf-8"))
+
+    def test_empty_suite_exit_codes_are_normalized_without_masking_failures(self) -> None:
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        python = bin_dir / "python3"
+        for test_count, interpreter_exit, expected in ((0, 0, 2), (0, 5, 2), (1, 5, 5)):
+            with self.subTest(test_count=test_count, interpreter_exit=interpreter_exit):
+                python.write_text(
+                    "#!/bin/sh\n"
+                    f"printf 'Ran {test_count} tests in 0.001s\\n' >&2\n"
+                    f"exit {interpreter_exit}\n",
+                    encoding="utf-8",
+                )
+                python.chmod(0o755)
+                with mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}):
+                    result, _ = self.run_runner("run_unit_tests.sh", "--pattern", "test_alpha.py")
+                self.assertEqual(expected, result.returncode, result.stderr)
+                if test_count == 0:
+                    self.assertIn("unit selector loaded no tests", result.stderr)
+                else:
+                    self.assertNotIn("unit selector loaded no tests", result.stderr)
 
     def test_missing_selector_value_is_a_usage_failure(self) -> None:
         unit, _ = self.run_runner("run_unit_tests.sh", "--pattern")

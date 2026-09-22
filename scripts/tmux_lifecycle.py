@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,10 +18,75 @@ class TmuxLifecycleError(RuntimeError):
     """Raised when tmux or repository lifecycle evidence is unavailable."""
 
 
+class TmuxCleanupError(TmuxLifecycleError):
+    """Raised when a newly created session cannot be safely rolled back."""
+
+
 _IDENTITY_FORMAT = "#{session_id}\t#{session_created}\t#{session_name}"
 _ACTIVE_TASK_STATES = {"planning", "running"}
 _PRUNABLE_HANDOFF_STATES = {"strategy_review", "verified", "review"}
 TMUX_IDENTITY_REF = "runtime/TMUX_SESSION.json"
+TMUX_CLEANUP_POLICIES = {"cleanup_on_exit", "retain"}
+TMUX_CLEANUP_SUCCESS_STATUSES = {
+    "killed",
+    "already_absent",
+    "retained_by_policy",
+}
+TMUX_CLEANUP_FAILURE_STATUSES = {
+    "identity_mismatch",
+    "kill_failed",
+    "verification_failed",
+}
+TMUX_CLEANUP_STATUSES = (
+    TMUX_CLEANUP_SUCCESS_STATUSES | TMUX_CLEANUP_FAILURE_STATUSES
+)
+
+
+def preflight_tmux_runtime() -> dict[str, Any]:
+    """Prove that this process can create, inspect, and remove a tmux session."""
+
+    session_name = f"rdo-preflight-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        created = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session_name, "sleep 30"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except FileNotFoundError as exc:
+        raise TmuxLifecycleError("tmux executable is unavailable") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TmuxLifecycleError("tmux session creation probe timed out") from exc
+    if created.returncode != 0:
+        detail = created.stderr.strip() or created.stdout.strip() or f"exit {created.returncode}"
+        raise TmuxLifecycleError(f"cannot create tmux preflight session: {detail}")
+
+    identity: dict[str, Any] | None = None
+    try:
+        identity = inspect_live_tmux_session(session_name)
+        if identity is None or identity["session_name"] != session_name:
+            raise TmuxLifecycleError("tmux preflight session cannot be inspected")
+        cleanup = kill_live_tmux_session(identity)
+        if cleanup["status"] not in {"killed", "already_absent"}:
+            raise TmuxLifecycleError(
+                f"cannot remove tmux preflight session: {cleanup.get('reason') or cleanup['status']}"
+            )
+        if inspect_live_tmux_session(str(identity["session_id"])) is not None:
+            raise TmuxLifecycleError("tmux preflight session survived cleanup")
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session_name],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    return {
+        "runtime_backend": "tmux",
+        "session_create": True,
+        "session_inspect": True,
+        "session_cleanup": True,
+    }
 
 
 def _parse_identity(line: str) -> dict[str, Any]:
@@ -83,25 +149,56 @@ def inspect_live_tmux_session(session_id: str) -> dict[str, Any] | None:
             return None
         detail = completed.stderr.strip() or f"exit {completed.returncode}"
         raise TmuxLifecycleError(f"cannot inspect tmux session {session_id}: {detail}")
-    return _parse_identity(completed.stdout.rstrip("\n"))
+    identity_line = completed.stdout.rstrip("\n")
+    # Some tmux versions return success plus an all-empty format expansion when
+    # the target disappeared while another server session remains alive.
+    if not any(identity_line.split("\t")):
+        return None
+    return _parse_identity(identity_line)
+
+
+def _cleanup_result(
+    policy: str,
+    status: str,
+    reason: str | None = None,
+    *,
+    observed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if policy not in TMUX_CLEANUP_POLICIES:
+        raise ValueError(f"unsupported tmux cleanup policy: {policy}")
+    if status not in TMUX_CLEANUP_STATUSES:
+        raise ValueError(f"unsupported tmux cleanup status: {status}")
+    result: dict[str, Any] = {
+        "policy": policy,
+        "status": status,
+        "reason": reason,
+    }
+    if observed is not None:
+        result["observed"] = observed
+    return result
 
 
 def kill_live_tmux_session(expected: dict[str, Any]) -> dict[str, Any]:
-    """Kill only the same tmux identity observed during inventory."""
+    """Kill only the expected identity and verify that it is absent."""
 
-    observed = inspect_live_tmux_session(str(expected["session_id"]))
+    policy = "cleanup_on_exit"
+    try:
+        observed = inspect_live_tmux_session(str(expected["session_id"]))
+    except TmuxLifecycleError as exc:
+        return _cleanup_result(policy, "verification_failed", str(exc))
     if observed is None:
-        return {"status": "already_absent", "reason": None}
+        return _cleanup_result(policy, "already_absent")
     if observed != {
         "session_id": expected["session_id"],
         "created_at_epoch": expected["created_at_epoch"],
         "session_name": expected["session_name"],
     }:
-        return {
-            "status": "identity_changed",
-            "reason": "tmux session identity changed after inventory",
-            "observed": observed,
-        }
+        return _cleanup_result(
+            policy,
+            "identity_mismatch",
+            "live tmux identity does not match the dispatch receipt",
+            observed=observed,
+        )
     try:
         completed = subprocess.run(
             ["tmux", "kill-session", "-t", str(expected["session_id"])],
@@ -110,16 +207,59 @@ def kill_live_tmux_session(expected: dict[str, Any]) -> dict[str, Any]:
             check=False,
         )
     except FileNotFoundError as exc:
-        raise TmuxLifecycleError("tmux executable is unavailable") from exc
-    if completed.returncode == 0:
-        return {"status": "killed", "reason": None}
+        return _cleanup_result(policy, "kill_failed", f"tmux executable is unavailable: {exc}")
     try:
-        if inspect_live_tmux_session(str(expected["session_id"])) is None:
-            return {"status": "already_absent", "reason": None}
-    except TmuxLifecycleError:
-        pass
+        remaining = inspect_live_tmux_session(str(expected["session_id"]))
+    except TmuxLifecycleError as exc:
+        return _cleanup_result(
+            policy,
+            "verification_failed",
+            f"tmux session absence could not be verified: {exc}",
+        )
+    if remaining is None:
+        return _cleanup_result(
+            policy,
+            "killed" if completed.returncode == 0 else "already_absent",
+        )
     detail = completed.stderr.strip() or f"exit {completed.returncode}"
-    return {"status": "failed", "reason": detail}
+    if remaining != expected:
+        return _cleanup_result(
+            policy,
+            "verification_failed",
+            f"tmux identity changed while verifying cleanup: {detail}",
+            observed=remaining,
+        )
+    return _cleanup_result(
+        policy,
+        "kill_failed" if completed.returncode != 0 else "verification_failed",
+        detail if completed.returncode != 0 else "tmux reported success but the session is still live",
+        observed=remaining,
+    )
+
+
+def _write_tmux_session_identity(
+    output: Path,
+    *,
+    run_id: str,
+    task_id: str,
+    attempt_id: str,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        **identity,
+    }
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, output)
+    except (OSError, UnicodeError) as exc:
+        raise TmuxLifecycleError(f"tmux identity receipt could not be persisted: {exc}") from exc
+    return payload
 
 
 def record_tmux_session_identity(
@@ -135,18 +275,85 @@ def record_tmux_session_identity(
     identity = inspect_live_tmux_session(session_name)
     if identity is None or identity["session_name"] != session_name:
         raise TmuxLifecycleError("new tmux session identity is unavailable")
-    payload = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "task_id": task_id,
-        "attempt_id": attempt_id,
-        **identity,
-    }
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, output)
-    return payload
+    return _write_tmux_session_identity(
+        output,
+        run_id=run_id,
+        task_id=task_id,
+        attempt_id=attempt_id,
+        identity=identity,
+    )
+
+
+def create_tmux_session_with_receipt(
+    output: Path,
+    *,
+    run_id: str,
+    task_id: str,
+    attempt_id: str,
+    session_name: str,
+    command: str,
+) -> dict[str, Any]:
+    """Create one parked session and durably bind its exact identity."""
+
+    try:
+        created = subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                _IDENTITY_FORMAT,
+                "-s",
+                session_name,
+                command,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except FileNotFoundError as exc:
+        raise TmuxLifecycleError("tmux executable is unavailable") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TmuxCleanupError(
+            "tmux session creation timed out; session absence is unverified"
+        ) from exc
+    if created.returncode != 0:
+        detail = created.stderr.strip() or created.stdout.strip() or f"exit {created.returncode}"
+        raise TmuxLifecycleError(f"tmux session creation failed: {detail}")
+    try:
+        identity = _parse_identity(created.stdout.strip())
+    except TmuxLifecycleError as exc:
+        raise TmuxCleanupError(
+            "tmux created a session without returning a valid identity; "
+            "exact rollback is unavailable"
+        ) from exc
+    if identity["session_name"] != session_name:
+        cleanup = kill_live_tmux_session(identity)
+        error = (
+            "tmux returned an unexpected session name; "
+            f"rollback status={cleanup['status']}"
+        )
+        if cleanup["status"] not in {"killed", "already_absent"}:
+            raise TmuxCleanupError(error)
+        raise TmuxLifecycleError(error)
+    try:
+        return _write_tmux_session_identity(
+            output,
+            run_id=run_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            identity=identity,
+        )
+    except TmuxLifecycleError as exc:
+        cleanup = kill_live_tmux_session(identity)
+        if cleanup["status"] not in {"killed", "already_absent"}:
+            raise TmuxCleanupError(
+                f"{exc}; exact rollback failed with status={cleanup['status']}: "
+                f"{cleanup.get('reason') or 'unknown failure'}"
+            ) from exc
+        raise
 
 
 def _safe_component(value: str, label: str) -> str:
@@ -203,6 +410,49 @@ def load_attempt_tmux_identity(
         "created_at_epoch": payload["created_at_epoch"],
         "session_name": session_name,
     }
+
+
+def cleanup_attempt_tmux_session(
+    attempt_dir: Path,
+    *,
+    run_id: str,
+    task_id: str,
+    attempt_id: str,
+    session_name: str,
+    policy: str,
+) -> dict[str, Any]:
+    """Apply one explicit retention policy to the receipt-bound session."""
+
+    if policy not in TMUX_CLEANUP_POLICIES:
+        raise ValueError(f"unsupported tmux cleanup policy: {policy}")
+    try:
+        expected = load_attempt_tmux_identity(
+            attempt_dir,
+            run_id=run_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            session_name=session_name,
+        )
+    except TmuxLifecycleError as exc:
+        return _cleanup_result(policy, "verification_failed", str(exc))
+
+    if policy == "cleanup_on_exit":
+        return kill_live_tmux_session(expected)
+
+    try:
+        observed = inspect_live_tmux_session(str(expected["session_id"]))
+    except TmuxLifecycleError as exc:
+        return _cleanup_result(policy, "verification_failed", str(exc))
+    if observed is None:
+        return _cleanup_result(policy, "already_absent")
+    if observed != expected:
+        return _cleanup_result(
+            policy,
+            "identity_mismatch",
+            "live tmux identity does not match the dispatch receipt",
+            observed=observed,
+        )
+    return _cleanup_result(policy, "retained_by_policy")
 
 
 def revalidate_live_tmux_identity(expected: dict[str, Any]) -> dict[str, Any]:
@@ -474,25 +724,61 @@ def build_tmux_inventory(
 def main() -> int:
     parser = argparse.ArgumentParser(description="RDO tmux lifecycle helper")
     subparsers = parser.add_subparsers(dest="action", required=True)
+    create = subparsers.add_parser("create")
+    create.add_argument("--output", required=True)
+    create.add_argument("--run-id", required=True)
+    create.add_argument("--task-id", required=True)
+    create.add_argument("--attempt-id", required=True)
+    create.add_argument("--session-name", required=True)
+    create.add_argument("--command", default="sleep 2147483647")
     record = subparsers.add_parser("record")
     record.add_argument("--output", required=True)
     record.add_argument("--run-id", required=True)
     record.add_argument("--task-id", required=True)
     record.add_argument("--attempt-id", required=True)
     record.add_argument("--session-name", required=True)
+    cleanup = subparsers.add_parser("cleanup")
+    cleanup.add_argument("--attempt-dir", required=True)
+    cleanup.add_argument("--run-id", required=True)
+    cleanup.add_argument("--task-id", required=True)
+    cleanup.add_argument("--attempt-id", required=True)
+    cleanup.add_argument("--session-name", required=True)
+    cleanup.add_argument("--policy", choices=sorted(TMUX_CLEANUP_POLICIES), required=True)
     args = parser.parse_args()
     try:
-        payload = record_tmux_session_identity(
-            Path(args.output),
-            run_id=args.run_id,
-            task_id=args.task_id,
-            attempt_id=args.attempt_id,
-            session_name=args.session_name,
-        )
+        if args.action == "create":
+            payload = create_tmux_session_with_receipt(
+                Path(args.output),
+                run_id=args.run_id,
+                task_id=args.task_id,
+                attempt_id=args.attempt_id,
+                session_name=args.session_name,
+                command=args.command,
+            )
+        elif args.action == "record":
+            payload = record_tmux_session_identity(
+                Path(args.output),
+                run_id=args.run_id,
+                task_id=args.task_id,
+                attempt_id=args.attempt_id,
+                session_name=args.session_name,
+            )
+        else:
+            payload = cleanup_attempt_tmux_session(
+                Path(args.attempt_dir),
+                run_id=args.run_id,
+                task_id=args.task_id,
+                attempt_id=args.attempt_id,
+                session_name=args.session_name,
+                policy=args.policy,
+            )
+    except TmuxCleanupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
     except TmuxLifecycleError as exc:
         parser.error(str(exc))
     print(json.dumps(payload, indent=2))
-    return 0
+    return 1 if payload.get("status") in TMUX_CLEANUP_FAILURE_STATUSES else 0
 
 
 if __name__ == "__main__":

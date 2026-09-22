@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "L03-cross-file-feature",
   "title": "Cross-file queued-job cancellation",
   "description": "A bounded feature spanning lifecycle validation, persistence, queue mutation, and statistics.",
@@ -28,5 +28,46 @@
     "src/miniqueue/model.py",
     "src/miniqueue/queue.py"
   ],
-  "expected_initial_verifier_exit": 1
+  "expected_initial_verifier_exit": 1,
+  "contract": {
+    "version": 1,
+    "source": "fixture/base/docs/DESIGN.md",
+    "requirements": [
+      "A084", "A085", "A086", "A087", "A088", "A089", "A090",
+      "A091", "A092", "A093", "A094", "A095", "A096"
+    ],
+    "coverage": {
+      "visible": ["A084", "A085", "A086", "A092", "A093", "A094", "A095"],
+      "hidden": [
+        "A084", "A086", "A087", "A088", "A089", "A090", "A091",
+        "A092", "A093", "A094", "A095", "A096"
+      ]
+    }
+  },
+  "calibration": [
+    {
+      "id": "golden",
+      "patches": ["cases/L03-cross-file-feature/calibration/golden.patch"],
+      "expected_exit": 0,
+      "expected_requirements": []
+    },
+    {
+      "id": "wrong-transition-error",
+      "patches": [
+        "cases/L03-cross-file-feature/calibration/golden.patch",
+        "cases/L03-cross-file-feature/calibration/wrong-transition-error.patch"
+      ],
+      "expected_exit": 1,
+      "expected_requirements": ["A088"]
+    },
+    {
+      "id": "non-idempotent-repeat",
+      "patches": [
+        "cases/L03-cross-file-feature/calibration/golden.patch",
+        "cases/L03-cross-file-feature/calibration/non-idempotent-repeat.patch"
+      ],
+      "expected_exit": 1,
+      "expected_requirements": ["A087"]
+    }
+  ]
 }

@@ -7,10 +7,16 @@ import argparse
 import json
 import re
 import secrets
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from protocol import PACKAGE_VERSION, PROTOCOL_VERSION, append_event, render_template, repo_root, run_git, utc_now
+
+
+LOCAL_STATE_DIRECTORIES = (".agent-collab", ".agent-worktrees")
+LOCAL_EXCLUDE_RULES = tuple(f"/{directory}/" for directory in LOCAL_STATE_DIRECTORIES)
+LOCAL_EXCLUDE_MARKER = "# research-dev-orchestrator local state"
 
 
 def slugify(value: str) -> str:
@@ -21,6 +27,79 @@ def slugify(value: str) -> str:
 def write_if_missing(path: Path, content: str) -> None:
     if not path.exists():
         path.write_text(content, encoding="utf-8")
+
+
+def run_git_checked(args: list[str], root: Path) -> subprocess.CompletedProcess[str]:
+    process = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "unknown Git error"
+        raise SystemExit(f"Git command failed ({' '.join(args)}): {detail}")
+    return process
+
+
+def ensure_local_state_ignored(root: Path) -> Path:
+    tracked = run_git_checked(
+        ["ls-files", "--", *LOCAL_STATE_DIRECTORIES],
+        root,
+    ).stdout.splitlines()
+    if tracked:
+        preview = "\n".join(f"  - {path}" for path in tracked[:10])
+        remainder = len(tracked) - 10
+        if remainder > 0:
+            preview += f"\n  - ... and {remainder} more"
+        raise SystemExit(
+            "RDO local state is already tracked by Git:\n"
+            f"{preview}\n"
+            "Remove it from the index before initializing, for example:\n"
+            "  git rm -r --cached --ignore-unmatch .agent-collab .agent-worktrees"
+        )
+
+    git_path = run_git_checked(
+        ["rev-parse", "--git-path", "info/exclude"],
+        root,
+    ).stdout.strip()
+    if not git_path:
+        raise SystemExit("Git did not resolve info/exclude for the target repository")
+    exclude_path = Path(git_path)
+    if not exclude_path.is_absolute():
+        exclude_path = root / exclude_path
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+    existing_lines = existing.splitlines()
+    missing_rules = [rule for rule in LOCAL_EXCLUDE_RULES if rule not in existing_lines]
+    if missing_rules:
+        additions: list[str] = []
+        if LOCAL_EXCLUDE_MARKER not in existing_lines:
+            additions.append(LOCAL_EXCLUDE_MARKER)
+        additions.extend(missing_rules)
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        exclude_path.write_text(
+            existing + separator + "\n".join(additions) + "\n",
+            encoding="utf-8",
+        )
+
+    for directory in LOCAL_STATE_DIRECTORIES:
+        probe = f"{directory}/.rdo-ignore-probe"
+        verification = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--no-index", "--", probe],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if verification.returncode != 0:
+            raise SystemExit(
+                f"RDO local-state ignore verification failed for {directory}. "
+                f"Check {exclude_path} and higher-precedence .gitignore rules."
+            )
+    return exclude_path
 
 
 def main() -> int:
@@ -35,6 +114,7 @@ def main() -> int:
     args = parser.parse_args()
 
     root = repo_root(Path.cwd())
+    ensure_local_state_ignored(root)
     project_slug = slugify(args.project_slug)
     created_at = utc_now()
     shortid = secrets.token_hex(3)

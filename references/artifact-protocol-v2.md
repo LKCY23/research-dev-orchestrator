@@ -180,12 +180,12 @@ attempts/<attempt-id>/
 | `ATTEMPT.json` | Canonical attempt identity/runtime metadata; input binding is only a `TASK_INPUTS.json` ref and digest | Dispatcher creates it; protocol code advances attempt metadata |
 | `TASK_INPUTS.json` | Derived immutable snapshot of canonical task inputs and resolved commits | Dispatcher publishes it before launch |
 | `runtime/DEPENDENCY_CONTEXT.json` | Optional short catalog binding merged predecessor bundles and Broker-visible fields; contains no full predecessor document, diff, or log | Dispatcher derives it from verified `task_merged` artifact bindings before prompt rendering; `TASK_INPUTS.json` binds its exact digest |
-| `runtime/COMMANDS.ndjson` | Append-only raw supervised-command facts, including before/after semantic source digests | `rdo check` appends records before or during finalization |
+| `runtime/COMMANDS.ndjson` | Append-only raw supervised-command facts bound to an exact clean source commit, tree, and semantic digest | `rdo check` appends records before finalization |
 | `runtime/check-broker/` | Ephemeral request, one-use supervision lease, and cleanup receipt transport; not evidence | Machine attempt supervisor creates one instance per launch and serves it only for that worker lifetime |
 | `runtime/ARTIFACT_LOCK` | Internal process lock; not evidence | Shared by supervised command writers and held exclusively by finalization so no command can append after publication |
 | `runtime/DEADLINE.json` | Create-once attempt execution deadline shared by backend resume fallback | Supervisor creates it before worker launch |
-| `runtime/finalization-worktree.json` | Create-once full semantic source snapshot at finalize-only entry | RDO publishes it before the finalization marker |
-| `runtime/FINALIZATION.json` | Create-once phase marker binding entry time, grace, task inputs, fixed final deadline, and source snapshot | RDO publishes it after the profile's source-freeze gate passes |
+| `runtime/finalization-worktree.json` | Create-once snapshot of the already-checked clean candidate, including commit, tree, and semantic entries | RDO publishes it before the finalization marker |
+| `runtime/FINALIZATION.json` | Create-once phase marker binding entry time, grace, task inputs, fixed final deadline, and exact candidate identity | RDO publishes it only after acceptance and output gates pass |
 | `runtime/transcript.log` | Raw worker/supervisor log | Supervisor appends while the worker runs; it is not selected into the frozen evidence package before worker exit |
 | `runtime/worktree-*.json` | Raw before/after worktree facts | Dispatcher/supervisor capture them at their defined boundaries |
 | `EVIDENCE.json` | Frozen, structured index selecting raw facts for review; never a second command log | Finalizer derives and publishes it once |
@@ -209,14 +209,16 @@ workers cannot satisfy it with free text. Every raw command record declares
 `artifact_protocol_version = 2` and `schema_version = 2`, and binds
 `record_id`, `task_id`, `attempt_id`, `task_inputs_sha256`,
 `acceptance_contract_sha256`, `category = required_commands`, and `check_id`.
-It records the exact argv, cwd, timeout, start/finish times, exit code, timeout
+It records the exact candidate commit/tree, argv, cwd, timeout, start/finish times, exit code, timeout
 flag, elapsed time, surviving processes, and attempt-local stdout/stderr refs
 plus SHA-256 digests. `record_sha256` covers the canonical record excluding
 that self-declared digest. Optional workflow and instance fields bind the same
 record to an active Full workflow instance. Missing, foreign-attempt,
 digest-mismatched, or mutable-log records are invalid. Coordinator
 pre/post-merge checks use the same supervisor against their respective command
-lists.
+lists. Checks run only against a clean committed candidate; any command that
+changes its commit, tree, tracked/untracked content, mode, kind, or symlink
+identity is recorded as failure and cannot satisfy acceptance.
 
 `EVIDENCE.json` indexes those immutable records by ID/reference and record
 digest, including exit code, timeout and elapsed time. It also indexes changed
@@ -243,6 +245,8 @@ Its review-manifest shape is:
       "record_sha256": "<sha256>",
       "acceptance_contract_sha256": "<sha256>",
       "category": "required_commands",
+      "source_commit": "0123456789abcdef0123456789abcdef01234567",
+      "source_tree": "0123456789abcdef0123456789abcdef01234567",
       "argv": ["python3", "-m", "unittest", "discover", "-s", "tests/unit"],
       "cwd": ".",
       "timeout_seconds": 300,

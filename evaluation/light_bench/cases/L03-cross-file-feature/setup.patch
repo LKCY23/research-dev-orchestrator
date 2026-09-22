@@ -2,7 +2,7 @@ diff --git a/tests/test_cancellation.py b/tests/test_cancellation.py
 new file mode 100644
 --- /dev/null
 +++ b/tests/test_cancellation.py
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,44 @@
 +from __future__ import annotations
 +
 +import unittest
@@ -12,6 +12,7 @@ new file mode 100644
 +
 +
 +class CancellationTests(unittest.TestCase):
++    # A084, A086, A094, A095
 +    def test_cancel_queued_job_is_terminal_and_not_leased(self) -> None:
 +        clock = ManualClock(50)
 +        queue = Queue(clock=clock)
@@ -26,11 +27,13 @@ new file mode 100644
 +        self.assertEqual(0, cancelled.attempts)
 +        self.assertIsNone(queue.lease_next("worker"))
 +
++    # A085
 +    def test_cancel_without_reason_uses_stable_text(self) -> None:
 +        queue = Queue(clock=ManualClock(4))
 +        queue.enqueue({"kind": "work"}, job_id="job")
 +        self.assertEqual("cancelled", queue.cancel("job").last_error)
 +
++    # A092, A093
 +    def test_stats_count_cancelled_separately(self) -> None:
 +        queue = Queue(clock=ManualClock())
 +        queue.enqueue({"kind": "work"}, job_id="cancel-me")
